@@ -278,7 +278,7 @@ class AICommander:
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
                   show_thinking: bool = True, command_timeout: int = 30,
                   max_prompt_len: int = 20000, max_output_bytes: int = 10240, debug: bool = False,
-                  sink: EventSink = None, persist_history: bool = False):
+                  sink: EventSink = None, persist_history: bool = False, max_steps: int = 500):
         self.base_url = api_base.rstrip('/')
         self.model = model
         self.api_key = api_key
@@ -288,7 +288,7 @@ class AICommander:
         # history (carried over from a previous run) instead of resetting it.
         # This lets a fresh command keep the full chat context of past sessions.
         self.persist_history = persist_history
-        self.max_steps = 500
+        self.max_steps = max_steps
         self.max_tokens = 8000
         self.command_timeout = command_timeout
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1418,6 +1418,8 @@ def main():
                         help="Maximum prompt length in characters (default: 80000)")
     parser.add_argument("--max-output-bytes", type=int, default=10240,
                         help="Maximum output bytes to return from commands (default: 10240)")
+    parser.add_argument("--max-steps", type=int, default=500,
+                        help="Maximum number of agent loop steps before stopping (default: 500)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug mode (dump conversation history on truncation)")
     parser.add_argument("--nogui", action="store_true",
@@ -1465,7 +1467,8 @@ def main():
             max_prompt_len=args.max_prompt_len,
             max_output_bytes=args.max_output_bytes,
             debug=args.debug,
-            sink=sink
+            sink=sink,
+            max_steps=args.max_steps
         )
         try:
             user_request = " ".join(args.request)
@@ -1518,7 +1521,7 @@ def main():
 
         CSS = """
         Screen {
-            background: #3465a4;
+            background: #12488b;
         }
         #warning-banner {
             background: #06989a;
@@ -1554,7 +1557,7 @@ def main():
         }
         #prompt-input > .input--cursor {
             background: #06989a;
-            color: #3465a4;
+            color: #12488b;
         }
         #status-bar {
             background: #06989a;
@@ -1571,13 +1574,13 @@ def main():
             height: 1fr;
         }
         #console-log {
-            background: #3465a4;
+            background: #12488b;
             color: #f2f2f2;
             border: solid #f2f2f2;
             width: 1fr;
         }
         #agent-log {
-            background: #3465a4;
+            background: #12488b;
             color: #f2f2f2;
             border: solid #f2f2f2;
             width: 1fr;
@@ -1986,7 +1989,8 @@ def main():
                     max_output_bytes=self.args.max_output_bytes,
                     debug=self.args.debug,
                     sink=self.sink,
-                    persist_history=True
+                    persist_history=True,
+                    max_steps=self.args.max_steps
                 )
             else:
                 # Reuse the existing agent so its conversation history (from

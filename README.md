@@ -79,6 +79,7 @@ python3 aic.py \
 | `--timeout` | Command timeout in seconds (default: `30`). |
 | `--max-prompt-len` | Maximum prompt length in characters (default: `80000`). |
 | `--max-output-bytes` | Maximum output bytes returned from commands (default: `10240`). |
+| `--max-steps` | Maximum number of agent loop steps before stopping (default: `500`). |
 | `--debug` | Enable debug mode (dump conversation history on truncation). |
 | `--nogui` | Run in direct CLI mode without TUI (original behaviour). |
 | `--disable-sandbox` | Disable the OS-level Landlock sandbox (Linux only). |
