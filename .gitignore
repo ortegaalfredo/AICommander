@@ -1,6 +1,52 @@
-# Python bytecode
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type checking
+.mypy_cache/
+.pytype/
+.pyright/
+
+# ---------------------------------------------------------------------------
+# AI-Commander specific
+# ---------------------------------------------------------------------------
 
 # Debug artifacts
 commander-debug.txt
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

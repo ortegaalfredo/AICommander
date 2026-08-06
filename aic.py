@@ -1216,7 +1216,6 @@ Think carefully; response quality is the highest priority. You have unlimited th
                     # The assistant stopped without calling tools and without signaling
                     # completion.  This is a premature stop - the task is NOT finished.
                     # Inject a continuation message so the LLM keeps working until done.
-                    self._log("Assistant provided a response without tool calls and without completion signal. Task is not finished. Injecting continuation prompt.")
 
                     continuation_msg = (
                         f"Continue working on the task. You previously responded without using any tools. "
@@ -1397,7 +1396,7 @@ def enable_sandbox() -> Tuple[bool, str]:
         ll.apply()
         return (True,
                 "[SANDBOX] OS-level Landlock sandbox enabled "
-                "(writes restricted to cwd, /tmp, /dev, and /dev/pts)")
+                "(writes restricted to current directory, /tmp and /dev)")
     except Exception as e:
         return (False,
                 f"[SANDBOX] Failed to enable Landlock sandbox: {e}")
@@ -1783,7 +1782,7 @@ def main():
                 # running commands or waiting on approval.
                 self._decay_token_rate()
             elif kind == "SHUTDOWN":
-                self._write_agent("[SHUTDOWN] Agent loop terminated.", style="bold red")
+                self._write_agent("[SHUTDOWN] Agent loop terminated, waiting for next command.", style="bold green")
                 self._handle_agent_exit()
 
             self.update_status_bar()
@@ -1993,10 +1992,12 @@ def main():
                 # Reuse the existing agent so its conversation history (from
                 # prior commands in this session) is carried into the new run.
                 # Clear its internal stop event so the loop can run again, and
-                # point it at the fresh sink.
+                # point it at the fresh sink.  Also re-sync the auto_approve
+                # gate in case the user toggled /aa since the last run.
                 self.agent.persist_history = True
                 self.agent.stop_event.clear()
                 self.agent.sink = self.sink
+                self.agent.auto_approve = self.auto_approve
             self.agent_thread = threading.Thread(
                 target=self.agent.run,
                 args=(prompt,),
@@ -2052,6 +2053,12 @@ def main():
                 self.auto_approve = not self.auto_approve
                 if self.sink:
                     self.sink.auto_approve = self.auto_approve
+                # Keep the agent's gate in sync too: get_user_confirmation()
+                # checks self.agent.auto_approve, not the app/sink flag, so
+                # without this the toggle would only update the UI while the
+                # agent kept auto-approving (or blocking) commands.
+                if self.agent:
+                    self.agent.auto_approve = self.auto_approve
                 self._write_agent(
                     f"[AUTO-APPROVE TOGGLED] auto_approve is now "
                     f"{'ON (commands will run without asking)' if self.auto_approve else 'OFF (commands will require /approve)'}"

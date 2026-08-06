@@ -1,0 +1,8 @@
+# Dependencies for AI-Commander
+#
+# Note: textual pulls in `rich` transitively, which the TUI code imports
+# directly (from rich.text import Text), so rich is not listed separately.
+
+openai>=2.0.0
+textual>=8.0.0
+py-landlock>=0.1.0
