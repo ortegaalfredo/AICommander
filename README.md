@@ -13,11 +13,6 @@ It supports two presentation modes:
   `/autoapprove` toggle for the approval gate.
 - **`--nogui`** — the original direct-CLI behaviour (stdout/stderr, no TUI).
 
-The agent logic (`AICommander`) is presentation-agnostic: all I/O is funnelled
-through an `EventSink` interface. `ConsoleSink` replicates the original CLI
-behaviour, while `TUISink` bridges events to the Textual app via a thread-safe
-queue.
-
 ![AI-Commander TUI](aic.png)
 
 ## Features
@@ -25,6 +20,7 @@ queue.
 - **Ralph-loop agent** — repeatedly plans, executes, and observes until the
   task is done.
 - **Shell access** — runs arbitrary commands and captures their output.
+- **Web search** — using duck-duck-go ddgr command line tool (need install)
 - **Approval gate** — review each command before it runs, or auto-approve.
 - **Thinking tokens** — optional display/hiding of reasoning output.
 - **Command timeouts** — prevent runaway commands (configurable).
