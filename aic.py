@@ -1638,11 +1638,7 @@ def main():
                 "⚠ AGENT WILL EXECUTE REAL BASH COMMANDS ON THIS SYSTEM ⚠\n"
                 "Auto-approve is OFF. Every command requires /approve or /reject.\n"
                 "Type /autoapprove (or /aa) to toggle auto-approve for this session.\n"
-                "───────────────────────────────────────────────────────────────────\n"
-                "COPY/PASTE: Text selection is handled by your TERMINAL, not this app.\n"
-                "  • Most terminals: drag to select, then middle-click or Ctrl+Shift+C/V\n"
-                "  • If mouse is captured: hold SHIFT while dragging to bypass app capture\n"
-                "  • This app has disabled its own mouse capture to allow native selection",
+                "───────────────────────────────────────────────────────────────────",
                 id="warning-banner",
                 markup=False
             )
