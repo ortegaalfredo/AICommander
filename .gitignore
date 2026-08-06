@@ -1,0 +1,6 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Debug artifacts
+commander-debug.txt
