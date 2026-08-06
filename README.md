@@ -18,6 +18,8 @@ through an `EventSink` interface. `ConsoleSink` replicates the original CLI
 behaviour, while `TUISink` bridges events to the Textual app via a thread-safe
 queue.
 
+![AI-Commander TUI](aic.png)
+
 ## Features
 
 - **Ralph-loop agent** — repeatedly plans, executes, and observes until the
