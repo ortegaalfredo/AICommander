@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Advanced LLM Interactor Tool
-A sophisticated command-line tool that provides shell access and task planning
+AI-Commander
+A ralph-loop AI agent that provides shell access and task planning
 capabilities to Large Language Models through function calling.
 
 This version supports two presentation modes:
@@ -9,7 +9,7 @@ This version supports two presentation modes:
   default  : Textual-based TUI with split panels (prompt, console, agent output,
              status footer) and an /autoapprove toggle for the approval gate.
 
-The agent logic (LLMInteractor) is presentation-agnostic: all I/O is funnelled
+The agent logic (AICommander) is presentation-agnostic: all I/O is funnelled
 through an EventSink interface.  ConsoleSink replicates the original CLI
 behaviour.  TUISink bridges events to the Textual app via a thread-safe queue.
 """
@@ -84,19 +84,19 @@ def _strip_ansi(text: str) -> str:
 # ---------------------------------------------------------------------------
 # EventSink abstraction
 # ---------------------------------------------------------------------------
-# The sink interface decouples LLMInteractor's I/O from the presentation
+# The sink interface decouples AICommander's I/O from the presentation
 # layer.  ConsoleSink replicates the original direct-terminal behaviour
 # (--nogui mode).  TUISink pushes events to a queue that the Textual app
 # polls from the main thread; the agent thread NEVER touches widgets
 # directly.
 #
 # All direct print()/input()/sys.exit() calls that were scattered through
-# LLMInteractor are funnelled through sink.emit()/sink.input() so the same
+# AICommander are funnelled through sink.emit()/sink.input() so the same
 # agent code runs unchanged in either mode.
 
 
 class EventSink:
-    """Abstract I/O interface for LLMInteractor.
+    """Abstract I/O interface for AICommander.
 
     Implementations:
         ConsoleSink  – direct terminal I/O (--nogui mode, backward compatible)
@@ -272,8 +272,8 @@ class TUISink(EventSink):
             self._approval_event.set()  # unblock any waiting approval
 
 
-class LLMInteractor:
-    """Main class for LLM interactor functionality"""
+class AICommander:
+    """Main class for AI-Commander functionality"""
 
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
                   show_thinking: bool = True, command_timeout: int = 30,
@@ -284,7 +284,7 @@ class LLMInteractor:
         self.api_key = api_key
         self.auto_approve = auto_approve
         self.conversation_history = []
-        # When True, run_interactor() continues any existing conversation
+        # When True, run() continues any existing conversation
         # history (carried over from a previous run) instead of resetting it.
         # This lets a fresh command keep the full chat context of past sessions.
         self.persist_history = persist_history
@@ -311,8 +311,8 @@ class LLMInteractor:
         # user messages so behavior can be steered mid-execution.
         self.suggestion_queue: queue.Queue = queue.Queue()
 
-        # Tracks whether the [SYSTEM] LLM INTERACTOR STARTED banner has already
-        # been displayed.  run_interactor() is re-entered for every new prompt,
+        # Tracks whether the [SYSTEM] AI-COMMANDER STARTED banner has already
+        # been displayed.  run() is re-entered for every new prompt,
         # but the banner should only appear once per session.
         self._started_banner_shown = False
 
@@ -364,8 +364,8 @@ class LLMInteractor:
         return len(content) if content is not None else 0
 
     def _dump_conversation_history(self):
-        """Dump the current conversation history to interactor-debug.txt for debugging."""
-        with open("interactor-debug.txt", "w", encoding="utf-8") as f:
+        """Dump the current conversation history to commander-debug.txt for debugging."""
+        with open("commander-debug.txt", "w", encoding="utf-8") as f:
             f.write(f"Conversation history dump at {datetime.now().isoformat()}\n")
             f.write(f"Total messages: {len(self.conversation_history)}\n")
             total_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
@@ -384,7 +384,7 @@ class LLMInteractor:
                     f.write(f"tool_calls: {json.dumps(tool_calls, indent=2)}\n")
                 f.write(f"content ({len(content)} chars):\n{content}\n\n")
             f.write("=" * 80 + "\nEnd of conversation history\n")
-        self._log(f"[DEBUG DUMP] Conversation history dumped to interactor-debug.txt")
+        self._log(f"[DEBUG DUMP] Conversation history dumped to commander-debug.txt")
 
     def _truncate_conversation_history(self):
         """Truncate conversation history if it exceeds max_prompt_len.
@@ -474,7 +474,7 @@ Think carefully; response quality is the highest priority. You have unlimited th
         try:
             import fcntl
         except ImportError:
-            self._log_error("'fcntl' module not available. This PTY-based interactor requires a Unix-like system.")
+            self._log_error("'fcntl' module not available. This PTY-based AI-Commander requires a Unix-like system.")
             return "fcntl module not available", 1
 
         pid, master_fd = pty.fork()
@@ -1017,15 +1017,15 @@ Think carefully; response quality is the highest priority. You have unlimited th
             })
             self._log(f"[USER SUGGESTION] {s}")
 
-    def run_interactor(self, user_request: str):
+    def run(self, user_request: str):
         """Main interactive loop"""
-        # Emit the startup banner only on the first prompt.  run_interactor()
+        # Emit the startup banner only on the first prompt.  run()
         # is called again for each new prompt, so without this guard the banner
         # would be reprinted every time.
         if not self._started_banner_shown:
             self._started_banner_shown = True
             self.sink.emit("SYSTEM", {
-                "text": "[LLM INTERACTOR STARTED]",
+                "text": "[AI-COMMANDER STARTED]",
                 "api_base": self.base_url,
                 "model": self.model,
                 "auto_approve": self.auto_approve,
@@ -1405,7 +1405,7 @@ def enable_sandbox() -> Tuple[bool, str]:
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description="Advanced LLM Interactor Tool")
+    parser = argparse.ArgumentParser(description="AI-Commander - a ralph-loop AI agent")
     parser.add_argument("--api-base", required=True, help="API base URL")
     parser.add_argument("--model", required=True, help="Model name")
     parser.add_argument("--api-key", required=True, help="API key")
@@ -1456,7 +1456,7 @@ def main():
             "text": args.sandbox_msg,
             "style": "green" if args.sandbox_enabled else "red",
         })
-        interactor = LLMInteractor(
+        commander = AICommander(
             api_base=args.api_base,
             model=args.model,
             api_key=args.api_key,
@@ -1470,15 +1470,15 @@ def main():
         )
         try:
             user_request = " ".join(args.request)
-            interactor.run_interactor(user_request)
+            commander.run(user_request)
         except KeyboardInterrupt:
-            interactor._log("[INTERRUPTED] Interactor stopped by user")
+            commander._log("[INTERRUPTED] AI-Commander stopped by user")
             sys.exit(0)
         except Exception as e:
-            interactor._log_error(f"\n[FATAL ERROR] An unexpected error occurred:")
+            commander._log_error(f"\n[FATAL ERROR] An unexpected error occurred:")
             import traceback
             tb_str = traceback.format_exc()
-            interactor._log_error(tb_str)
+            commander._log_error(tb_str)
             sys.exit(1)
         return
 
@@ -1494,8 +1494,8 @@ def main():
     from textual import events
     from textual.binding import Binding
 
-    class InteractorApp(App):
-        """Textual TUI for the LLM Interactor.
+    class CommanderApp(App):
+        """Textual TUI for AI-Commander.
 
         Layout (Norton-Commander / Midnight-Commander style):
             ┌────────────────────────────────┬───────────────────────────┐
@@ -1662,7 +1662,7 @@ def main():
             yield Static(id="status-bar")
 
         def on_mount(self):
-            self.title = "LLM Interactor TUI"
+            self.title = "AI-Commander TUI"
             self.sub_title = f"Model: {self.model_name} | Session: {self.session_id}"
             self.update_status_bar()
             # Give keyboard focus to the prompt input so typed commands are
@@ -1677,7 +1677,7 @@ def main():
             # If a task request was supplied on the command line, auto-start
             # the agent with it instead of discarding it.  This mirrors the
             # --nogui path where args.request is passed straight to
-            # run_interactor().  We schedule via a one-shot callback so the
+            # run().  We schedule via a one-shot callback so the
             # app has finished composing widgets before we start the
             # background thread; the request is consumed so a remount
             # (e.g. resize) does not re-launch.
@@ -1976,7 +1976,7 @@ def main():
                 # First run: create a fresh agent.  persist_history is enabled
                 # so that if the user later sends another command, the same
                 # instance is reused and its conversation history carries over.
-                self.agent = LLMInteractor(
+                self.agent = AICommander(
                     api_base=self.api_base,
                     model=self.model_name,
                     api_key=self.args.api_key,
@@ -1998,7 +1998,7 @@ def main():
                 self.agent.stop_event.clear()
                 self.agent.sink = self.sink
             self.agent_thread = threading.Thread(
-                target=self.agent.run_interactor,
+                target=self.agent.run,
                 args=(prompt,),
                 daemon=True
             )
@@ -2139,7 +2139,7 @@ def main():
             self.exit()
 
     # Instantiate and run the TUI
-    app = InteractorApp(args)
+    app = CommanderApp(args)
     try:
         app.run()
     except KeyboardInterrupt:
