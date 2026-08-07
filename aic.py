@@ -2020,14 +2020,12 @@ def main():
         }
         """
 
-        # Disable Textual's internal mouse-capture selection so the
-        # terminal's native text-selection/copy works normally.  In most
-        # terminals (xterm, gnome-terminal, kitty, iTerm2) this lets you
-        # select and copy text the usual way (drag, or Shift+drag when
-        # the terminal intercepts mouse events).  Textual's built-in
-        # selection only populates an internal buffer that cannot be
-        # pasted into external applications, so it is useless for real
-        # copy/paste and only interferes with the terminal.
+        # Keep Textual's mouse support enabled so buttons/tabs are clickable,
+        # but disable its internal text-selection mode so the terminal's
+        # native selection (left-drag to select, right-click to paste) works.
+        # Textual still captures mouse events for its widgets, but without
+        # ALLOW_SELECT it won't start its own selection highlight, letting
+        # the terminal emulator handle drag-selection and context menus.
         ALLOW_SELECT = False
 
         def __init__(self, args):
@@ -2101,7 +2099,7 @@ def main():
             # after a few seconds so it does not occupy screen space for
             # the whole session.  It is shown again whenever a command
             # approval is pending (see _refresh_approval_prompt).
-            self.set_timer(8.0, self._auto_hide_warning_banner)
+            self.set_timer(20.0, self._auto_hide_warning_banner)
             # Make sure the right-hand panel shows the Console Output tab by
             # default (it already does via ContentSwitcher(initial=...), but
             # set it explicitly so nothing can leave the Shell tab active).
@@ -2146,13 +2144,23 @@ def main():
         def update_status_bar(self):
             sb = self.query_one("#status-bar")
             ap_status = "ON" if self.auto_approve else "OFF"
+            # Show whether the OS-level Landlock sandbox is active.  The
+            # state is fixed at startup (see --disable-sandbox) so it never
+            # changes during the session; green when on, red when off.
+            sandbox_on = getattr(self.args, "sandbox_enabled", False)
+            sandbox_txt = (
+                "[green]Sandbox: on[/green]"
+                if sandbox_on
+                else "[red]Sandbox: off[/red]"
+            )
             status_text = (
                 f"Model: {self.model_name} | "
                 f"Step: {self.step_count}/{self.max_steps} | "
                 f"tok/s: {self.tokens_per_second:.1f} | "
                 f"Session: {self.session_id} | "
                 f"Auto-approve: {ap_status} | "
-                f"Pending approval: {'YES' if self.pending_approval else 'no'}"
+                f"Pending approval: {'YES' if self.pending_approval else 'no'} | "
+                f"{sandbox_txt}"
             )
             sb.update(status_text)
 
@@ -2241,7 +2249,7 @@ def main():
                 # running commands or waiting on approval.
                 self._decay_token_rate()
             elif kind == "SHUTDOWN":
-                self._write_agent("[SHUTDOWN] Agent loop terminated, waiting for next command.", style="bold green")
+                self._write_agent("[READY] Agent loop terminated, waiting for next command.", style="bold green")
                 self._handle_agent_exit()
 
             self.update_status_bar()
@@ -2288,6 +2296,12 @@ def main():
                 from rich.text import Text
                 widget = self.query_one("#agent-log")
                 clean = _strip_ansi(text)
+                # Filter out the internal completion marker so it doesn't
+                # clutter the agent output panel.  The agent loop still uses
+                # it internally to detect when the task is done.
+                clean = clean.replace("TASKCOMPLETE", "")
+                if not clean:
+                    return
                 buf_key = "#agent-log"
                 # --- Streaming path -------------------------------------------------
                 if streaming:
