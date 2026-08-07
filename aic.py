@@ -1116,7 +1116,9 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.request:
+    # The TUI can start with no request (user types one in the prompt input);
+    # --nogui is a one-shot runner and still requires one.
+    if args.nogui and not args.request:
         print("[ERROR] Please provide a task request", file=sys.stderr)
         sys.exit(1)
 
