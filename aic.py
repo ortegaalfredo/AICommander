@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
-"""
-AI-Commander
-A ralph-loop AI agent that provides shell access and task planning
-capabilities to Large Language Models through function calling.
+"""AI-Commander: a ralph-loop AI agent giving LLMs shell access via function calling.
 
-This version supports two presentation modes:
-  --nogui  : Original direct-CLI behaviour (stdout/stderr, no TUI)
-  default  : Textual-based TUI with split panels (prompt, console, agent output,
-             status footer) and an /autoapprove toggle for the approval gate.
-
-The agent logic (AICommander) is presentation-agnostic: all I/O is funnelled
-through an EventSink interface.  ConsoleSink replicates the original CLI
-behaviour.  TUISink bridges events to the Textual app via a thread-safe queue.
+Modes: --nogui (direct CLI) or the default Textual TUI. All agent I/O goes
+through an EventSink (ConsoleSink or TUISink) so the same agent code drives
+either presentation.
 """
 
 import argparse
 import json
-import subprocess
 import sys
 import time
 import threading
@@ -29,56 +20,44 @@ import select
 import fcntl
 import termios
 import struct
+import traceback
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from openai import OpenAI
 
-# Cloudflare-friendly user-agent used for ALL outbound HTTP requests so the
-# script is not flagged as a bot and the IP does not get blocked. It is sent
-# as a header on OpenAI API calls and injected into curl/wget/other tools run
-# through execute_bash_command.
+# Browser-like User-Agent for all outbound HTTP (OpenAI API calls plus
+# curl/wget run through execute_bash) so Cloudflare-fronted endpoints do not
+# flag the script as a bot and block the IP.
 USER_AGENT = 'Mozilla/5.0 (compatible; OpenAI-Client/1.0)'
 
 try:
     # Textual is only required for TUI mode; --nogui runs without it.
-    import textual
-    from textual.app import App, ComposeResult
-    from textual.widgets import RichLog, Input, Static, Button
-    from textual.widgets import TabbedContent, TabPane
-    from textual.widget import Widget
+    from textual.app import ComposeResult
+    from textual.widgets import Static, Button
     from textual.screen import ModalScreen
     from textual.containers import Horizontal, Vertical
-    from textual import events
     from textual.binding import Binding
-    import pyte  # VT100 terminal emulator used by the embedded shell widget
     _TEXTUAL_AVAILABLE = True
 except ImportError:
     _TEXTUAL_AVAILABLE = False
 
 
-# Color codes for output (used by ConsoleSink and ANSI stripping in TUISink)
 class colors:
+    """ANSI codes used by ConsoleSink (stripped again by TUISink)."""
     RED = '\033[91m'
     GREEN = '\033[92m'
     YELLOW = '\033[93m'
     BLUE = '\033[94m'
-    MAGENTA = '\033[95m'
     CYAN = '\033[96m'
-    WHITE = '\033[97m'
     BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
     END = '\033[0m'
 
 
 class CommandTimeoutError(Exception):
-    """Exception raised when command execution times out"""
+    """Raised when command execution times out."""
     pass
 
 
-# ---------------------------------------------------------------------------
-# ANSI stripping helper (used by TUISink to strip raw \033[...] codes before
-# pushing events to the Textual app, which applies its own Rich styling).
-# ---------------------------------------------------------------------------
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
 
@@ -87,166 +66,95 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub('', text)
 
 
-# ---------------------------------------------------------------------------
-# EventSink abstraction
-# ---------------------------------------------------------------------------
-# The sink interface decouples AICommander's I/O from the presentation
-# layer.  ConsoleSink replicates the original direct-terminal behaviour
-# (--nogui mode).  TUISink pushes events to a queue that the Textual app
-# polls from the main thread; the agent thread NEVER touches widgets
-# directly.
-#
-# All direct print()/input()/sys.exit() calls that were scattered through
-# AICommander are funnelled through sink.emit()/sink.input() so the same
-# agent code runs unchanged in either mode.
-
-
 class EventSink:
-    """Abstract I/O interface for AICommander.
+    """Abstract presentation-layer I/O for AICommander.
 
-    Implementations:
-        ConsoleSink  – direct terminal I/O (--nogui mode, backward compatible)
-        TUISink      – queue bridge to Textual app (TUI mode)
-
-    The agent code calls only these methods; it never touches print/input
-    directly.  This makes the agent presentation-agnostic.
+    Event kinds: LOG, ERROR, LLM_STREAM, THINKING_STREAM, CMD_EXEC,
+    CMD_OUTPUT, CMD_COMPLETE, SYSTEM, STATUS_UPDATE, APPROVAL_REQUEST,
+    SHUTDOWN. Common payload keys: text, end, flush.
     """
 
     def emit(self, kind: str, payload: dict):
-        """Output an event.
-
-        kind values:
-            LOG              – general informational output
-            ERROR            – error / warning output
-            LLM_STREAM       – streamed LLM content (token-by-token)
-            THINKING_STREAM  – streamed reasoning/thinking content
-            CMD_EXEC         – command is about to be executed
-            CMD_OUTPUT       – raw command output chunk
-            CMD_COMPLETE     – command finished with exit code
-            SYSTEM           – system banner (model, API base, config)
-            STATUS_UPDATE    – footer status update (tok/s, step, etc.)
-            APPROVAL_REQUEST – command awaiting approval
-            SHUTDOWN         – agent is shutting down
-        payload fields depend on kind; common keys: text, end, flush.
-        """
-        raise NotImplementedError("emit() must be implemented by subclass")
+        raise NotImplementedError
 
     def input(self, prompt: str) -> str:
-        """Request a line of user input.  Used by the approval gate.
-        Returns the user's response string."""
-        raise NotImplementedError("input() must be implemented by subclass")
+        """Request a line of user input (approval gate)."""
+        raise NotImplementedError
 
     def close(self):
-        """Release any resources held by the sink."""
-        raise NotImplementedError("close() must be implemented by subclass")
+        raise NotImplementedError
 
 
 class ConsoleSink(EventSink):
-    """Sink for --nogui mode.  Replicates the original direct-terminal
-    behaviour exactly: stdout/stderr via print(), stdin via builtins.input().
-    No queueing, no threading, no TUI – a thin adapter that preserves the
-    historical CLI behaviour bit-for-bit."""
+    """Direct terminal I/O for --nogui mode (no queueing, no TUI)."""
 
-    def __init__(self):
-        import builtins
-        self._builtins = builtins
+    _STYLES = {
+        "ERROR": colors.RED,
+        "LLM_STREAM": colors.CYAN,
+        "THINKING_STREAM": colors.YELLOW,
+        "CMD_OUTPUT": colors.GREEN,
+        "CMD_EXEC": colors.YELLOW,
+        "CMD_COMPLETE": colors.BOLD,
+        "SYSTEM": colors.BOLD + colors.BLUE,
+    }
+    _LOG_STYLES = {"yellow": colors.YELLOW, "green": colors.GREEN, "red": colors.RED}
 
     def emit(self, kind: str, payload: dict):
         text = payload.get("text", "")
         if kind == "STATUS_UPDATE":
             return  # status footer is meaningless in CLI mode
-        # Streaming kinds (LLM tokens, thinking tokens) must NOT add a
-        # newline after each token; the caller controls line breaks by
-        # emitting explicit \n characters or by sending a final LOG event.
-        if kind in ("LLM_STREAM", "THINKING_STREAM"):
-            end = ""
-        else:
-            end = payload.get("end", "\n")
+        # Streaming kinds must not append a newline after each token.
+        end = "" if kind in ("LLM_STREAM", "THINKING_STREAM") else payload.get("end", "\n")
         flush = payload.get("flush", True)
-        # Apply colour per event kind
-        if kind == "ERROR":
-            print(f"{colors.RED}{text}{colors.END}", file=sys.stderr, end=end, flush=flush)
-        elif kind == "LLM_STREAM":
-            print(f"{colors.CYAN}{text}{colors.END}", end=end, flush=flush)
-        elif kind == "THINKING_STREAM":
-            print(f"{colors.YELLOW}{text}{colors.END}", end=end, flush=flush)
-        elif kind == "CMD_OUTPUT":
-            print(f"{colors.GREEN}{text}{colors.END}", end=end, flush=flush)
-        elif kind == "CMD_EXEC":
-            print(f"{colors.YELLOW}{text}{colors.END}", end=end, flush=flush)
-        elif kind == "CMD_COMPLETE":
-            print(f"{colors.BOLD}{text}{colors.END}", end=end, flush=flush)
-        elif kind == "SYSTEM":
-            print(f"{colors.BOLD}{colors.BLUE}{text}{colors.END}", end=end, flush=flush)
-        elif kind == "LOG":
-            style = payload.get("style", "")
-            if style == "yellow":
-                print(f"{colors.YELLOW}{text}{colors.END}", end=end, flush=flush)
-            elif style == "green":
-                print(f"{colors.GREEN}{text}{colors.END}", end=end, flush=flush)
-            elif style == "red":
-                print(f"{colors.RED}{text}{colors.END}", end=end, flush=flush)
-            else:
-                print(text, end=end, flush=flush)
+        if kind == "LOG":
+            style = self._LOG_STYLES.get(payload.get("style", ""), "")
         else:
-            print(text, end=end, flush=flush)
+            style = self._STYLES.get(kind, "")
+        out = sys.stderr if kind == "ERROR" else sys.stdout
+        print(f"{style}{text}{colors.END}" if style else text, file=out, end=end, flush=flush)
 
     def input(self, prompt: str) -> str:
-        return self._builtins.input(prompt)
+        import builtins
+        return builtins.input(prompt)
 
     def close(self):
         pass
 
 
 class TUISink(EventSink):
-    """Sink for TUI mode.  All emit() calls are serialised and pushed to a
-    thread-safe queue.  The Textual app (main thread) polls the queue via
-    set_interval and renders events to widgets.  The agent thread NEVER
-    touches widgets or Textual objects directly.
+    """Queue bridge to the Textual app. The agent thread only writes to the
+    queue; the main thread polls it and renders events to widgets.
 
-    The input() method implements the approval gate:
-        - auto_approve True  → return "y" immediately (no blocking)
-        - auto_approve False → push APPROVAL_REQUEST event, block on a
-                               threading.Event until the TUI user types
-                               /approve or /reject, or stop_event is set
+    input() implements the approval gate: returns "y" immediately when
+    auto_approve is on, otherwise pushes APPROVAL_REQUEST and blocks on a
+    threading.Event until the TUI calls resolve_approval().
     """
 
     def __init__(self, event_queue: queue.Queue, stop_event: threading.Event):
         self.queue = event_queue
         self.stop_event = stop_event
         self.auto_approve = False
-        # Approval gate state – single-slot because the agent processes one
-        # command at a time.
         self._approval_event: Optional[threading.Event] = None
         self._approval_response: Optional[str] = None
 
     def emit(self, kind: str, payload: dict):
         if self.stop_event.is_set():
             return
-        # Strip ANSI codes; the TUI applies its own styling via Rich markup
-        clean = {}
-        for k, v in payload.items():
-            clean[k] = _strip_ansi(v) if isinstance(v, str) else v
+        # Strip ANSI codes; the TUI applies its own styling via Rich markup.
+        clean = {k: _strip_ansi(v) if isinstance(v, str) else v for k, v in payload.items()}
         self.queue.put({"kind": kind, "payload": clean})
 
     def input(self, prompt: str) -> str:
-        # Fast path: auto-approve enabled → no blocking
         if self.auto_approve:
             return "y"
 
-        # Create the event FIRST so the TUI thread can never resolve the
-        # request before we start waiting on it (race condition).  Only after
-        # the event object exists do we push the APPROVAL_REQUEST event; the
-        # main thread may then call resolve_approval() at any point and the
-        # set() will land on an event we are about to wait on.
+        # Create the event BEFORE publishing the request so the TUI can never
+        # resolve it before we start waiting on it (race condition).
         self._approval_event = threading.Event()
         self._approval_response = None
-
-        # Push an approval request event so the TUI can display the dialog
         self.emit("APPROVAL_REQUEST", {"command": prompt})
 
-        # Block until the TUI user resolves the request or the agent is
-        # shutting down.  Poll every 100 ms so we can react to stop_event.
+        # Poll so we can react to shutdown while blocked.
         while not self._approval_event.is_set():
             if self.stop_event.is_set():
                 self._approval_event = None
@@ -260,15 +168,8 @@ class TUISink(EventSink):
         return response
 
     def resolve_approval(self, approved: bool, suggestion: str = ""):
-        """Called by the TUI (main thread) when the user responds to a
-        pending approval request.  approved=True → "y";
-        approved=False → suggestion if given else "n"."""
-        if approved:
-            self._approval_response = "y"
-        else:
-            self._approval_response = suggestion if suggestion else "n"
-        # set() is idempotent and thread-safe; safe to call even if the agent
-        # thread has not yet reached the wait() (it will return immediately).
+        """Called by the TUI when the user answers a pending approval request."""
+        self._approval_response = "y" if approved else (suggestion or "n")
         if self._approval_event:
             self._approval_event.set()
 
@@ -281,6 +182,9 @@ class TUISink(EventSink):
 class AICommander:
     """Main class for AI-Commander functionality"""
 
+    COMPLETION_MARKER = "TASKCOMPLETE"
+    OUTPUT_TRUNCATION_SENTINEL = "output too long: truncated"
+
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
                   show_thinking: bool = True, command_timeout: int = 30,
                   max_prompt_len: int = 20000, max_output_bytes: int = 10240, debug: bool = False,
@@ -290,9 +194,8 @@ class AICommander:
         self.api_key = api_key
         self.auto_approve = auto_approve
         self.conversation_history = []
-        # When True, run() continues any existing conversation
-        # history (carried over from a previous run) instead of resetting it.
-        # This lets a fresh command keep the full chat context of past sessions.
+        # When True, run() extends the existing conversation history instead
+        # of resetting it, so a fresh prompt keeps prior chat context.
         self.persist_history = persist_history
         self.max_steps = max_steps
         self.max_tokens = 8000
@@ -302,36 +205,27 @@ class AICommander:
         self.max_prompt_len = max_prompt_len
         self.max_output_bytes = max_output_bytes
         self.debug = debug
-
-        # Sink for presentation-layer I/O.  Default to ConsoleSink so the
-        # agent is usable without a TUI (backward-compatible --nogui path).
         self.sink: EventSink = sink if sink is not None else ConsoleSink()
 
-        # Shutdown coordination – checked between steps and before
-        # each command execution so the TUI can halt the agent cleanly.
+        # Checked between steps and during command execution so the TUI can
+        # halt the agent cleanly.
         self.stop_event = threading.Event()
 
-        # Queue for mid-run user suggestions.  The TUI (main thread) pushes
-        # steering messages here while the agent is running; the agent thread
-        # drains the queue at the start of each step and injects them as
-        # user messages so behavior can be steered mid-execution.
+        # Mid-run user suggestions queued by the TUI; drained at the start of
+        # each step and injected as user messages.
         self.suggestion_queue: queue.Queue = queue.Queue()
 
-        # Tracks whether the [SYSTEM] AI-COMMANDER STARTED banner has already
-        # been displayed.  run() is re-entered for every new prompt,
-        # but the banner should only appear once per session.
+        # run() is re-entered for every new prompt but the startup banner
+        # should only appear once per session.
         self._started_banner_shown = False
 
-        # Initialize OpenAI client. default_headers ensures the User-Agent is
-        # sent on every API call so endpoints behind Cloudflare do not treat
-        # the OpenAI SDK's default agent as a bot and block the IP.
+        # default_headers sends the User-Agent on every API call (Cloudflare).
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
             default_headers={'User-Agent': USER_AGENT}
         )
 
-        # Tool schemas
         self.tool_schemas = [
             {
                 "type": "function",
@@ -353,24 +247,17 @@ class AICommander:
         ]
 
     def _log(self, message: str, end: str = '\n', flush: bool = True, style: str = ""):
-        """Emit a log event via the sink."""
         self.sink.emit("LOG", {"text": message, "end": end, "flush": flush, "style": style})
 
     def _log_error(self, message: str):
-        """Emit an error event via the sink."""
         self.sink.emit("ERROR", {"text": message})
 
-    # --- Single-source-of-truth constants ---
-    COMPLETION_MARKER = "TASKCOMPLETE"
-    OUTPUT_TRUNCATION_SENTINEL = "output too long: truncated"
-
     def _get_message_length(self, msg: dict) -> int:
-        """Get the length of a message content, handling None values."""
         content = msg.get('content', '')
         return len(content) if content is not None else 0
 
     def _dump_conversation_history(self):
-        """Dump the current conversation history to commander-debug.txt for debugging."""
+        """Dump the conversation history to commander-debug.txt for debugging."""
         with open("commander-debug.txt", "w", encoding="utf-8") as f:
             f.write(f"Conversation history dump at {datetime.now().isoformat()}\n")
             f.write(f"Total messages: {len(self.conversation_history)}\n")
@@ -379,30 +266,22 @@ class AICommander:
             f.write(f"Max prompt length: {self.max_prompt_len}\n")
             f.write("=" * 80 + "\n\n")
             for i, msg in enumerate(self.conversation_history):
-                role = msg.get('role', 'unknown')
                 content = msg.get('content', '') or ''
-                tool_calls = msg.get('tool_calls', [])
-                tool_call_id = msg.get('tool_call_id', '')
-                f.write(f"--- Message {i} (role: {role}) ---\n")
-                if tool_call_id:
-                    f.write(f"tool_call_id: {tool_call_id}\n")
-                if tool_calls:
-                    f.write(f"tool_calls: {json.dumps(tool_calls, indent=2)}\n")
+                f.write(f"--- Message {i} (role: {msg.get('role', 'unknown')}) ---\n")
+                if msg.get('tool_call_id'):
+                    f.write(f"tool_call_id: {msg['tool_call_id']}\n")
+                if msg.get('tool_calls'):
+                    f.write(f"tool_calls: {json.dumps(msg['tool_calls'], indent=2)}\n")
                 f.write(f"content ({len(content)} chars):\n{content}\n\n")
             f.write("=" * 80 + "\nEnd of conversation history\n")
         self._log(f"[DEBUG DUMP] Conversation history dumped to commander-debug.txt")
 
     def _truncate_conversation_history(self):
-        """Truncate conversation history if it exceeds max_prompt_len.
+        """Shrink conversation history below max_prompt_len.
 
-        Keeps the system prompt (index 0) and the first user instruction (index 1),
-        then reduces size from the oldest messages onwards.  Two passes:
-
-          1. Condense oversized tool outputs in-place (cheap, preserves structure).
-          2. Drop the oldest messages (index 2 onwards) until under the limit.
-
-        This actually shrinks the list, unlike the previous implementation which
-        only mutated tool content in-place and never removed messages.
+        Keeps the system prompt (index 0) and first user instruction (index 1).
+        Pass 1 condenses oversized tool outputs in-place; pass 2 drops the
+        oldest messages from index 2 onwards until under the limit.
         """
         total_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
 
@@ -411,7 +290,6 @@ class AICommander:
 
         self._log(f"[TRUNCATING] Prompt length ({total_len}) exceeds max ({self.max_prompt_len}). Truncating conversation history.")
 
-        # Pass 1: condense oversized tool outputs in-place.
         for msg in self.conversation_history:
             if msg.get('role') == 'tool' and isinstance(msg.get('content'), str) and len(msg['content']) > 30:
                 removed_len = len(msg['content'])
@@ -419,40 +297,29 @@ class AICommander:
                 total_len -= (removed_len - len(msg['content']))
                 self._log(f"[TRUNCATED] Condensed tool message (removed {removed_len} chars)")
 
-        # Pass 2: drop the oldest messages (keep system at 0 and first user at 1).
-        # Iterate by index and only advance when we keep a message, so popped
-        # entries are naturally skipped without going out of range.
         i = 2
         while i < len(self.conversation_history) and total_len > self.max_prompt_len:
             removed_msg = self.conversation_history.pop(i)
             total_len -= self._get_message_length(removed_msg)
             self._log(f"[TRUNCATED] Removed {removed_msg.get('role')} message (removed {self._get_message_length(removed_msg)} chars, new length: {total_len})")
 
-        # Safety: never drop the system prompt or the first user instruction.
-        # If we somehow still exceed the limit (e.g. a single enormous system
-        # prompt), stop rather than corrupt the conversation.
         final_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
         self._log(f"[TRUNCATING COMPLETE] Final prompt length: {final_len}")
 
     def get_system_prompt(self) -> str:
         """Get the system prompt for the LLM"""
-        marker = self.COMPLETION_MARKER
-        truncation_sentinel = self.OUTPUT_TRUNCATION_SENTINEL
-        timeout_seconds = self.command_timeout
-        output_limit = self.max_output_bytes
-
-        base_prompt = f"""You are an expert planning and execution assistant. Fulfill the user's request by breaking it into manageable steps and executing bash commands via the execute_bash tool (one command at a time, waiting for each result).
+        return f"""You are an expert planning and execution assistant. Fulfill the user's request by breaking it into manageable steps and executing bash commands via the execute_bash tool (one command at a time, waiting for each result).
 
 **Workflow:**
 1. Analyze the request; if complex, break it into a numbered task list.
 2. Restate your plan every ~5 steps and update the task list as you progress.
 3. Execute one step with execute_bash, then evaluate the result.
-4. If a step fails, adjust your approach and explain. If all steps are done and the goal is met, emit the exact phrase '{marker}'.
-5. Only emit '{marker}' once you are certain every necessary action is complete and verified. Never say it prematurely.
+4. If a step fails, adjust your approach and explain. If all steps are done and the goal is met, emit the exact phrase '{self.COMPLETION_MARKER}'.
+5. Only emit '{self.COMPLETION_MARKER}' once you are certain every necessary action is complete and verified. Never say it prematurely.
 
 **Runtime Constraints (execute_bash):**
-- Output is capped at {output_limit} bytes. If truncated, the literal sentinel `{truncation_sentinel}` is appended. If you see it, you are missing data — do NOT assume success or failure. Re-run with output redirected to a file and read in chunks via `sed -n 'start,end p' file`, or use `head -c N`/`tail -c N`. Prefer targeted commands (grep, wc, stat) over dumping large outputs.
-- Commands are killed after {timeout_seconds}s. For long operations use `nohup ... &` and check later, split into smaller steps, or set your own `timeout`.
+- Output is capped at {self.max_output_bytes} bytes. If truncated, the literal sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}` is appended. If you see it, you are missing data — do NOT assume success or failure. Re-run with output redirected to a file and read in chunks via `sed -n 'start,end p' file`, or use `head -c N`/`tail -c N`. Prefer targeted commands (grep, wc, stat) over dumping large outputs.
+- Commands are killed after {self.command_timeout}s. For long operations use `nohup ... &` and check later, split into smaller steps, or set your own `timeout`.
 - Commands run in a PTY; use non-interactive flags (`-y`, `--no-interactive`) where available.
 
 **Command Results:**
@@ -466,57 +333,38 @@ class AICommander:
 - Keep working until the task is genuinely complete. Do NOT stop early or produce a summary-only final response — take concrete action with tools.
 - If you respond without calling tools, the system injects a continuation prompt; you must keep making progress.
 - Troubleshoot errors and try alternative approaches until the objective is met.
-- The ONLY way to finish is to emit '{marker}' AFTER verifying all objectives via actual command execution and result inspection. Partial completion is not completion.
+- The ONLY way to finish is to emit '{self.COMPLETION_MARKER}' AFTER verifying all objectives via actual command execution and result inspection. Partial completion is not completion.
 - Do not ask the user for clarification unless you have exhausted autonomous options.
-- Before emitting '{marker}', verify your last actions (check file contents, run tests, confirm services).
+- Before emitting '{self.COMPLETION_MARKER}', verify your last actions (check file contents, run tests, confirm services).
 
 Think carefully; response quality is the highest priority. You have unlimited thinking tokens."""
-        return base_prompt
 
     def execute_bash_command(self, command: str) -> Tuple[str, int]:
-        """Execute a bash command with timeout and return output and exit code"""
+        """Execute a bash command in a PTY with timeout; return (output, exit_code)."""
         output_buffer = bytearray()
-
-        try:
-            import fcntl
-        except ImportError:
-            self._log_error("'fcntl' module not available. This PTY-based AI-Commander requires a Unix-like system.")
-            return "fcntl module not available", 1
-
         pid, master_fd = pty.fork()
 
         if pid == 0:
-            # Best-effort, start a new process group so os.killpg(pid, ...) targets
-            # the child's group rather than the parent's. In sandboxes that forbid
-            # setsid (EPERM), we fall back to running in the parent's group; the
-            # killpg calls in the parent are guarded by try/except OSError already.
+            # Child: start a new process group so the parent's killpg() targets
+            # the whole tree. Sandboxes may forbid setsid (EPERM); the parent's
+            # killpg calls are guarded by try/except OSError.
             try:
                 os.setsid()
             except OSError:
                 pass
-            # Export the same Cloudflare-friendly User-Agent used by the OpenAI
-            # client. curl/wget (and any tool honoring HTTP_USER_AGENT) will
-            # inherit it so Cloudflare sees a consistent, browser-like agent and
-            # does not flag the script as a bot or block the IP.
-            try:
-                os.environ["HTTP_USER_AGENT"] = USER_AGENT
-            except Exception:
-                pass
-            # Shell functions that force curl/wget to send our User-Agent, so
-            # even tools that ignore the HTTP_USER_AGENT env var stay consistent.
-            _ua_wrapper = (
+            # Force curl/wget (and tools honoring HTTP_USER_AGENT) to send the
+            # same browser-like User-Agent as the OpenAI client.
+            wrapper = (
                 'export HTTP_USER_AGENT="%s"; '
                 'curl() { command curl -A "$HTTP_USER_AGENT" "$@"; }; '
                 'wget() { command wget --user-agent="$HTTP_USER_AGENT" "$@"; }; '
                 '%s'
             ) % (USER_AGENT, command)
             try:
-                os.execvp("/bin/sh", ["/bin/sh", "-c", _ua_wrapper])
+                os.execvp("/bin/sh", ["/bin/sh", "-c", wrapper])
             except OSError as e:
                 os.write(2, f"Child process error (os.execvp failed): {e}\n".encode('utf-8'))
                 os._exit(1)
-            # os.execvp only returns on error; this line is unreachable on success
-            os._exit(0)
 
         exit_code = -1
         timed_out = False
@@ -524,17 +372,15 @@ Think carefully; response quality is the highest priority. You have unlimited th
         master_fl = fcntl.fcntl(master_fd, fcntl.F_GETFL)
         fcntl.fcntl(master_fd, fcntl.F_SETFL, master_fl | os.O_NONBLOCK)
 
-        # In TUI mode (TUISink), Textual/curses owns the terminal and sys.stdin.
-        # Modifying stdin flags or including it in select() will freeze the UI.
-        # Only monitor stdin in ConsoleSink (--nogui) mode.
+        # In TUI mode Textual owns the terminal; touching stdin flags or
+        # select()ing on it would freeze the UI. Only monitor stdin in CLI mode.
         _monitor_stdin = not isinstance(self.sink, TUISink)
         stdin_fl = None
         if _monitor_stdin:
             stdin_fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
             fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, stdin_fl | os.O_NONBLOCK)
 
-        # Derive the output kill threshold from the configurable max_output_bytes
-        # (5x the limit) instead of a hardcoded 50KB, so the two stay in sync.
+        # Kill the command if its raw output grows past 5x the return limit.
         output_kill_threshold = 5 * self.max_output_bytes
 
         start_time = time.time()
@@ -561,7 +407,6 @@ Think carefully; response quality is the highest priority. You have unlimited th
                     timed_out = True
                     break
 
-                # Only include sys.stdin in select when not in TUI mode.
                 _read_fds = [master_fd, sys.stdin.fileno()] if _monitor_stdin else [master_fd]
                 rlist, _, _ = select.select(_read_fds, [], [], 0.1)
 
@@ -572,8 +417,10 @@ Think carefully; response quality is the highest priority. You have unlimited th
                             output_buffer.extend(data)
                             # Stream output to the sink in real-time
                             try:
-                                chunk_text = data.decode('utf-8', errors='replace')
-                                self.sink.emit("CMD_OUTPUT", {"text": chunk_text, "command": command})
+                                self.sink.emit("CMD_OUTPUT", {
+                                    "text": data.decode('utf-8', errors='replace'),
+                                    "command": command,
+                                })
                             except Exception:
                                 pass
                             if len(output_buffer) > output_kill_threshold:
@@ -611,7 +458,6 @@ Think carefully; response quality is the highest priority. You have unlimited th
             if master_fd is not None:
                 os.close(master_fd)
 
-            # Only restore stdin flags when we modified them.
             if stdin_fl is not None:
                 try:
                     fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, stdin_fl)
@@ -619,17 +465,9 @@ Think carefully; response quality is the highest priority. You have unlimited th
                     pass
 
             if exit_code == -1:
-                # The main loop exited without observing the child's exit status
-                # (e.g., PTY reached EOF before the status was seen).  Use a
-                # blocking waitpid(pid, 0) so the OS reaps the now-dead child
-                # and returns its TRUE exit status.
-                #
-                # The previous code used WNOHANG, which returns (0, 0) for
-                # "still running".  That is indistinguishable from the
-                # "exited normally, code 0" case, causing a false-positive
-                # "Command still running after timeout" message even for
-                # instant commands like `grep`.  Blocking here is correct
-                # because the child has already exited by now.
+                # The loop exited without observing the child's status (e.g.
+                # PTY EOF arrived first). The child is already dead, so reap it
+                # with a blocking waitpid to obtain the TRUE exit status.
                 try:
                     _, status = os.waitpid(pid, 0)
                     if os.WIFEXITED(status):
@@ -639,39 +477,32 @@ Think carefully; response quality is the highest priority. You have unlimited th
                     else:
                         exit_code = 1
                 except OSError:
-                    # ESRCH: child already reaped.  ECHILD: not our child.
-                    # Nothing to report; do not fabricate a "still running"
-                    # message.
-                    pass
+                    pass  # ESRCH/ECHILD: already reaped or not our child
 
         final_output = output_buffer.decode('utf-8', errors='replace')
 
-        # Clean carriage returns: remove \r characters to avoid ^M display issues
-        # and normalize line endings to Unix style (\n)
+        # Normalize line endings (strips ^M from PTY output).
         final_output = final_output.replace('\r\n', '\n').replace('\r', '\n')
 
-        # Truncate output if it exceeds max_output_bytes
-        output_bytes = len(final_output.encode('utf-8'))
-        if output_bytes > self.max_output_bytes:
+        if len(final_output.encode('utf-8')) > self.max_output_bytes:
             final_output = final_output[:self.max_output_bytes] + "\n" + self.OUTPUT_TRUNCATION_SENTINEL
 
-        # Notify sink of command completion
         self.sink.emit("CMD_COMPLETE", {"command": command, "exit_code": exit_code, "output": final_output})
 
-        # Raise CommandTimeoutError if the command timed out, so the caller's
-        # except CommandTimeoutError handler is reachable.
         if timed_out:
             raise CommandTimeoutError(f"Command timed out after {self.command_timeout} seconds")
 
         return final_output, exit_code
 
     def get_user_confirmation(self, command: str) -> Tuple[bool, Optional[str]]:
-        """Get user confirmation for command execution via the sink"""
+        """Get user confirmation for command execution via the sink.
+
+        Returns (approved, suggestion): suggestion is a non-empty steering
+        string when the user rejected with guidance instead of a plain no.
+        """
         if self.auto_approve:
             return True, None
 
-        # Ask the sink for approval.  ConsoleSink uses builtins.input() (CLI);
-        # TUISink blocks on an Event until the TUI user types /approve or /reject.
         prompt = f"Approve command? (y/n/suggestion): {command}"
         response_input = self.sink.input(prompt).strip().lower()
 
@@ -683,80 +514,37 @@ Think carefully; response quality is the highest priority. You have unlimited th
             return False, response_input
 
     def _validate_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Validate and sanitize messages before sending to API.
-
-        Ensures all messages have valid content (not None) and proper structure.
-        """
+        """Sanitize messages before sending: no None content, valid roles, tool
+        messages need tool_call_id, and no trailing assistant message without
+        tool calls (a terminal state APIs reject; signaled by an empty list)."""
         validated = []
         for msg in messages:
-            # Create a copy to avoid modifying the original
             clean_msg = dict(msg)
-
-            # Ensure content is never None - use empty string instead
             if clean_msg.get("content") is None:
-                # If it's a tool message without content, that's okay if it has tool_call_id
-                if clean_msg.get("role") == "tool" and clean_msg.get("tool_call_id"):
-                    clean_msg["content"] = ""
-                elif clean_msg.get("role") == "assistant" and clean_msg.get("tool_calls"):
-                    # Assistant messages with tool_calls can have empty content
-                    clean_msg["content"] = ""
-                else:
-                    # For other messages, set to empty string
-                    clean_msg["content"] = ""
-
-            # Ensure role is valid
-            valid_roles = ["system", "user", "assistant", "tool", "developer", "function"]
-            if clean_msg.get("role") not in valid_roles:
-                # Skip invalid messages or set a default
+                clean_msg["content"] = ""
+            if clean_msg.get("role") not in ("system", "user", "assistant", "tool", "developer", "function"):
                 continue
-
-            # Tool messages must have tool_call_id
             if clean_msg.get("role") == "tool" and not clean_msg.get("tool_call_id"):
-                # Skip tool messages without tool_call_id
                 continue
-
-            # Function messages must have name
             if clean_msg.get("role") == "function" and not clean_msg.get("name"):
-                # Skip function messages without name
                 continue
-
             validated.append(clean_msg)
 
-        # Safety check: prevent consecutive assistant messages at the end of the list.
-        # Many API providers reject this pattern with errors like:
-        # "Cannot have 2 or more assistant messages at the end of the list."
-        # This can happen when a previous turn ended with an assistant message
-        # (no tool calls) and the caller attempts to send another request.
+        # APIs reject consecutive assistant messages; drop the older one.
         while len(validated) >= 2 and validated[-1].get("role") == "assistant" and validated[-2].get("role") == "assistant":
-            # Remove the older of the two consecutive assistant messages
             validated.pop(-2)
 
-        # If the last message is an assistant message (no tool calls), we cannot
-        # proceed - the API would have to produce another assistant message.
-        # Return empty list to signal the caller to stop.
-        if len(validated) >= 1 and validated[-1].get("role") == "assistant":
-            # Check if the last assistant message has tool_calls
-            last_msg = validated[-1]
-            has_tool_calls = bool(last_msg.get("tool_calls"))
-            if not has_tool_calls:
-                # The last message is an assistant message without tool calls.
-                # This is a terminal state - we cannot continue without violating
-                # the API's constraint. Signal the caller by returning an empty list.
-                # The caller should check for empty list and terminate the loop.
-                return []
+        if validated and validated[-1].get("role") == "assistant" and not validated[-1].get("tool_calls"):
+            return []
 
         return validated
 
     def call_llm_api(self, messages: List[Dict[str, str]], use_tools: bool = True) -> Dict[str, Any]:
-        """Call the LLM API using the OpenAI client with streaming support"""
-
-        # Validate and sanitize messages before sending
+        """Call the LLM API using the OpenAI client with streaming support."""
         messages = self._validate_messages(messages)
 
-        # Safety check: if _validate_messages returns an empty list, it means
-        # the conversation history ends with an assistant message without tool calls.
-        # This is a terminal state - calling the API would produce consecutive
-        # assistant messages which APIs reject. Return a terminal response.
+        # Empty list = terminal assistant state (see _validate_messages);
+        # calling the API would produce consecutive assistant messages.
         if not messages:
             self._log(f"\n[SAFETY STOP] Conversation history validation returned empty - terminal assistant state detected. Ending interaction.")
             return {
@@ -770,28 +558,19 @@ Think carefully; response quality is the highest priority. You have unlimited th
                 }]
             }
 
-        # Lower temperature when tools are in play: high randomness (1.0) makes
-        # models emit malformed/incorrect JSON tool arguments.  A deterministic
-        # temperature (~0.2) yields far more reliable function calls.  Creative
-        # text-only turns keep the original higher temperature.
+        # Low temperature for tool use: high randomness yields malformed JSON
+        # tool arguments. Creative text-only turns keep the high temperature.
         temperature = 0.2 if use_tools else 1.0
 
-        if self.model.find("gpt")==-1: # OpenAI don't like this
-            request_params = {
-                "model": self.model,
-                "messages": messages,
-                "temperature": temperature,
-                "stream": True,
-                "max_tokens": self.max_tokens,
-            }
+        request_params = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if "gpt" not in self.model:  # OpenAI rejects these extra params
+            request_params["max_tokens"] = self.max_tokens
             request_params['extra_body'] = {"chat_template_kwargs": {"enable_thinking": True}}
-        else:
-            request_params = {
-                "model": self.model,
-                "messages": messages,
-                "temperature": temperature,
-                "stream": True,
-                }
 
         if use_tools:
             request_params["tools"] = self.tool_schemas
@@ -811,74 +590,63 @@ Think carefully; response quality is the highest priority. You have unlimited th
                 stream = self.client.chat.completions.create(**request_params)
 
                 for chunk in stream:
-                        if self.stop_event.is_set():
-                            self._log("\n[STOP] Agent shutdown requested. Aborting LLM stream.")
-                            return {
-                                "choices": [{
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": f"Agent stopped by user.\n\n{self.COMPLETION_MARKER}",
-                                        "tool_calls": None,
-                                        "reasoning_content": None
-                                    }
-                                }]
-                            }
-                        delta = chunk.choices[0].delta if chunk.choices else None
+                    if self.stop_event.is_set():
+                        self._log("\n[STOP] Agent shutdown requested. Aborting LLM stream.")
+                        return {
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": f"Agent stopped by user.\n\n{self.COMPLETION_MARKER}",
+                                    "tool_calls": None,
+                                    "reasoning_content": None
+                                }
+                            }]
+                        }
+                    delta = chunk.choices[0].delta if chunk.choices else None
 
-                        if delta:
-                            # Handle thinking/reasoning tokens if enabled and supported.
-                            # Some APIs use 'thinking', others (e.g. DeepSeek/OpenAI) use 'reasoning_content'.
-                            reasoning_chunk = None
-                            if hasattr(delta, 'reasoning_content') and delta.reasoning_content is not None:
-                                reasoning_chunk = delta.reasoning_content
-                            elif hasattr(delta, 'thinking') and delta.thinking:
-                                reasoning_chunk = delta.thinking
+                    if delta:
+                        # Reasoning tokens: 'reasoning_content' (DeepSeek/OpenAI)
+                        # or 'thinking' (some other providers).
+                        reasoning_chunk = None
+                        if hasattr(delta, 'reasoning_content') and delta.reasoning_content is not None:
+                            reasoning_chunk = delta.reasoning_content
+                        elif hasattr(delta, 'thinking') and delta.thinking:
+                            reasoning_chunk = delta.thinking
 
-                            if self.show_thinking and reasoning_chunk:
-                                collected_thinking += reasoning_chunk
-                                thinking_buffer += reasoning_chunk
+                        if self.show_thinking and reasoning_chunk:
+                            collected_thinking += reasoning_chunk
+                            thinking_buffer += reasoning_chunk
+                            self.sink.emit("THINKING_STREAM", {"text": reasoning_chunk})
+                            in_thinking = True
 
-                                # Emit thinking tokens to the sink in real-time
-                                self.sink.emit("THINKING_STREAM", {"text": reasoning_chunk})
-                                in_thinking = True
+                        if delta.content:
+                            collected_content += delta.content
+                            if self.show_thinking and in_thinking and thinking_buffer:
+                                self._log("[THINKING COMPLETE]", style="yellow")
+                                in_thinking = False
+                            self.sink.emit("LLM_STREAM", {"text": delta.content})
 
-                            # Handle regular content
-                            if delta.content:
-                                content_chunk = delta.content
-                                collected_content += content_chunk
+                        if delta.tool_calls:
+                            for tool_call_chunk in delta.tool_calls:
+                                index = tool_call_chunk.index
 
-                                # If we were in thinking mode, show transition
-                                if self.show_thinking and in_thinking and thinking_buffer:
-                                    self._log("[THINKING COMPLETE]", style="yellow")
-                                    in_thinking = False
+                                while len(collected_tool_calls) <= index:
+                                    collected_tool_calls.append({
+                                        "id": "",
+                                        "type": "function",
+                                        "function": {"name": "", "arguments": ""}
+                                    })
 
-                                # Emit content chunk to the sink in real-time
-                                self.sink.emit("LLM_STREAM", {"text": content_chunk})
+                                current_tool_call = collected_tool_calls[index]
 
-                            if delta.tool_calls:
-                                for tool_call_chunk in delta.tool_calls:
-                                    index = tool_call_chunk.index
+                                if tool_call_chunk.id:
+                                    current_tool_call["id"] = tool_call_chunk.id
 
-                                    while len(collected_tool_calls) <= index:
-                                        collected_tool_calls.append({
-                                            "id": "",
-                                            "type": "function",
-                                            "function": {
-                                                "name": "",
-                                                "arguments": ""
-                                            }
-                                        })
-
-                                    current_tool_call = collected_tool_calls[index]
-
-                                    if tool_call_chunk.id:
-                                        current_tool_call["id"] = tool_call_chunk.id
-
-                                    if tool_call_chunk.function:
-                                        if tool_call_chunk.function.name:
-                                            current_tool_call["function"]["name"] += tool_call_chunk.function.name
-                                        if tool_call_chunk.function.arguments:
-                                            current_tool_call["function"]["arguments"] += tool_call_chunk.function.arguments
+                                if tool_call_chunk.function:
+                                    if tool_call_chunk.function.name:
+                                        current_tool_call["function"]["name"] += tool_call_chunk.function.name
+                                    if tool_call_chunk.function.arguments:
+                                        current_tool_call["function"]["arguments"] += tool_call_chunk.function.arguments
                 break
             except Exception as e:
                 if attempt < max_retries:
@@ -886,48 +654,36 @@ Think carefully; response quality is the highest priority. You have unlimited th
                     time.sleep(wait_seconds)
                 else:
                     raise
-                continue
 
         self._log("")
         final_tool_calls = [tc for tc in collected_tool_calls if tc.get("id")]
 
-        final_response = {
+        return {
             "choices": [{
                 "message": {
                     "role": "assistant",
                     "content": collected_content if collected_content else None,
                     "tool_calls": final_tool_calls if final_tool_calls else None,
-                    # Use reasoning_content so models like DeepSeek receive it back on the next request.
-                    # The OpenAI-compatible API expects reasoning_content, not "thinking".
+                    # Sent back as reasoning_content so reasoning models receive
+                    # their prior reasoning on the next request.
                     "reasoning_content": collected_thinking if collected_thinking else None
                 }
             }]
         }
-        return final_response
 
     def process_llm_response(self, response: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str], List[Dict[str, Any]]]:
-        """Process LLM response and extract ALL tool calls, content, and thinking content.
+        """Extract content, tool calls, thinking, and malformed tool calls from
+        an LLM response.
 
-        Returns:
-            content: The text content of the response.
-            tool_calls_info: A list of dicts, each with keys:
-                - tool_call_id (str)
-                - function_name (str)
-                - arguments_str (str)
-                - command (str or None)  -- populated for execute_bash
-            first_tool_call_id: The id of the first tool call (for backward compat).
-            thinking: The thinking/reasoning content if any.
-            malformed_tool_calls: A list of dicts describing tool calls whose
-                arguments could not be parsed as valid JSON. Each dict has:
-                - tool_call_id (str)
-                - function_name (str)
-                - raw_arguments (str)
-                - parse_error (str)
+        Returns (content, tool_calls_info, first_tool_call_id, thinking,
+        malformed_tool_calls). Each tool_calls_info entry has tool_call_id,
+        function_name, function_arguments, and command (for execute_bash).
+        Malformed entries have tool_call_id, function_name, raw_arguments,
+        parse_error.
         """
         message = response["choices"][0]["message"]
         content = message.get("content")
         tool_calls = message.get("tool_calls")
-        # Support both "reasoning_content" (OpenAI/DeepSeek standard) and "thinking" (legacy).
         thinking = message.get("reasoning_content") or message.get("thinking")
 
         tool_calls_info: List[Dict[str, Any]] = []
@@ -974,7 +730,7 @@ Think carefully; response quality is the highest priority. You have unlimited th
         return content or "", tool_calls_info, first_tool_call_id, thinking, malformed_tool_calls
 
     def handle_function_call(self, function_info: Dict[str, Any]) -> str:
-        """Handle different function calls"""
+        """Produce a tool result for tool calls that carry no bash command."""
         function_name = function_info.get("name")
         arguments_str = function_info.get("arguments")
 
@@ -982,41 +738,29 @@ Think carefully; response quality is the highest priority. You have unlimited th
             return "No arguments provided for function call"
 
         try:
-            args = json.loads(arguments_str)
+            json.loads(arguments_str)
         except json.JSONDecodeError as e:
             return (f"ERROR: The JSON arguments provided for function '{function_name}' "
                     f"could not be parsed. Parse error: {e}. "
                     f"Please re-issue this tool call with valid, properly formatted JSON "
-                    f"arguments. Ensure all strings use double quotes, no literal newlines "
-                    f"inside strings (use \\n), no trailing commas, and the entire "
-                    f"argument is a single valid JSON object.")
+                    f"arguments (double-quoted strings, newlines escaped as \\n, "
+                    f"no trailing commas, a single JSON object).")
 
         return f"Unknown function: {function_name}"
 
     def inject_suggestion(self, suggestion: str):
-        """Inject a mid-run user suggestion into the agent stream.
-
-        The suggestion is queued and drained by the agent thread at the start
-        of the next step, where it is appended to the conversation history
-        as a user message.  This lets the user steer behavior while the agent
-        is executing without interrupting it.
-        """
+        """Queue a mid-run user suggestion; drained at the start of the next
+        step and appended to the conversation as a user message."""
         if suggestion and suggestion.strip():
             self.suggestion_queue.put(suggestion.strip())
 
     def _drain_suggestions(self):
-        """Drain any queued user suggestions into the conversation history.
-
-        Called at the start of each step.  Each suggestion is appended as
-        a user message so the LLM sees it on the next API call.
-        """
-        suggestions = []
+        """Append any queued user suggestions to the conversation history."""
         while not self.suggestion_queue.empty():
             try:
-                suggestions.append(self.suggestion_queue.get_nowait())
+                s = self.suggestion_queue.get_nowait()
             except queue.Empty:
                 break
-        for s in suggestions:
             self.conversation_history.append({
                 "role": "user",
                 "content": f"[Suggestion from user] {s}"
@@ -1025,9 +769,6 @@ Think carefully; response quality is the highest priority. You have unlimited th
 
     def run(self, user_request: str):
         """Main interactive loop"""
-        # Emit the startup banner only on the first prompt.  run()
-        # is called again for each new prompt, so without this guard the banner
-        # would be reprinted every time.
         if not self._started_banner_shown:
             self._started_banner_shown = True
             self.sink.emit("SYSTEM", {
@@ -1040,11 +781,8 @@ Think carefully; response quality is the highest priority. You have unlimited th
         self._log(f"[USER REQUEST] {user_request}")
         self._log(f"{'='*60}")
 
-        # Initialize conversation with system prompt and user request.
-        # When persist_history is enabled, we keep any prior conversation
-        # (from an earlier command in the same session) so the new request
-        # continues the full chat context instead of starting fresh.  The
-        # system prompt is refreshed in place at index 0.
+        # With persist_history, refresh the system prompt in place and append
+        # the new request so prior chat context carries over; otherwise reset.
         if self.persist_history and self.conversation_history:
             self.conversation_history[0] = {
                 "role": "system",
@@ -1071,23 +809,18 @@ Think carefully; response quality is the highest priority. You have unlimited th
                 step += 1
                 self.sink.emit("STATUS_UPDATE", {"step": step, "max_steps": self.max_steps, "phase": "llm_call"})
 
-                # Inject any mid-run user suggestions into the conversation
-                # before the next LLM call so behavior can be steered.
                 self._drain_suggestions()
-
-                # Truncate conversation history if it exceeds max_prompt_len
                 self._truncate_conversation_history()
 
                 response = self.call_llm_api(list(self.conversation_history))
 
-                # Check if this is a safety-stop response (empty validated messages)
                 if not response.get("choices") or not response.get("choices", [{}])[0].get("message"):
                     self._log(f"[SAFETY STOP] API call returned no valid response. Ending interaction.")
                     break
 
                 assistant_message = response["choices"][0]["message"]
 
-                # Check if this is a terminal safety response from _validate_messages
+                # Terminal safety response synthesized by call_llm_api.
                 _content_raw = assistant_message.get("content") or ""
                 if (_content_raw.strip().endswith(self.COMPLETION_MARKER) and
                     not assistant_message.get("tool_calls") and
@@ -1095,26 +828,23 @@ Think carefully; response quality is the highest priority. You have unlimited th
                     len(_content_raw) < 200):
                     break
 
-                # Remove reasoning_content from the stored message to avoid
-                # confusing APIs that don't expect it in subsequent requests
+                # Don't store reasoning_content; it confuses APIs that don't
+                # expect it in subsequent requests.
                 clean_message = dict(assistant_message)
                 clean_message.pop("reasoning_content", None)
 
-                # Do NOT append if it would create consecutive assistant messages
-                # (this should not happen due to validation, but double-check)
+                # Never create consecutive assistant messages.
                 if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
-                    # Replace the previous assistant message instead of adding a new one
                     self.conversation_history[-1] = clean_message
                 else:
                     self.conversation_history.append(clean_message)
                 content, tool_calls_info, first_tool_call_id, thinking, malformed_tool_calls = self.process_llm_response(response)
 
-                # NOTE: The LLM content is NOT re-printed here.  It was already
-                # streamed token-by-token via sink.emit("LLM_STREAM", ...) inside
-                # call_llm_api().  Re-printing the full content here would show
-                # the same text twice.
+                # LLM content was already streamed via LLM_STREAM events; do
+                # not re-print it here or it would appear twice.
 
-                # Handle malformed tool calls - notify the LLM and request a corrected response
+                # Malformed tool calls: feed the parse errors back to the LLM
+                # and let it re-issue corrected calls on the next step.
                 if malformed_tool_calls:
                     self._log(f"[INFO] {len(malformed_tool_calls)} tool call(s) had malformed JSON arguments. Requesting correction from LLM.")
                     for mal in malformed_tool_calls:
@@ -1136,11 +866,8 @@ Think carefully; response quality is the highest priority. You have unlimited th
                             "content": err_msg,
                         })
                     self._log(f"[INFO] Correction messages appended. Continuing to next step for LLM to fix the tool calls.")
-                    # Do not proceed with normal tool execution this step; let the loop continue
-                    # so the LLM can re-issue corrected tool calls.
                     continue
 
-                # Execute ALL tool calls if any were provided
                 if tool_calls_info:
                     for tc_info in tool_calls_info:
                         if self.stop_event.is_set():
@@ -1160,7 +887,6 @@ Think carefully; response quality is the highest priority. You have unlimited th
                                 })
                             continue
 
-                        # Notify sink that a command is about to execute
                         self.sink.emit("CMD_EXEC", {"command": command, "tool_call_id": tool_call_id, "function_name": function_name})
 
                         approved, user_suggestion = self.get_user_confirmation(command)
@@ -1216,13 +942,11 @@ Think carefully; response quality is the highest priority. You have unlimited th
                     _content_check = content if isinstance(content, str) else ""
 
                     if _content_check.strip().endswith(self.COMPLETION_MARKER) or self.COMPLETION_MARKER in _content_check:
-                        # The assistant has signaled task completion
                         break
 
-                    # The assistant stopped without calling tools and without signaling
-                    # completion.  This is a premature stop - the task is NOT finished.
-                    # Inject a continuation message so the LLM keeps working until done.
-
+                    # The assistant stopped with neither tool calls nor the
+                    # completion marker: a premature stop. Inject a
+                    # continuation message so it keeps working.
                     continuation_msg = (
                         f"Continue working on the task. You previously responded without using any tools. "
                         f"If the task is truly complete, you MUST emit the completion signal \"{self.COMPLETION_MARKER}\" "
@@ -1232,167 +956,124 @@ Think carefully; response quality is the highest priority. You have unlimited th
                         f"task is fully finished, then emit \"{self.COMPLETION_MARKER}\"."
                     )
                     self.conversation_history.append({"role": "user", "content": continuation_msg})
-                    # Continue the loop - do NOT break
 
-                # Check for task completion AFTER command execution
                 if self.COMPLETION_MARKER in content:
                     self._log(f"[{self.COMPLETION_MARKER} DETECTED - TASK COMPLETED SUCCESSFULLY]")
                     break
 
-                # Check if we've reached max steps
                 if step >= self.max_steps:
                     self._log(f"[LIMIT REACHED] Maximum steps ({self.max_steps}) exceeded")
 
         finally:
             self.sink.emit("SHUTDOWN", {"reason": "agent_loop_terminated"})
 
-        # Clear any pending approval gate on shutdown
-        if hasattr(self.sink, 'close'):
-            self.sink.close()
+        self.sink.close()
 
 
-class ApprovalScreen(ModalScreen):
-    """Modal dialog that blocks the whole UI and asks the user to approve
-    or reject a pending bash command.
+if _TEXTUAL_AVAILABLE:
+    class ApprovalScreen(ModalScreen):
+        """Blocking modal that asks the user to approve or reject a command.
 
-    The agent thread is blocked in TUISink.input() waiting on a
-    threading.Event.  When the user presses [Y]es or [N]o (or clicks the
-    buttons), this screen calls the app's approval callback, which resolves
-    the sink's event and unblocks the agent.  Because it is a ModalScreen,
-    the rest of the TUI is inert until a choice is made — the agent cannot
-    continue past the gate.
+        The agent thread is blocked in TUISink.input(); the decision callback
+        resolves the sink's event and unblocks it. Rendered as a small
+        centered dialog over a dimmed full-screen overlay.
+        """
 
-    The screen itself is a full-screen dimmed overlay; the actual dialog is
-    a small centered box (see #approval-dialog) so it reads as a pop-up in
-    the middle of the console rather than covering the whole screen.
-    """
+        CSS = """
+        ApprovalScreen {
+            align: center middle;
+            background: $surface 50%;
+        }
+        #approval-dialog {
+            width: 72;
+            max-width: 85%;
+            height: auto;
+            max-height: 60%;
+            border: thick $accent;
+            background: $surface;
+            padding: 1 2;
+        }
+        #approval-message {
+            width: 100%;
+            height: auto;
+            padding: 0 1;
+        }
+        #approval-buttons {
+            width: 100%;
+            height: auto;
+            align: center middle;
+            padding-top: 1;
+        }
+        #approval-buttons Button {
+            margin: 0 1;
+        }
+        """
 
-    CSS = """
-    ApprovalScreen {
-        align: center middle;
-        background: $surface 50%;
-    }
-    #approval-dialog {
-        width: 72;
-        max-width: 85%;
-        height: auto;
-        max-height: 60%;
-        border: thick $accent;
-        background: $surface;
-        padding: 1 2;
-    }
-    #approval-message {
-        width: 100%;
-        height: auto;
-        padding: 0 1;
-    }
-    #approval-buttons {
-        width: 100%;
-        height: auto;
-        align: center middle;
-        padding-top: 1;
-    }
-    #approval-buttons Button {
-        margin: 0 1;
-    }
-    """
+        # Screen-level bindings fire regardless of widget focus.
+        BINDINGS = [
+            Binding("y", "approve", "Approve", show=False),
+            Binding("n", "reject", "Reject", show=False),
+            Binding("enter", "approve", "Approve", show=False),
+            Binding("escape", "reject", "Reject", show=False),
+        ]
 
-    def __init__(self, command: str, on_decision):
-        super().__init__()
-        self.command = command
-        self._on_decision = on_decision
+        def __init__(self, command: str, on_decision):
+            super().__init__()
+            self.command = command
+            self._on_decision = on_decision
 
-    def compose(self) -> ComposeResult:
-        with Vertical(id="approval-dialog"):
-            yield Static(
-                "⚠ APPROVAL REQUIRED ⚠\n\n"
-                "The agent wants to execute the following command:\n\n"
-                f"  {self.command}\n\n"
-                "Press  Y  to approve and run it, or  N  to reject it.",
-                id="approval-message",
-            )
-            with Horizontal(id="approval-buttons"):
-                yield Button("Yes (Y)", id="approve-yes", variant="success")
-                yield Button("No (N)", id="approve-no", variant="error")
+        def compose(self) -> ComposeResult:
+            with Vertical(id="approval-dialog"):
+                yield Static(
+                    "⚠ APPROVAL REQUIRED ⚠\n\n"
+                    "The agent wants to execute the following command:\n\n"
+                    f"  {self.command}\n\n"
+                    "Press  Y  to approve and run it, or  N  to reject it.",
+                    id="approval-message",
+                )
+                with Horizontal(id="approval-buttons"):
+                    yield Button("Yes (Y)", id="approve-yes", variant="success")
+                    yield Button("No (N)", id="approve-no", variant="error")
 
-    def on_button_pressed(self, event: Button.Pressed):
-        approved = event.button.id == "approve-yes"
-        self._resolve(approved)
+        def on_button_pressed(self, event: Button.Pressed):
+            self._resolve(event.button.id == "approve-yes")
 
-    def _resolve(self, approved: bool):
-        self._on_decision(approved)
-        self.dismiss()
+        def _resolve(self, approved: bool):
+            self._on_decision(approved)
+            self.dismiss()
 
-    # Screen-level bindings: these fire regardless of which widget has focus
-    # (e.g. a Button), so pressing Y/N always selects the option.
-    BINDINGS = [
-        Binding("y", "approve", "Approve", show=False),
-        Binding("n", "reject", "Reject", show=False),
-        Binding("enter", "approve", "Approve", show=False),
-        Binding("escape", "reject", "Reject", show=False),
-    ]
+        def action_approve(self):
+            self._resolve(True)
 
-    def action_approve(self):
-        self._resolve(True)
-
-    def action_reject(self):
-        self._resolve(False)
+        def action_reject(self):
+            self._resolve(False)
 
 
 def enable_sandbox() -> Tuple[bool, str]:
-    """Enable a basic OS-level sandbox on Linux using py-landlock.
+    """Enable a Linux OS-level sandbox via py-landlock.
 
-    Restricts the agent so it can only WRITE inside the current working
-    directory (and its subdirectories) plus /tmp.  Reads are allowed
-    anywhere, and command execution + network access are preserved.
+    Writes are restricted to the current working directory (recursively),
+    /tmp, /dev and /dev/pts; reads and execution are allowed anywhere and
+    network access is preserved. /dev and /dev/pts (plus the IOCTL_DEV right,
+    Landlock ABI v5) are required for pty allocation. strict=False makes
+    everything best-effort on older kernels.
 
-    Does NOT print anything: the caller is responsible for routing the
-    returned status message through the active sink so it appears in the
-    agent output panel (green when the sandbox is active, red when the
-    agent runs unsandboxed).
-
-    Returns (enabled, message) where ``enabled`` is True if the sandbox
-    was successfully applied and ``message`` is a human-readable [SANDBOX]
-    status line describing what happened.
+    Prints nothing; the caller routes the returned [SANDBOX] status message
+    through the active sink. Returns (enabled, message).
     """
-    # 1) OS detection: Landlock is a Linux-only kernel security module.
     if sys.platform != 'linux':
-        return (False,
-                "[SANDBOX] Not running on Linux; no OS-level sandbox applied")
+        return (False, "[SANDBOX] Not running on Linux; no OS-level sandbox applied")
 
-    # 2) Import py-landlock lazily so --nogui / non-Linux runs don't need it.
     try:
         from py_landlock import Landlock, AccessFs
     except ImportError:
-        return (False,
-                "[SANDBOX] py-landlock not installed; running unsandboxed")
+        return (False, "[SANDBOX] py-landlock not installed; running unsandboxed")
 
     try:
-        cwd = os.getcwd()
-        # allow_read("/")  -> reads allowed everywhere (any other dir is
-        #                     forbidden to WRITE, not to READ).
-        # allow_execute("/")-> binaries can still be executed.
-        # allow_write(cwd, "/tmp", "/dev", "/dev/pts") -> writes restricted
-        #                     to cwd (recursively covers its subdirectories),
-        #                     /tmp, /dev, and /dev/pts.  /dev is required so
-        #                     the agent can allocate ptys (/dev/ptmx) and use
-        #                     /dev/null when executing commands; /dev/pts is a
-        #                     separate devpts mount holding the dynamically-
-        #                     created pty slave nodes, so it must be allowed
-        #                     explicitly.
-        # allow_all_network() -> preserve outbound HTTP (OpenAI API, curl...).
-        # allow_all_scope()  -> preserve IPC/signal handling (ABI >= 6).
-        # strict=False       -> best-effort: skip rules for missing paths.
-        #
-        # pty handling also issues ioctl() calls on the device files
-        # (TIOCSPTLCK, TIOCGPTN, TIOCSWINSZ, ...).  Those are gated behind the
-        # IOCTL_DEV access right (Landlock ABI v5), which allow_write() does
-        # NOT grant, so add it explicitly for the device paths.  On kernels
-        # with ABI < 5 the flag is silently dropped (strict=False).
         ll = Landlock(strict=False) \
             .allow_read("/") \
             .allow_execute("/") \
-            .allow_write(cwd, "/tmp", "/dev", "/dev/pts") \
+            .allow_write(os.getcwd(), "/tmp", "/dev", "/dev/pts") \
             .allow_all_network() \
             .allow_all_scope()
         ll.add_path_rule(
@@ -1404,8 +1085,7 @@ def enable_sandbox() -> Tuple[bool, str]:
                 "[SANDBOX] OS-level Landlock sandbox enabled "
                 "(writes restricted to current directory, /tmp and /dev)")
     except Exception as e:
-        return (False,
-                f"[SANDBOX] Failed to enable Landlock sandbox: {e}")
+        return (False, f"[SANDBOX] Failed to enable Landlock sandbox: {e}")
 
 
 def main():
@@ -1440,25 +1120,17 @@ def main():
         print("[ERROR] Please provide a task request", file=sys.stderr)
         sys.exit(1)
 
-    # Enable the OS-level sandbox (Linux + py-landlock) unless explicitly
-    # disabled.  This must happen before the agent thread is started so the
-    # Landlock domain covers the whole process (both --nogui and TUI paths).
-    # The [SANDBOX] status message is routed through the active sink later so
-    # it appears in the agent output panel (green when active, red otherwise).
+    # Sandbox must be enabled before the agent thread starts so the Landlock
+    # domain covers the whole process. The status message is routed through
+    # the active sink below.
     if args.disable_sandbox:
         args.sandbox_enabled = False
         args.sandbox_msg = "[SANDBOX] Sandbox disabled via --disable-sandbox"
     else:
         args.sandbox_enabled, args.sandbox_msg = enable_sandbox()
 
-    # Determine sink mode: --nogui uses ConsoleSink (direct CLI, original behaviour).
-    # Default (no flag) uses TUISink + Textual app.  The TUI path requires the
-    # Textual library to be available.
     if args.nogui:
         sink = ConsoleSink()
-        # Route the [SANDBOX] status through the sink so it appears in the
-        # agent output (green when the OS-level sandbox is active, red when
-        # the agent runs unsandboxed).
         sink.emit("LOG", {
             "text": args.sandbox_msg,
             "style": "green" if args.sandbox_enabled else "red",
@@ -1482,11 +1154,9 @@ def main():
         except KeyboardInterrupt:
             commander._log("[INTERRUPTED] AI-Commander stopped by user")
             sys.exit(0)
-        except Exception as e:
+        except Exception:
             commander._log_error(f"\n[FATAL ERROR] An unexpected error occurred:")
-            import traceback
-            tb_str = traceback.format_exc()
-            commander._log_error(tb_str)
+            commander._log_error(traceback.format_exc())
             sys.exit(1)
         return
 
@@ -1496,23 +1166,19 @@ def main():
         print("Alternatively, run with --nogui for direct CLI mode.")
         sys.exit(1)
 
-    # Import Textual widgets (only available in TUI mode)
-    from textual.app import App, ComposeResult
-    from textual.widgets import RichLog, Input, Static, TabbedContent, TabPane, ContentSwitcher
+    from textual.app import App
+    from textual.widgets import RichLog, Input, ContentSwitcher
     from textual.widget import Widget
     from textual import events
-    from textual.binding import Binding
     from rich.text import Text as RichText
     import pyte
 
     class ShellWidget(Widget, can_focus=True):
-        """A real interactive shell embedded in a Textual widget.
+        """An interactive shell embedded in a Textual widget.
 
-        It spawns the user's default shell (from $SHELL, falling back to
-        /bin/sh) in a pseudo-terminal, emulates the VT100 output with pyte,
-        and renders the terminal screen.  All keyboard input while focused is
-        forwarded to the shell, so it behaves like a regular terminal
-        (including Tab for autocomplete, Ctrl+C, arrows, etc.).
+        Spawns the user's shell in a pty, emulates VT100 output with pyte,
+        and forwards all keyboard input while focused (Tab autocomplete,
+        Ctrl+C, arrows, etc.).
         """
 
         def __init__(self, *args, **kwargs):
@@ -1523,23 +1189,12 @@ def main():
             self._stream = None  # pyte.ByteStream
             self._cols = 80
             self._rows = 24
-            # Full terminal history (scrollback) as a list of plain-text lines.
             self._history: list = []
-            # Last rendered text, used to avoid useless refreshes.
             self._last_render = ""
 
         def check_consume_key(self, key: str, character: Optional[str]) -> bool:
-            """Let the shell take precedence over ancestor bindings.
-
-            We deliberately do NOT return True for every key: doing so makes
-            Textual treat the key as fully consumed during the binding phase,
-            which in some Textual versions prevents ``_on_key`` from ever
-            receiving the event (so the shell appears dead) and also blocks
-            the Tab key used to switch panes.  Returning False lets the key
-            reach ``_on_key`` (which forwards it to the pty and calls
-            ``event.stop()``), while the App/RightPanel only define a handful
-            of explicit bindings that remain usable.
-            """
+            # Return False so keys reach _on_key (which forwards them to the
+            # pty and stops propagation) while App-level bindings still work.
             return False
 
         def _spawn(self) -> None:
@@ -1552,7 +1207,6 @@ def main():
             except OSError:
                 return
             if pid == 0:
-                # Child: exec the shell.
                 os.environ["TERM"] = "xterm-256color"
                 try:
                     os.execv(shell, [shell])
@@ -1561,17 +1215,14 @@ def main():
                         os.execv("/bin/sh", ["/bin/sh"])
                     except Exception:
                         os._exit(127)
-            # Parent.
             self._pid = pid
             self._master_fd = master_fd
-            # Non-blocking reads so _poll never blocks the UI thread.
             try:
                 fl = fcntl.fcntl(master_fd, fcntl.F_GETFL)
                 fcntl.fcntl(master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
             except OSError:
                 pass
             self._resize_pty()
-            # Set up the VT100 emulator sized to the widget.
             self._screen = pyte.Screen(self._cols, self._rows)
             self._stream = pyte.ByteStream(self._screen)
             self._stream.attach(self._screen)
@@ -1587,30 +1238,21 @@ def main():
                 pass
 
         def on_mount(self) -> None:
-            # Do NOT spawn here: the widget is mounted hidden inside the
-            # ContentSwitcher (size 0x0), so a pty spawned now would get a
-            # 0x0 window size and the shell would emit no prompt (black
-            # screen).  We spawn lazily in on_resize() once a real size is
-            # known.  Just start the output poller.
+            # Don't spawn here: the widget starts hidden inside the
+            # ContentSwitcher (size 0x0), which would give the pty a broken
+            # window size. Spawn lazily in on_resize() instead.
             self.set_interval(0.05, self._poll)
 
         def on_resize(self, event: events.Resize) -> None:
-            # Ignore degenerate (hidden) sizes: the ContentSwitcher reports
-            # 0x0 while the widget is not the visible tab.  Spawning at that
-            # size would start the shell with a tiny/broken window.
+            # Ignore degenerate (hidden) sizes reported by the ContentSwitcher.
             if event.size.width < 4 or event.size.height < 3:
                 return
             self._cols = max(2, event.size.width)
             self._rows = max(2, event.size.height)
-            # Spawn the shell the first time we have a real size, so the pty
-            # starts with a correct window size and the shell prints its
-            # prompt immediately.  If it was already spawned at a degenerate
-            # size (shouldn't happen now, but be safe), leave it alone.
             if self._master_fd is None and self._pid is None:
                 self._spawn()
             if self._screen is not None:
                 try:
-                    # pyte.Screen.resize(lines, columns) -- rows first.
                     self._screen.resize(self._rows, self._cols)
                 except Exception:
                     pass
@@ -1620,15 +1262,10 @@ def main():
         def _poll(self) -> None:
             """Read pending pty output, feed it to pyte, and refresh."""
             if self._master_fd is None:
-                # No live shell yet (waiting for first on_resize) or the child
-                # exited.  Spawning is handled in on_resize() so the pty gets a
-                # correct window size; nothing to do here until then.
                 return
             try:
                 data = os.read(self._master_fd, 65536)
-            except BlockingIOError:
-                data = b""
-            except OSError:
+            except (BlockingIOError, OSError):
                 data = b""
             if data:
                 try:
@@ -1637,10 +1274,8 @@ def main():
                     pass
                 self._sync_history()
                 self.refresh()
-            # Reap the child if it exited, so we don't leak the fd.  Once
-            # reaped, reset BOTH _pid and _master_fd to None so the next poll
-            # spawns a fresh shell instead of repeatedly waitpid()'ing a
-            # non-child (ChildProcessError) and trying to close a dead fd.
+            # Reap the child if it exited; resetting both fields lets the next
+            # on_resize spawn a fresh shell.
             if self._pid is not None:
                 try:
                     wpid, _status = os.waitpid(self._pid, os.WNOHANG)
@@ -1655,43 +1290,28 @@ def main():
                     self._pid = None
 
         def _sync_history(self) -> None:
-            """Copy the pyte screen into self._history.
-
-            ``Screen.display()`` returns the current screen as a list of
-            plain-text lines (one per visible row), which is exactly what we
-            need for rendering.  It handles the internal buffer layout (a dict
-            keyed by coordinates) for us.
-            """
+            """Copy the pyte screen contents into self._history for rendering."""
             if self._screen is None:
                 return
             try:
-                # Strip trailing whitespace from each line so the prompt sits
-                # flush against the left edge.
                 self._history = [line.rstrip() for line in self._screen.display]
             except Exception:
-                # Never let a rendering hiccup crash the poll loop.
                 pass
 
         def render(self) -> RichText:
-            """Render the terminal history, showing only the last *height* lines.
-
-            Also draws a block cursor at the pyte cursor position so the user
-            can see where input will land (like a real terminal)."""
+            """Render the last *height* history lines with a block cursor at
+            the pyte cursor position."""
             if not self._history:
                 return RichText("")
             height = self.size.height
             if height <= 0:
                 height = 24
             visible = self._history[-height:] if height else []
-            # Pad short buffers up to the widget height so the prompt sits at
-            # the bottom, like a real terminal.
+            # Pad short buffers so the prompt sits at the bottom.
             if len(visible) < height:
                 visible = [""] * (height - len(visible)) + visible
 
-            # Locate the pyte cursor within the visible window.  The cursor's
-            # absolute row is screen.cursor.y; the visible window shows the
-            # last `height` history rows, so the cursor's on-screen row is
-            # cursor.y - (len(history) - height), offset by any top padding.
+            # Map the absolute pyte cursor row into the visible window.
             cursor_row = -1
             cursor_col = 0
             if self._screen is not None:
@@ -1710,19 +1330,13 @@ def main():
                 if i:
                     text.append("\n")
                 if i == cursor_row and 0 <= cursor_col:
-                    # Draw the line with a reverse-video block at the cursor.
-                    # The history lines were rstrip()ed, so trailing spaces
-                    # (e.g. echoed when the user presses Space) were removed.
-                    # Pad the line up to the cursor column so the block
-                    # cursor advances on whitespace just like on real text.
+                    # History lines were rstrip()ed; pad up to the cursor
+                    # column so the block advances over whitespace.
                     if len(line) < cursor_col:
                         line = line + " " * (cursor_col - len(line))
-                    before = line[:cursor_col]
-                    at = line[cursor_col:cursor_col + 1] or " "
-                    after = line[cursor_col + 1:]
-                    text.append(before, style="default on #000000")
-                    text.append(at, style="reverse on #000000")
-                    text.append(after, style="default on #000000")
+                    text.append(line[:cursor_col], style="default on #000000")
+                    text.append(line[cursor_col:cursor_col + 1] or " ", style="reverse on #000000")
+                    text.append(line[cursor_col + 1:], style="default on #000000")
                 else:
                     text.append(line, style="default on #000000")
             return text
@@ -1740,15 +1354,12 @@ def main():
         def _key_to_bytes(self, event: events.Key) -> bytes:
             """Convert a Textual Key event into the byte sequence for the pty."""
             key = event.key
-            # Ctrl+letter -> control character (e.g. ctrl+c -> 0x03).
             if key.startswith("ctrl+"):
                 ch = key[5:]
                 if len(ch) == 1 and ch.isalpha():
                     return bytes([ord(ch.lower()) & 0x1f])
-            # Printable characters (handles shift -> uppercase, etc.).
             if event.is_printable and event.character:
                 return event.character.encode("utf-8")
-            # Special / function keys.
             special = {
                 "enter": b"\r",
                 "backspace": b"\x7f",
@@ -1766,7 +1377,6 @@ def main():
             }
             if key in special:
                 return special[key]
-            # Function keys F1..F12.
             if key.startswith("f") and key[1:].isdigit():
                 n = int(key[1:])
                 if 1 <= n <= 4:
@@ -1776,13 +1386,8 @@ def main():
             return b""
 
     class RightPanel(Vertical):
-        """Manual tab panel for the right-hand side (Console Output + Shell).
-
-        Built from basic widgets because Textual 8.2.8's TabbedContent
-        docks its tab strip to the screen top and breaks the Horizontal
-        layout.  Uses a Vertical container with a Horizontal button strip
-        on top and a ContentSwitcher below.
-        """
+        """Right-hand tab panel (Console Output + Shell) built from a button
+        strip and a ContentSwitcher (TabbedContent breaks this layout)."""
 
         BINDINGS = [
             Binding("tab", "switch_tab", "Switch panel", show=False),
@@ -1802,18 +1407,12 @@ def main():
                 yield ShellWidget(id="shell-widget")
 
         def on_mount(self) -> None:
-            """Mark the Console Output tab active by default."""
             self._update_tab_buttons()
 
         def _update_tab_buttons(self, active=None) -> None:
-            """Reflect the active pane on the tab buttons via the active-tab class.
-
-            *active* is the pane id ("console-log" or "shell-widget").  When
-            omitted it is read from the switcher; callers that just changed
-            the switcher pass it explicitly because ContentSwitcher applies
-            the new ``current`` asynchronously, so reading it back immediately
-            would return the previous pane.
-            """
+            """Reflect the active pane on the tab buttons via the active-tab
+            class. Callers that just switched panes pass *active* explicitly
+            because ContentSwitcher applies `current` asynchronously."""
             if active is None:
                 active = self._switcher.current
             console_active = active == "console-log"
@@ -1830,24 +1429,18 @@ def main():
                         bc.remove_class("active-tab")
                 except Exception:
                     pass
-            # Defer to after the current event/refresh cycle so the class
-            # change is not clobbered by the switcher/focus updates that
-            # immediately follow a tab switch.
+            # Defer so the class change isn't clobbered by the switcher/focus
+            # updates that immediately follow a tab switch.
             self.call_after_refresh(_apply)
 
         def action_switch_tab(self) -> None:
             """Cycle between the Console Output and Shell tabs."""
-            if self._switcher.current == "shell-widget":
-                new = "console-log"
-            else:
-                new = "shell-widget"
+            new = "console-log" if self._switcher.current == "shell-widget" else "shell-widget"
             self._switcher.current = new
             self._update_tab_buttons(new)
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
-            """Switch pane when a tab button is clicked."""
-            # Stop the event so CommanderApp's on_button_pressed (bubbled)
-            # does not double-handle it.
+            # Stop the event so CommanderApp's handler doesn't double-handle it.
             event.stop()
             if event.button.id == "btn-console":
                 self._switcher.current = "console-log"
@@ -1855,9 +1448,7 @@ def main():
             elif event.button.id == "btn-shell":
                 self._switcher.current = "shell-widget"
                 self._update_tab_buttons("shell-widget")
-                # Focus the shell so keystrokes go to it immediately.  Defer
-                # to the next tick so Textual's own click->focus-button logic
-                # runs first and our focus() call wins.
+                # Focus the shell after Textual's own click->focus logic runs.
                 def _focus_shell():
                     try:
                         self.query_one("#shell-widget").focus()
@@ -1868,24 +1459,10 @@ def main():
     class CommanderApp(App):
         """Textual TUI for AI-Commander.
 
-        Layout (Norton-Commander / Midnight-Commander style):
-            ┌────────────────────────────────┬───────────────────────────┐
-            │  [1] Agent Output (left)        │  [2] Console Log (right)
-            │  - LLM reasoning/thinking       │  - command output (live)
-            │  - LLM text responses          │  - exit codes
-            │  - tool-call summaries          │
-            ├────────────────────────────────┴───────────────────────────┤
-            │  [3] Prompt Input (bottom, full width)
-            │  - user prompt entry
-            │  - /autoapprove toggle
-            ├────────────────────────────────────────────────────────────┤
-            │  [4] Status Footer
-            │  - model | tok/s | steps | session id | auto-approve status
-            └────────────────────────────────────────────────────────────┘
-
-        The agent runs in a background thread and pushes events to a queue.
-        The main thread polls the queue via set_interval(0.05) and renders
-        events to widgets.  The agent thread NEVER touches widgets directly.
+        Norton-Commander style layout: agent output (left), console/shell tabs
+        (right), prompt input (bottom), status footer. The agent runs in a
+        background thread and pushes events to a queue; the main thread polls
+        it and renders to widgets. The agent thread never touches widgets.
         """
 
         CSS = """
@@ -1938,15 +1515,6 @@ def main():
             height: 1fr;
             width: 1fr;
         }
-        /* Ensure the right panel and its content switcher actually fill the
-        available space; without an explicit min-height the switcher body
-        collapsed to zero in real terminals (tab strip rendered, body blank). */
-        #right-panel {
-            min-height: 5;
-        }
-        #right-panel ContentSwitcher {
-            min-height: 3;
-        }
         RichLog {
             border: solid #f2f2f2;
             padding: 0;
@@ -1964,52 +1532,45 @@ def main():
             border: solid #f2f2f2;
             width: 1fr;
         }
+        /* Explicit min-heights keep the switcher body from collapsing to
+        zero in real terminals (tab strip rendered, body blank). */
         #right-panel {
             height: 1fr;
             width: 1fr;
+            min-height: 5;
             layout: vertical;
+        }
+        #right-panel ContentSwitcher {
+            height: 1fr;
+            width: 1fr;
+            min-height: 3;
         }
         #tab-strip {
             height: 3;
             background: #0b2f5e;
         }
+        /* Flat tab strip: suppress Textual's default Button focus chrome. */
         #tab-strip Button {
             width: 1fr;
             height: 3;
             background: #0b2f5e;
             color: #f2f2f2;
             border: none;
-            /* Suppress Textual's default Button focus/active chrome (the
-            animated border + tall highlight) which looked out of place on a
-            flat tab strip. */
             border-top: none;
             border-bottom: none;
         }
-        /* Neutralize the default focus highlight entirely; the selected tab
-        is shown only via the active-tab class below, so keyboard focus moving
-        over a button does not trigger a distracting animation. */
         #tab-strip Button:focus {
             background: #0b2f5e;
             color: #f2f2f2;
             text-style: none;
         }
-        /* Visually mark the currently-selected tab.  Target the button IDs
-        directly (higher specificity than Textual's internal .-style-default
-        component class) so the teal highlight actually wins. */
-        #btn-console.active-tab, #btn-shell.active-tab {
-            background: #06989a;
-            color: #000000;
-            text-style: bold;
-        }
-        /* The active tab keeps its highlight even when focused. */
+        /* Target button IDs directly (higher specificity than Textual's
+        internal component classes) so the teal highlight wins. */
+        #btn-console.active-tab, #btn-shell.active-tab,
         #btn-console.active-tab:focus, #btn-shell.active-tab:focus {
             background: #06989a;
             color: #000000;
             text-style: bold;
-        }
-        #right-panel ContentSwitcher {
-            height: 1fr;
-            width: 1fr;
         }
         #shell-widget {
             background: #000000;
@@ -2020,12 +1581,8 @@ def main():
         }
         """
 
-        # Keep Textual's mouse support enabled so buttons/tabs are clickable,
-        # but disable its internal text-selection mode so the terminal's
-        # native selection (left-drag to select, right-click to paste) works.
-        # Textual still captures mouse events for its widgets, but without
-        # ALLOW_SELECT it won't start its own selection highlight, letting
-        # the terminal emulator handle drag-selection and context menus.
+        # Keep mouse support for buttons/tabs but disable Textual's own text
+        # selection so the terminal's native select/copy works.
         ALLOW_SELECT = False
 
         def __init__(self, args):
@@ -2038,11 +1595,7 @@ def main():
             self.step_count = 0
             self.max_steps = 500
             self.tokens_per_second = 0.0
-            # Token-rate tracking state.  We count streamed chunks (each is
-            # roughly one token) and compute a rolling rate over a short
-            # window so the status bar shows a live tok/s while the LLM is
-            # streaming, and decays to 0.0 when it is not.
-            self._tok_count = 0
+            # Rolling ~1s window for the live tok/s display in the status bar.
             self._tok_window_start = time.monotonic()
             self._tok_window_tokens = 0
             self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2050,21 +1603,16 @@ def main():
             self.api_base = args.api_base
             self.sink: TUISink = None
             self.agent = None
-            self.pending_approval = None  # dict with 'command' awaiting user decision
-            # Streaming buffers accumulate tokens per-widget so RichLog.write()
-            # doesn't create one line per token.  Keys are widget ids.
+            self.pending_approval = None  # dict with 'command' awaiting decision
+            # Per-widget buffers so streamed tokens are written as whole lines
+            # instead of one RichLog line per token.
             self._stream_buffer: Dict[str, str] = {}
-            # Track which stream prefixes have already been displayed so a
-            # label like "[THINKING]" is shown once at the start of a stream
-            # rather than prepended to every token chunk.
+            # Stream labels (e.g. "[THINKING]") shown once per stream.
             self._stream_prefix_done: set = set()
-            # Ensure the [SANDBOX] status is shown in the agent output panel
-            # exactly once (green when the OS-level sandbox is active, red
-            # when the agent runs unsandboxed), not on every agent re-run.
+            # Show the [SANDBOX] status once per session, not on every re-run.
             self._sandbox_notified = False
 
         def compose(self) -> ComposeResult:
-            # Warning banner at top
             yield Static(
                 "⚠ AGENT WILL EXECUTE REAL BASH COMMANDS ON THIS SYSTEM ⚠\n"
                 "Auto-approve is OFF. Every command requires /approve or /reject.\n"
@@ -2073,56 +1621,36 @@ def main():
                 id="warning-banner",
                 markup=False
             )
-            # Side-by-side panels (Norton-Commander style): Agent output on
-            # the left; on the right a tabbed panel with the Console Output
-            # log and an embedded interactive shell.  The user can switch
-            # between them with the mouse (clicking the tab strip) or the
-            # Tab key (when the tab strip is focused).
             agent = RichLog(id="agent-log", auto_scroll=True, wrap=True, max_lines=2000)
             agent.border_title = "Agent Output"
             yield Horizontal(agent, RightPanel(id="right-panel"), id="panels")
-            # Prompt input field (bottom, full width), with a shell-style
-            # "> " marker preceding it as a visual cue.
             yield Horizontal(
                 Static(">", id="prompt-marker", markup=False),
                 Input(id="prompt-input", placeholder="Type a prompt or /command, then Enter"),
                 id="prompt-container",
             )
-            # Status footer
             yield Static(id="status-bar")
 
         def on_mount(self):
             self.title = "AI-Commander TUI"
             self.sub_title = f"Model: {self.model_name} | Session: {self.session_id}"
             self.update_status_bar()
-            # The top warning banner is informational only: auto-hide it
-            # after a few seconds so it does not occupy screen space for
-            # the whole session.  It is shown again whenever a command
-            # approval is pending (see _refresh_approval_prompt).
+            # The banner is informational only; auto-hide after a grace period
+            # (it is shown again while an approval is pending).
             self.set_timer(20.0, self._auto_hide_warning_banner)
-            # Make sure the right-hand panel shows the Console Output tab by
-            # default (it already does via ContentSwitcher(initial=...), but
-            # set it explicitly so nothing can leave the Shell tab active).
             try:
                 self.query_one("#right-panel ContentSwitcher").current = "console-log"
             except Exception:
                 pass
-            # Give keyboard focus to the prompt input so typed commands are
-            # captured immediately instead of going nowhere.
             try:
                 self.query_one("#prompt-input").focus()
             except Exception:
                 pass
-            # Poll the event queue every 50 ms
             self.set_interval(0.05, self._drain_queue)
 
-            # If a task request was supplied on the command line, auto-start
-            # the agent with it instead of discarding it.  This mirrors the
-            # --nogui path where args.request is passed straight to
-            # run().  We schedule via a one-shot callback so the
-            # app has finished composing widgets before we start the
-            # background thread; the request is consumed so a remount
-            # (e.g. resize) does not re-launch.
+            # Auto-start the agent with a CLI-supplied request, mirroring
+            # --nogui. Deferred so widgets exist before the thread starts;
+            # the request is consumed so a remount doesn't re-launch.
             cli_request = " ".join(self.args.request) if self.args.request else ""
             self.args.request = []
             if cli_request.strip():
@@ -2130,30 +1658,25 @@ def main():
                 self.set_timer(0.5, self._autostart_once)
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
-            """When a right-panel tab button is clicked, focus the shell if
-            that is the active pane so keyboard input goes straight to it."""
+            """Focus the shell when its tab button is clicked."""
             if event.button.id == "btn-shell":
                 try:
                     switcher = self.query_one("#right-panel ContentSwitcher")
                     if switcher.current == "shell-widget":
-                        shell = self.query_one("#shell-widget")
-                        shell.focus()
+                        self.query_one("#shell-widget").focus()
                 except Exception:
                     pass
 
         def update_status_bar(self):
             sb = self.query_one("#status-bar")
             ap_status = "ON" if self.auto_approve else "OFF"
-            # Show whether the OS-level Landlock sandbox is active.  The
-            # state is fixed at startup (see --disable-sandbox) so it never
-            # changes during the session; green when on, red when off.
             sandbox_on = getattr(self.args, "sandbox_enabled", False)
             sandbox_txt = (
                 "[green]Sandbox: on[/green]"
                 if sandbox_on
                 else "[red]Sandbox: off[/red]"
             )
-            status_text = (
+            sb.update(
                 f"Model: {self.model_name} | "
                 f"Step: {self.step_count}/{self.max_steps} | "
                 f"tok/s: {self.tokens_per_second:.1f} | "
@@ -2162,13 +1685,11 @@ def main():
                 f"Pending approval: {'YES' if self.pending_approval else 'no'} | "
                 f"{sandbox_txt}"
             )
-            sb.update(status_text)
 
         def _drain_queue(self):
-            """Poll the event queue and dispatch events to widgets.  Runs on
-            the main Textual thread; the agent thread only writes to the
-            queue, never touches widgets."""
-            # Drain up to 200 events per tick to avoid starving the UI
+            """Poll the event queue and dispatch events to widgets (main
+            thread only; the agent thread only writes to the queue)."""
+            # Cap events per tick to avoid starving the UI.
             for _ in range(200):
                 if self.event_queue.empty():
                     break
@@ -2178,7 +1699,6 @@ def main():
                     break
                 self._dispatch_event(event)
 
-            # If agent thread has exited, clean up
             if self.agent_thread and not self.agent_thread.is_alive():
                 self._handle_agent_exit()
 
@@ -2212,7 +1732,6 @@ def main():
                 self._write_console(f"[COMMAND REQUESTED] {cmd}", style="bold yellow")
                 self._write_console(f"  tool_call_id: {tcid}  function: {fn}", style="yellow")
                 self._write_console(f"  ⚠ This command will execute when approved.", style="yellow")
-                # Set pending approval state
                 self.pending_approval = {"command": cmd, "tool_call_id": tcid}
                 self._refresh_approval_prompt()
             elif kind == "APPROVAL_REQUEST":
@@ -2221,32 +1740,20 @@ def main():
                 self._write_console(f"\n[APPROVAL REQUIRED] Command: {cmd}", style="bold yellow")
                 self._write_console(f"  Respond to the dialog to approve or reject.", style="yellow")
                 self._refresh_approval_prompt()
-                # Pop up the blocking Y/N modal dialog.  The agent thread is
-                # waiting on the sink's approval event; this dialog captures
-                # the user's decision and resolves it.
+                # The agent thread is blocked on the sink's approval event;
+                # the modal resolves it via the on_decision callback.
                 self._push_approval_dialog(cmd)
             elif kind == "CMD_OUTPUT":
-                text = payload.get("text", "")
-                cmd = payload.get("command", "")
-                self._write_console(text, style="green")
+                self._write_console(payload.get("text", ""), style="green")
             elif kind == "CMD_COMPLETE":
-                cmd = payload.get("command", "")
-                exit_code = payload.get("exit_code", -1)
-                output = payload.get("output", "")
-                self._write_console(f"[COMMAND COMPLETE] {cmd}", style="bold green")
-                self._write_console(f"  Exit code: {exit_code}", style="green")
-                # The raw output was already written live via CMD_OUTPUT
-                # chunks while the command ran; do NOT re-print the full
-                # captured output here, or it would appear twice in the
-                # console panel.
+                self._write_console(f"[COMMAND COMPLETE] {payload.get('command', '')}", style="bold green")
+                self._write_console(f"  Exit code: {payload.get('exit_code', -1)}", style="green")
+                # Raw output was already written live via CMD_OUTPUT chunks.
                 self.pending_approval = None
                 self._refresh_approval_prompt()
             elif kind == "STATUS_UPDATE":
                 self.step_count = payload.get("step", 0)
                 self.max_steps = payload.get("max_steps", 500)
-                # If no tokens have streamed recently, decay the displayed
-                # rate so it doesn't show a stale value while the agent is
-                # running commands or waiting on approval.
                 self._decay_token_rate()
             elif kind == "SHUTDOWN":
                 self._write_agent("[READY] Agent loop terminated, waiting for next command.", style="bold green")
@@ -2255,15 +1762,9 @@ def main():
             self.update_status_bar()
 
         def _track_token(self):
-            """Record that a token chunk arrived and update the rolling rate.
-
-            Uses a short sliding window so the displayed tok/s reflects the
-            current streaming speed rather than the session average.
-            """
+            """Record a streamed token chunk and update the rolling rate."""
             now = time.monotonic()
-            self._tok_count += 1
             self._tok_window_tokens += 1
-            # Roll the window every ~1s.
             if now - self._tok_window_start >= 1.0:
                 elapsed = now - self._tok_window_start
                 if elapsed > 0:
@@ -2272,112 +1773,74 @@ def main():
                 self._tok_window_tokens = 0
 
         def _decay_token_rate(self):
-            """Reset the displayed rate to 0 once streaming has been idle
-            for more than 2 seconds (e.g. between tool calls)."""
+            """Reset the rate to 0 once streaming has been idle for 2s."""
             if self._tok_window_tokens == 0 and time.monotonic() - self._tok_window_start >= 2.0:
                 self.tokens_per_second = 0.0
 
         def _write_agent(self, text: str, streaming: bool = False, prefix: str = "", style: str = "", end: str = "\n"):
-            """Write text to the agent output RichLog (bottom panel).
+            """Write text to the agent output RichLog.
 
-            When *streaming* is True (LLM/Thinking tokens) the text is
-            accumulated in a buffer and flushed as complete lines, so tokens
-            flow inline instead of one-per-line.  This avoids touching
-            RichLog's private internal storage (which is fragile across
-            Textual versions); the partial (incomplete) line is held in the
-            buffer and written out once a newline arrives or the stream ends.
-
-            A *prefix* label (e.g. "[THINKING]") is shown ONCE at the start
-            of a stream session, never prepended to individual token chunks.
-
-            *style* is a Rich style string (e.g. "bold red", "cyan").
+            Streaming text is buffered and flushed as complete lines so tokens
+            flow inline. The prefix label is shown once per stream, not per
+            chunk. *style* is a Rich style string.
             """
             try:
                 from rich.text import Text
                 widget = self.query_one("#agent-log")
                 clean = _strip_ansi(text)
-                # Filter out the internal completion marker so it doesn't
-                # clutter the agent output panel.  The agent loop still uses
-                # it internally to detect when the task is done.
+                # Hide the internal completion marker from the panel; the
+                # agent loop still uses it to detect task completion.
                 clean = clean.replace("TASKCOMPLETE", "")
                 if not clean:
                     return
                 buf_key = "#agent-log"
-                # --- Streaming path -------------------------------------------------
                 if streaming:
-                    # On the very first chunk of a new stream, emit the label
-                    # once as its own line, then mark it done so it is never
-                    # prepended to subsequent token chunks.
                     if prefix and buf_key not in self._stream_prefix_done:
                         self._stream_prefix_done.add(buf_key)
-                        label = Text(_strip_ansi(prefix).strip(), style=style or "magenta")
-                        widget.write(label)
+                        widget.write(Text(_strip_ansi(prefix).strip(), style=style or "magenta"))
 
-                    # Accumulate the CLEAN token text (no prefix) into the buffer.
+                    # Flush complete lines; keep the partial line buffered.
                     buf = self._stream_buffer.get(buf_key, "") + clean
-                    # Split on newlines: flush complete lines, keep the remainder
-                    # (the still-growing current line) buffered until it completes.
                     parts = buf.split("\n")
-                    remainder = parts[-1]
-                    self._stream_buffer[buf_key] = remainder
+                    self._stream_buffer[buf_key] = parts[-1]
                     for part in parts[:-1]:
-                        styled = Text(part, style=style) if style else Text(part)
-                        widget.write(styled)
-                # --- Non-streaming path (stream ended or normal message) -----------
+                        widget.write(Text(part, style=style) if style else Text(part))
                 else:
-                    # A non-streaming write signals the end of any active
-                    # stream.  First flush whatever is pending in the buffer,
-                    # then reset stream-tracking state so the next stream
-                    # starts fresh.
+                    # A non-streaming write ends any active stream: flush the
+                    # buffer and reset stream-tracking state.
                     pending = self._stream_buffer.pop(buf_key, "")
                     if pending:
-                        styled = Text(pending, style=style) if style else Text(pending)
-                        widget.write(styled)
+                        widget.write(Text(pending, style=style) if style else Text(pending))
                     self._stream_prefix_done.discard(buf_key)
 
                     full = _strip_ansi(prefix) + clean
-                    styled = Text(full, style=style) if style else Text(full)
-                    widget.write(styled)
+                    widget.write(Text(full, style=style) if style else Text(full))
             except Exception:
                 pass
 
         def _write_console(self, text: str, style: str = ""):
-            """Write text to the console output RichLog (top-right panel).
-
-            *style* is a Rich style string (e.g. "bold red", "green").
-            """
+            """Write text to the console output RichLog."""
             try:
                 from rich.text import Text
                 widget = self.query_one("#console-log")
                 clean = _strip_ansi(text)
-                if style:
-                    styled = Text(clean, style=style)
-                else:
-                    styled = Text(clean)
-                widget.write(styled)
+                widget.write(Text(clean, style=style) if style else Text(clean))
             except Exception:
                 pass
 
         def _auto_hide_warning_banner(self):
-            """Hide the top warning banner after the initial grace period.
-
-            The banner is purely informational; it must not stay visible for
-            the whole session.  If a command approval is pending when the
-            timer fires, keep the banner visible so the user does not miss
-            the blocked-agent state.
-            """
+            """Hide the banner after the grace period unless an approval is
+            pending (the blocked-agent state must stay visible)."""
             if not self.pending_approval:
                 self._hide_warning_banner()
 
         def _hide_warning_banner(self):
-            """Collapse the warning banner so it takes no screen space."""
             try:
                 self.query_one("#warning-banner").display = False
             except Exception:
                 pass
 
         def _show_warning_banner(self):
-            """Make the warning banner visible again (e.g. pending approval)."""
             try:
                 self.query_one("#warning-banner").display = True
             except Exception:
@@ -2388,30 +1851,20 @@ def main():
             try:
                 banner = self.query_one("#warning-banner")
                 if self.pending_approval:
-                    status = (
+                    banner.update(
                         "⚠ PENDING APPROVAL ⚠\n"
                         f"  Command: {self.pending_approval.get('command','')}\n"
                         "  Type /approve to execute, /reject to deny, or /suggest <text> for guidance\n"
                         "  Agent is BLOCKED waiting for your decision."
                     )
-                    banner.update(status)
                     self._show_warning_banner()
                 else:
-                    # No pending approval: the informational banner stays
-                    # hidden after its initial grace period.
                     self._hide_warning_banner()
             except Exception:
                 pass
 
         def _push_approval_dialog(self, command: str):
-            """Push the blocking Y/N approval modal dialog.
-
-            The agent thread is blocked in TUISink.input() waiting on its
-            approval threading.Event.  This modal captures the user's decision
-            and resolves that event via the on_decision callback, which unblocks
-            the agent.  Uses push_screen so the ModalScreen stacks on top of the
-            main screen and blocks the whole UI until dismissed.
-            """
+            """Push the blocking Y/N approval modal."""
             def on_decision(approved: bool):
                 if self.sink:
                     self.sink.resolve_approval(approved)
@@ -2426,13 +1879,13 @@ def main():
             self.agent_thread = None
             # Keep self.agent so its conversation_history persists across commands.
             self.pending_approval = None
-            # Do not close the app automatically; let user review output.
+            # Stay open so the user can review output.
             self._refresh_approval_prompt()
             self.update_status_bar()
 
         def _autostart_once(self):
-            """One-shot dispatcher used by on_mount to launch the agent with
-            a command-line supplied request.  Cancels itself after firing."""
+            """One-shot timer callback launching the agent with the CLI
+            request; returning False cancels the timer."""
             try:
                 prompt = getattr(self, "_cli_request", "")
                 if prompt:
@@ -2440,15 +1893,11 @@ def main():
             except Exception as exc:
                 self._write_agent(f"[ERROR] Failed to auto-start from CLI request: {exc}")
             finally:
-                return False  # returning False cancels the recurring interval
+                return False
 
         def _start_agent(self, prompt: str):
-            """Start the agent thread with the given prompt.
-
-            If the agent is already running, the typed text is injected into
-            the agent stream as a mid-run user suggestion so behavior can be
-            steered while the agent is executing.
-            """
+            """Start the agent thread with the given prompt. If already
+            running, queue the text as a mid-run steering suggestion."""
             if self.agent_thread and self.agent_thread.is_alive():
                 if self.agent:
                     self.agent.inject_suggestion(prompt)
@@ -2456,12 +1905,9 @@ def main():
                 else:
                     self._write_agent("[ERROR] Agent is running but not available for suggestions.")
                 return
-            # Clear the stop events so the new agent run starts fresh.
             self.stop_event.clear()
             self.sink = TUISink(self.event_queue, self.stop_event)
             self.sink.auto_approve = self.auto_approve
-            # Show the [SANDBOX] status in the agent output panel exactly once
-            # (green when the OS-level sandbox is active, red when unsandboxed).
             if not self._sandbox_notified:
                 self.sink.emit("LOG", {
                     "text": self.args.sandbox_msg,
@@ -2469,9 +1915,8 @@ def main():
                 })
                 self._sandbox_notified = True
             if self.agent is None:
-                # First run: create a fresh agent.  persist_history is enabled
-                # so that if the user later sends another command, the same
-                # instance is reused and its conversation history carries over.
+                # persist_history lets later commands reuse this instance and
+                # its conversation history.
                 self.agent = AICommander(
                     api_base=self.api_base,
                     model=self.model_name,
@@ -2487,11 +1932,8 @@ def main():
                     max_steps=self.args.max_steps
                 )
             else:
-                # Reuse the existing agent so its conversation history (from
-                # prior commands in this session) is carried into the new run.
-                # Clear its internal stop event so the loop can run again, and
-                # point it at the fresh sink.  Also re-sync the auto_approve
-                # gate in case the user toggled /aa since the last run.
+                # Reuse the agent (and its history); re-sync mutable state in
+                # case the user toggled /aa since the last run.
                 self.agent.persist_history = True
                 self.agent.stop_event.clear()
                 self.agent.sink = self.sink
@@ -2514,36 +1956,26 @@ def main():
             self.pending_approval = None
             self._refresh_approval_prompt()
 
-        # --- Input handling ---
-        # The Input widget emits Input.Submitted events when the user presses
-        # Enter.  We intercept the text to handle slash commands and prompt
-        # submission.  The input field is in the prompt panel.
-
         def on_input_submitted(self, event):
             """Handle Enter key in the prompt input field."""
             text = event.value.strip()
-            # Clear the input field
             try:
-                input_widget = self.query_one("#prompt-input")
-                input_widget.value = ""
+                self.query_one("#prompt-input").value = ""
             except Exception:
                 pass
 
             if not text:
                 return
 
-            # Slash commands
             if text.startswith("/"):
                 self._handle_slash_command(text)
                 return
 
-            # Otherwise, treat as a prompt to start the agent
             self._start_agent(text)
 
         def _handle_slash_command(self, cmd: str):
             """Handle slash commands typed in the prompt panel."""
-            cmd_lower = cmd.lower()
-            parts = cmd_lower.split(" ", 1)
+            parts = cmd.lower().split(" ", 1)
             command = parts[0]
             arg = parts[1] if len(parts) > 1 else ""
 
@@ -2551,10 +1983,8 @@ def main():
                 self.auto_approve = not self.auto_approve
                 if self.sink:
                     self.sink.auto_approve = self.auto_approve
-                # Keep the agent's gate in sync too: get_user_confirmation()
-                # checks self.agent.auto_approve, not the app/sink flag, so
-                # without this the toggle would only update the UI while the
-                # agent kept auto-approving (or blocking) commands.
+                # The gate lives in the agent (get_user_confirmation), so it
+                # must be kept in sync with the UI toggle.
                 if self.agent:
                     self.agent.auto_approve = self.auto_approve
                 self._write_agent(
@@ -2616,34 +2046,23 @@ def main():
                 self._write_agent(f"[UNKNOWN COMMAND] {cmd}")
                 self._write_agent("Available: /autoapprove /aa /approve /reject /suggest /stop /quit /exit")
 
-        # --- Key bindings ---
         def key_press(self, event):
-            """Handle global key presses."""
-            # Ctrl+C stops the agent and quits
-            if event.key == "ctrl+c":
+            """Ctrl+C / Escape: stop the agent and quit."""
+            if event.key in ("ctrl+c", "escape"):
                 self._stop_agent()
                 self.shutdown()
-                return
-            # Escape also stops
-            if event.key == "escape":
-                self._stop_agent()
-                self.shutdown()
-                return
 
         def shutdown(self):
             """Clean shutdown: stop agent, close sink, exit app."""
             self._stop_agent()
             if self.sink:
                 self.sink.close()
-            # Remove the input widget if present
             try:
-                input_widget = self.query_one("#prompt-input")
-                input_widget.remove()
+                self.query_one("#prompt-input").remove()
             except Exception:
                 pass
             self.exit()
 
-    # Instantiate and run the TUI
     app = CommanderApp(args)
     try:
         app.run()
@@ -2652,7 +2071,6 @@ def main():
         sys.exit(0)
     except Exception as e:
         print(f"[FATAL ERROR] TUI crashed: {e}", file=sys.stderr)
-        import traceback
         traceback.print_exc()
         sys.exit(1)
 
