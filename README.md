@@ -40,15 +40,13 @@ It supports two presentation modes:
 Clone the repository and install the dependencies:
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/ortegaalfredo/AICommander
 cd AICommander
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
-
-> **Note:** `textual` (used by the TUI) pulls in `rich` transitively, which the
-> TUI code imports directly. The `py-landlock` package is only used on Linux and
+> **Note:** The `py-landlock` package is only used on Linux and
 > is optional — the agent runs unsandboxed if it is not installed.
 
 ## Usage
