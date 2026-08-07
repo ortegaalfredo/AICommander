@@ -26,6 +26,9 @@ import signal
 import os
 import pty
 import select
+import fcntl
+import termios
+import struct
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from openai import OpenAI
@@ -41,10 +44,13 @@ try:
     import textual
     from textual.app import App, ComposeResult
     from textual.widgets import RichLog, Input, Static, Button
+    from textual.widgets import TabbedContent, TabPane
+    from textual.widget import Widget
     from textual.screen import ModalScreen
     from textual.containers import Horizontal, Vertical
     from textual import events
     from textual.binding import Binding
+    import pyte  # VT100 terminal emulator used by the embedded shell widget
     _TEXTUAL_AVAILABLE = True
 except ImportError:
     _TEXTUAL_AVAILABLE = False
@@ -1492,9 +1498,343 @@ def main():
 
     # Import Textual widgets (only available in TUI mode)
     from textual.app import App, ComposeResult
-    from textual.widgets import RichLog, Input, Static
+    from textual.widgets import RichLog, Input, Static, TabbedContent, TabPane, ContentSwitcher
+    from textual.widget import Widget
     from textual import events
     from textual.binding import Binding
+    from rich.text import Text as RichText
+    import pyte
+
+    class ShellWidget(Widget, can_focus=True):
+        """A real interactive shell embedded in a Textual widget.
+
+        It spawns the user's default shell (from $SHELL, falling back to
+        /bin/sh) in a pseudo-terminal, emulates the VT100 output with pyte,
+        and renders the terminal screen.  All keyboard input while focused is
+        forwarded to the shell, so it behaves like a regular terminal
+        (including Tab for autocomplete, Ctrl+C, arrows, etc.).
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._master_fd: Optional[int] = None
+            self._pid: Optional[int] = None
+            self._screen = None  # pyte.Screen
+            self._stream = None  # pyte.ByteStream
+            self._cols = 80
+            self._rows = 24
+            # Full terminal history (scrollback) as a list of plain-text lines.
+            self._history: list = []
+            # Last rendered text, used to avoid useless refreshes.
+            self._last_render = ""
+
+        def check_consume_key(self, key: str, character: Optional[str]) -> bool:
+            """Let the shell take precedence over ancestor bindings.
+
+            We deliberately do NOT return True for every key: doing so makes
+            Textual treat the key as fully consumed during the binding phase,
+            which in some Textual versions prevents ``_on_key`` from ever
+            receiving the event (so the shell appears dead) and also blocks
+            the Tab key used to switch panes.  Returning False lets the key
+            reach ``_on_key`` (which forwards it to the pty and calls
+            ``event.stop()``), while the App/RightPanel only define a handful
+            of explicit bindings that remain usable.
+            """
+            return False
+
+        def _spawn(self) -> None:
+            """Fork a shell in a pty and set up the pyte emulator."""
+            shell = os.environ.get("SHELL", "") or "/bin/sh"
+            if not shell or not os.path.exists(shell):
+                shell = "/bin/sh"
+            try:
+                pid, master_fd = pty.fork()
+            except OSError:
+                return
+            if pid == 0:
+                # Child: exec the shell.
+                os.environ["TERM"] = "xterm-256color"
+                try:
+                    os.execv(shell, [shell])
+                except Exception:
+                    try:
+                        os.execv("/bin/sh", ["/bin/sh"])
+                    except Exception:
+                        os._exit(127)
+            # Parent.
+            self._pid = pid
+            self._master_fd = master_fd
+            # Non-blocking reads so _poll never blocks the UI thread.
+            try:
+                fl = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+                fcntl.fcntl(master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            except OSError:
+                pass
+            self._resize_pty()
+            # Set up the VT100 emulator sized to the widget.
+            self._screen = pyte.Screen(self._cols, self._rows)
+            self._stream = pyte.ByteStream(self._screen)
+            self._stream.attach(self._screen)
+
+        def _resize_pty(self) -> None:
+            """Tell the kernel the pty window size (so full-screen apps work)."""
+            if self._master_fd is None:
+                return
+            try:
+                winsize = struct.pack("HHHH", self._rows, self._cols, 0, 0)
+                fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
+            except OSError:
+                pass
+
+        def on_mount(self) -> None:
+            # Do NOT spawn here: the widget is mounted hidden inside the
+            # ContentSwitcher (size 0x0), so a pty spawned now would get a
+            # 0x0 window size and the shell would emit no prompt (black
+            # screen).  We spawn lazily in on_resize() once a real size is
+            # known.  Just start the output poller.
+            self.set_interval(0.05, self._poll)
+
+        def on_resize(self, event: events.Resize) -> None:
+            # Ignore degenerate (hidden) sizes: the ContentSwitcher reports
+            # 0x0 while the widget is not the visible tab.  Spawning at that
+            # size would start the shell with a tiny/broken window.
+            if event.size.width < 4 or event.size.height < 3:
+                return
+            self._cols = max(2, event.size.width)
+            self._rows = max(2, event.size.height)
+            # Spawn the shell the first time we have a real size, so the pty
+            # starts with a correct window size and the shell prints its
+            # prompt immediately.  If it was already spawned at a degenerate
+            # size (shouldn't happen now, but be safe), leave it alone.
+            if self._master_fd is None and self._pid is None:
+                self._spawn()
+            if self._screen is not None:
+                try:
+                    # pyte.Screen.resize(lines, columns) -- rows first.
+                    self._screen.resize(self._rows, self._cols)
+                except Exception:
+                    pass
+            self._resize_pty()
+            self.refresh()
+
+        def _poll(self) -> None:
+            """Read pending pty output, feed it to pyte, and refresh."""
+            if self._master_fd is None:
+                # No live shell yet (waiting for first on_resize) or the child
+                # exited.  Spawning is handled in on_resize() so the pty gets a
+                # correct window size; nothing to do here until then.
+                return
+            try:
+                data = os.read(self._master_fd, 65536)
+            except BlockingIOError:
+                data = b""
+            except OSError:
+                data = b""
+            if data:
+                try:
+                    self._stream.feed(data)
+                except Exception:
+                    pass
+                self._sync_history()
+                self.refresh()
+            # Reap the child if it exited, so we don't leak the fd.  Once
+            # reaped, reset BOTH _pid and _master_fd to None so the next poll
+            # spawns a fresh shell instead of repeatedly waitpid()'ing a
+            # non-child (ChildProcessError) and trying to close a dead fd.
+            if self._pid is not None:
+                try:
+                    wpid, _status = os.waitpid(self._pid, os.WNOHANG)
+                except ChildProcessError:
+                    wpid = self._pid
+                if wpid == self._pid:
+                    try:
+                        os.close(self._master_fd)
+                    except OSError:
+                        pass
+                    self._master_fd = None
+                    self._pid = None
+
+        def _sync_history(self) -> None:
+            """Copy the pyte screen into self._history.
+
+            ``Screen.display()`` returns the current screen as a list of
+            plain-text lines (one per visible row), which is exactly what we
+            need for rendering.  It handles the internal buffer layout (a dict
+            keyed by coordinates) for us.
+            """
+            if self._screen is None:
+                return
+            try:
+                # Strip trailing whitespace from each line so the prompt sits
+                # flush against the left edge.
+                self._history = [line.rstrip() for line in self._screen.display]
+            except Exception:
+                # Never let a rendering hiccup crash the poll loop.
+                pass
+
+        def render(self) -> RichText:
+            """Render the terminal history, showing only the last *height* lines.
+
+            Also draws a block cursor at the pyte cursor position so the user
+            can see where input will land (like a real terminal)."""
+            if not self._history:
+                return RichText("")
+            height = self.size.height
+            if height <= 0:
+                height = 24
+            visible = self._history[-height:] if height else []
+            # Pad short buffers up to the widget height so the prompt sits at
+            # the bottom, like a real terminal.
+            if len(visible) < height:
+                visible = [""] * (height - len(visible)) + visible
+
+            # Locate the pyte cursor within the visible window.  The cursor's
+            # absolute row is screen.cursor.y; the visible window shows the
+            # last `height` history rows, so the cursor's on-screen row is
+            # cursor.y - (len(history) - height), offset by any top padding.
+            cursor_row = -1
+            cursor_col = 0
+            if self._screen is not None:
+                try:
+                    cy = self._screen.cursor.y
+                    cx = self._screen.cursor.x
+                    pad_top = height - len(self._history[-height:])
+                    row_in_hist = cy - (len(self._history) - height)
+                    cursor_row = pad_top + row_in_hist
+                    cursor_col = cx
+                except Exception:
+                    cursor_row = -1
+
+            text = RichText()
+            for i, line in enumerate(visible):
+                if i:
+                    text.append("\n")
+                if i == cursor_row and 0 <= cursor_col:
+                    # Draw the line with a reverse-video block at the cursor.
+                    before = line[:cursor_col]
+                    at = line[cursor_col:cursor_col + 1] or " "
+                    after = line[cursor_col + 1:]
+                    text.append(before, style="default on #000000")
+                    text.append(at, style="reverse on #000000")
+                    text.append(after, style="default on #000000")
+                else:
+                    text.append(line, style="default on #000000")
+            return text
+
+        async def _on_key(self, event: events.Key) -> None:
+            """Forward every key press to the shell and stop propagation."""
+            data = self._key_to_bytes(event)
+            if data and self._master_fd is not None:
+                try:
+                    os.write(self._master_fd, data)
+                except OSError:
+                    pass
+            event.stop()
+
+        def _key_to_bytes(self, event: events.Key) -> bytes:
+            """Convert a Textual Key event into the byte sequence for the pty."""
+            key = event.key
+            # Ctrl+letter -> control character (e.g. ctrl+c -> 0x03).
+            if key.startswith("ctrl+"):
+                ch = key[5:]
+                if len(ch) == 1 and ch.isalpha():
+                    return bytes([ord(ch.lower()) & 0x1f])
+            # Printable characters (handles shift -> uppercase, etc.).
+            if event.is_printable and event.character:
+                return event.character.encode("utf-8")
+            # Special / function keys.
+            special = {
+                "enter": b"\r",
+                "backspace": b"\x7f",
+                "tab": b"\t",
+                "escape": b"\x1b",
+                "up": b"\x1b[A",
+                "down": b"\x1b[B",
+                "right": b"\x1b[C",
+                "left": b"\x1b[D",
+                "home": b"\x1b[H",
+                "end": b"\x1b[F",
+                "delete": b"\x1b[3~",
+                "pageup": b"\x1b[5~",
+                "pagedown": b"\x1b[6~",
+            }
+            if key in special:
+                return special[key]
+            # Function keys F1..F12.
+            if key.startswith("f") and key[1:].isdigit():
+                n = int(key[1:])
+                if 1 <= n <= 4:
+                    return b"\x1bOP" if n == 1 else b"\x1bO" + bytes([ord("P") + n - 1])
+                if 5 <= n <= 12:
+                    return b"\x1b[" + str(n + 9).encode() + b"~"
+            return b""
+
+    class RightPanel(Vertical):
+        """Manual tab panel for the right-hand side (Console Output + Shell).
+
+        Built from basic widgets because Textual 8.2.8's TabbedContent
+        docks its tab strip to the screen top and breaks the Horizontal
+        layout.  Uses a Vertical container with a Horizontal button strip
+        on top and a ContentSwitcher below.
+        """
+
+        BINDINGS = [
+            Binding("tab", "switch_tab", "Switch panel", show=False),
+        ]
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._switcher = None
+
+        def compose(self) -> ComposeResult:
+            with Horizontal(id="tab-strip"):
+                yield Button("Console Output", id="btn-console")
+                yield Button("Shell", id="btn-shell")
+            with ContentSwitcher(initial="console-log") as switcher:
+                self._switcher = switcher
+                yield RichLog(id="console-log", auto_scroll=True, wrap=True, max_lines=1000)
+                yield ShellWidget(id="shell-widget")
+
+        def on_mount(self) -> None:
+            """Mark the Console Output tab active by default."""
+            self._update_tab_buttons()
+
+        def _update_tab_buttons(self) -> None:
+            """Reflect the active pane on the tab buttons via the -active class."""
+            try:
+                console_active = self._switcher.current == "console-log"
+                self.query_one("#btn-console", Button).set_class(console_active, "-active")
+                self.query_one("#btn-shell", Button).set_class(not console_active, "-active")
+            except Exception:
+                pass
+
+        def action_switch_tab(self) -> None:
+            """Cycle between the Console Output and Shell tabs."""
+            if self._switcher.current == "shell-widget":
+                self._switcher.current = "console-log"
+            else:
+                self._switcher.current = "shell-widget"
+            self._update_tab_buttons()
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            """Switch pane when a tab button is clicked."""
+            # Stop the event so CommanderApp's on_button_pressed (bubbled)
+            # does not double-handle it.
+            event.stop()
+            if event.button.id == "btn-console":
+                self._switcher.current = "console-log"
+            elif event.button.id == "btn-shell":
+                self._switcher.current = "shell-widget"
+                # Focus the shell so keystrokes go to it immediately.  Defer
+                # to the next tick so Textual's own click->focus-button logic
+                # runs first and our focus() call wins.
+                def _focus_shell():
+                    try:
+                        self.query_one("#shell-widget").focus()
+                    except Exception:
+                        pass
+                self.set_timer(0.01, _focus_shell)
+            self._update_tab_buttons()
 
     class CommanderApp(App):
         """Textual TUI for AI-Commander.
@@ -1567,6 +1907,16 @@ def main():
         }
         #panels {
             height: 1fr;
+            width: 1fr;
+        }
+        /* Ensure the right panel and its content switcher actually fill the
+        available space; without an explicit min-height the switcher body
+        collapsed to zero in real terminals (tab strip rendered, body blank). */
+        #right-panel {
+            min-height: 5;
+        }
+        #right-panel ContentSwitcher {
+            min-height: 3;
         }
         RichLog {
             border: solid #f2f2f2;
@@ -1584,6 +1934,60 @@ def main():
             color: #f2f2f2;
             border: solid #f2f2f2;
             width: 1fr;
+        }
+        #right-panel {
+            height: 1fr;
+            width: 1fr;
+            layout: vertical;
+        }
+        #tab-strip {
+            height: 3;
+            background: #0b2f5e;
+        }
+        #tab-strip Button {
+            width: 1fr;
+            height: 3;
+            background: #0b2f5e;
+            color: #f2f2f2;
+            border: none;
+            /* Suppress Textual's default Button focus/active chrome (the
+            animated border + tall highlight) which looked out of place on a
+            flat tab strip. */
+            border-top: none;
+            border-bottom: none;
+        }
+        /* Neutralize the default focus highlight entirely; the selected tab
+        is shown only via the -active class below, so keyboard focus moving
+        over a button does not trigger a distracting animation. */
+        #tab-strip Button:focus {
+            background: #0b2f5e;
+            color: #f2f2f2;
+            text-style: none;
+        }
+        /* Visually mark the currently-selected tab.  Target the button IDs
+        directly (higher specificity than Textual's internal .-style-default
+        component class) so the teal highlight actually wins. */
+        #btn-console.-active, #btn-shell.-active {
+            background: #06989a;
+            color: #000000;
+            text-style: bold;
+        }
+        /* The active tab keeps its highlight even when focused. */
+        #btn-console.-active:focus, #btn-shell.-active:focus {
+            background: #06989a;
+            color: #000000;
+            text-style: bold;
+        }
+        #right-panel ContentSwitcher {
+            height: 1fr;
+            width: 1fr;
+        }
+        #shell-widget {
+            background: #000000;
+            color: #f2f2f2;
+            height: 1fr;
+            width: 1fr;
+            padding: 0;
         }
         """
 
@@ -1643,12 +2047,13 @@ def main():
                 markup=False
             )
             # Side-by-side panels (Norton-Commander style): Agent output on
-            # the left, Console output on the right, screen split in the middle.
+            # the left; on the right a tabbed panel with the Console Output
+            # log and an embedded interactive shell.  The user can switch
+            # between them with the mouse (clicking the tab strip) or the
+            # Tab key (when the tab strip is focused).
             agent = RichLog(id="agent-log", auto_scroll=True, wrap=True, max_lines=2000)
             agent.border_title = "Agent Output"
-            console = RichLog(id="console-log", auto_scroll=True, wrap=True, max_lines=1000)
-            console.border_title = "Console Output"
-            yield Horizontal(agent, console, id="panels")
+            yield Horizontal(agent, RightPanel(id="right-panel"), id="panels")
             # Prompt input field (bottom, full width), with a shell-style
             # "> " marker preceding it as a visual cue.
             yield Horizontal(
@@ -1663,6 +2068,13 @@ def main():
             self.title = "AI-Commander TUI"
             self.sub_title = f"Model: {self.model_name} | Session: {self.session_id}"
             self.update_status_bar()
+            # Make sure the right-hand panel shows the Console Output tab by
+            # default (it already does via ContentSwitcher(initial=...), but
+            # set it explicitly so nothing can leave the Shell tab active).
+            try:
+                self.query_one("#right-panel ContentSwitcher").current = "console-log"
+            except Exception:
+                pass
             # Give keyboard focus to the prompt input so typed commands are
             # captured immediately instead of going nowhere.
             try:
@@ -1684,6 +2096,18 @@ def main():
             if cli_request.strip():
                 self._cli_request = cli_request
                 self.set_timer(0.5, self._autostart_once)
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            """When a right-panel tab button is clicked, focus the shell if
+            that is the active pane so keyboard input goes straight to it."""
+            if event.button.id == "btn-shell":
+                try:
+                    switcher = self.query_one("#right-panel ContentSwitcher")
+                    if switcher.current == "shell-widget":
+                        shell = self.query_one("#shell-widget")
+                        shell.focus()
+                except Exception:
+                    pass
 
         def update_status_bar(self):
             sb = self.query_one("#status-bar")
@@ -1769,8 +2193,10 @@ def main():
                 output = payload.get("output", "")
                 self._write_console(f"[COMMAND COMPLETE] {cmd}", style="bold green")
                 self._write_console(f"  Exit code: {exit_code}", style="green")
-                if output:
-                    self._write_console(f"  Output:\n{output}", style="green")
+                # The raw output was already written live via CMD_OUTPUT
+                # chunks while the command ran; do NOT re-print the full
+                # captured output here, or it would appear twice in the
+                # console panel.
                 self.pending_approval = None
                 self._refresh_approval_prompt()
             elif kind == "STATUS_UPDATE":
