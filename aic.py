@@ -49,6 +49,7 @@ class colors:
     YELLOW = '\033[93m'
     BLUE = '\033[94m'
     CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
     BOLD = '\033[1m'
     END = '\033[0m'
 
@@ -97,7 +98,7 @@ class ConsoleSink(EventSink):
         "CMD_COMPLETE": colors.BOLD,
         "SYSTEM": colors.BOLD + colors.BLUE,
     }
-    _LOG_STYLES = {"yellow": colors.YELLOW, "green": colors.GREEN, "red": colors.RED}
+    _LOG_STYLES = {"yellow": colors.YELLOW, "green": colors.GREEN, "red": colors.RED, "magenta": colors.MAGENTA}
 
     def emit(self, kind: str, payload: dict):
         text = payload.get("text", "")
@@ -778,7 +779,7 @@ Think carefully; response quality is the highest priority. You have unlimited th
                 "auto_approve": self.auto_approve,
                 "max_prompt_len": self.max_prompt_len,
             })
-        self._log(f"[USER REQUEST] {user_request}")
+        self._log(f"[USER REQUEST] {user_request}", style="magenta")
         self._log(f"{'='*60}")
 
         # With persist_history, refresh the system prompt in place and append
