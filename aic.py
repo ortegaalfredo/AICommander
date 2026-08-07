@@ -327,7 +327,7 @@ class AICommander:
 - Only describe your plan, your reasoning, and conclusions drawn from the REAL tool output. Never fabricate or guess command output — wait for the actual result.
 
 **Internet Access:**
-- Use `ddgr --json --unsafe --np "query"`, wget/curl, and the w3m browser for up-to-date information.
+- Web search by printing JSON results to stdout: `python3 -c "import json; from ddgs import DDGS; print(json.dumps(list(DDGS().text('QUERY', max_results=10)), ensure_ascii=False, indent=2))"` (replace QUERY). Use wget/curl and the w3m browser to fetch page contents.
 
 **Persistence Policy (CRITICAL):**
 - Keep working until the task is genuinely complete. Do NOT stop early or produce a summary-only final response — take concrete action with tools.

@@ -20,7 +20,7 @@ It supports two presentation modes:
 - **Ralph-loop agent** — repeatedly plans, executes, and observes until the
   task is done.
 - **Shell access** — runs arbitrary commands and captures their output.
-- **Web search** — using duck-duck-go ddgr command line tool (need install)
+- **Web search** — using the duck-duck-go `ddgs` Python package (installed via requirements.txt)
 - **Approval gate** — review each command before it runs, or auto-approve.
 - **Thinking tokens** — optional display/hiding of reasoning output.
 - **Command timeouts** — prevent runaway commands (configurable).

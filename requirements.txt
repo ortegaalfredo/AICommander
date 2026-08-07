@@ -4,6 +4,7 @@
 # directly (from rich.text import Text), so rich is not listed separately.
 
 openai>=2.0.0
+ddgs>=8.0.0
 textual>=8.0.0
 py-landlock>=0.1.0
 pyte>=0.8.2
