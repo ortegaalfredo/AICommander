@@ -1711,6 +1711,12 @@ def main():
                     text.append("\n")
                 if i == cursor_row and 0 <= cursor_col:
                     # Draw the line with a reverse-video block at the cursor.
+                    # The history lines were rstrip()ed, so trailing spaces
+                    # (e.g. echoed when the user presses Space) were removed.
+                    # Pad the line up to the cursor column so the block
+                    # cursor advances on whitespace just like on real text.
+                    if len(line) < cursor_col:
+                        line = line + " " * (cursor_col - len(line))
                     before = line[:cursor_col]
                     at = line[cursor_col:cursor_col + 1] or " "
                     after = line[cursor_col + 1:]
@@ -1799,22 +1805,44 @@ def main():
             """Mark the Console Output tab active by default."""
             self._update_tab_buttons()
 
-        def _update_tab_buttons(self) -> None:
-            """Reflect the active pane on the tab buttons via the -active class."""
-            try:
-                console_active = self._switcher.current == "console-log"
-                self.query_one("#btn-console", Button).set_class(console_active, "-active")
-                self.query_one("#btn-shell", Button).set_class(not console_active, "-active")
-            except Exception:
-                pass
+        def _update_tab_buttons(self, active=None) -> None:
+            """Reflect the active pane on the tab buttons via the active-tab class.
+
+            *active* is the pane id ("console-log" or "shell-widget").  When
+            omitted it is read from the switcher; callers that just changed
+            the switcher pass it explicitly because ContentSwitcher applies
+            the new ``current`` asynchronously, so reading it back immediately
+            would return the previous pane.
+            """
+            if active is None:
+                active = self._switcher.current
+            console_active = active == "console-log"
+
+            def _apply():
+                try:
+                    bc = self.query_one("#btn-console", Button)
+                    bs = self.query_one("#btn-shell", Button)
+                    if console_active:
+                        bc.add_class("active-tab")
+                        bs.remove_class("active-tab")
+                    else:
+                        bs.add_class("active-tab")
+                        bc.remove_class("active-tab")
+                except Exception:
+                    pass
+            # Defer to after the current event/refresh cycle so the class
+            # change is not clobbered by the switcher/focus updates that
+            # immediately follow a tab switch.
+            self.call_after_refresh(_apply)
 
         def action_switch_tab(self) -> None:
             """Cycle between the Console Output and Shell tabs."""
             if self._switcher.current == "shell-widget":
-                self._switcher.current = "console-log"
+                new = "console-log"
             else:
-                self._switcher.current = "shell-widget"
-            self._update_tab_buttons()
+                new = "shell-widget"
+            self._switcher.current = new
+            self._update_tab_buttons(new)
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
             """Switch pane when a tab button is clicked."""
@@ -1823,8 +1851,10 @@ def main():
             event.stop()
             if event.button.id == "btn-console":
                 self._switcher.current = "console-log"
+                self._update_tab_buttons("console-log")
             elif event.button.id == "btn-shell":
                 self._switcher.current = "shell-widget"
+                self._update_tab_buttons("shell-widget")
                 # Focus the shell so keystrokes go to it immediately.  Defer
                 # to the next tick so Textual's own click->focus-button logic
                 # runs first and our focus() call wins.
@@ -1834,7 +1864,6 @@ def main():
                     except Exception:
                         pass
                 self.set_timer(0.01, _focus_shell)
-            self._update_tab_buttons()
 
     class CommanderApp(App):
         """Textual TUI for AI-Commander.
@@ -1957,7 +1986,7 @@ def main():
             border-bottom: none;
         }
         /* Neutralize the default focus highlight entirely; the selected tab
-        is shown only via the -active class below, so keyboard focus moving
+        is shown only via the active-tab class below, so keyboard focus moving
         over a button does not trigger a distracting animation. */
         #tab-strip Button:focus {
             background: #0b2f5e;
@@ -1967,13 +1996,13 @@ def main():
         /* Visually mark the currently-selected tab.  Target the button IDs
         directly (higher specificity than Textual's internal .-style-default
         component class) so the teal highlight actually wins. */
-        #btn-console.-active, #btn-shell.-active {
+        #btn-console.active-tab, #btn-shell.active-tab {
             background: #06989a;
             color: #000000;
             text-style: bold;
         }
         /* The active tab keeps its highlight even when focused. */
-        #btn-console.-active:focus, #btn-shell.-active:focus {
+        #btn-console.active-tab:focus, #btn-shell.active-tab:focus {
             background: #06989a;
             color: #000000;
             text-style: bold;
@@ -2068,6 +2097,11 @@ def main():
             self.title = "AI-Commander TUI"
             self.sub_title = f"Model: {self.model_name} | Session: {self.session_id}"
             self.update_status_bar()
+            # The top warning banner is informational only: auto-hide it
+            # after a few seconds so it does not occupy screen space for
+            # the whole session.  It is shown again whenever a command
+            # approval is pending (see _refresh_approval_prompt).
+            self.set_timer(8.0, self._auto_hide_warning_banner)
             # Make sure the right-hand panel shows the Console Output tab by
             # default (it already does via ContentSwitcher(initial=...), but
             # set it explicitly so nothing can leave the Shell tab active).
@@ -2310,6 +2344,31 @@ def main():
             except Exception:
                 pass
 
+        def _auto_hide_warning_banner(self):
+            """Hide the top warning banner after the initial grace period.
+
+            The banner is purely informational; it must not stay visible for
+            the whole session.  If a command approval is pending when the
+            timer fires, keep the banner visible so the user does not miss
+            the blocked-agent state.
+            """
+            if not self.pending_approval:
+                self._hide_warning_banner()
+
+        def _hide_warning_banner(self):
+            """Collapse the warning banner so it takes no screen space."""
+            try:
+                self.query_one("#warning-banner").display = False
+            except Exception:
+                pass
+
+        def _show_warning_banner(self):
+            """Make the warning banner visible again (e.g. pending approval)."""
+            try:
+                self.query_one("#warning-banner").display = True
+            except Exception:
+                pass
+
         def _refresh_approval_prompt(self):
             """Update the warning banner to show pending approval status."""
             try:
@@ -2321,13 +2380,12 @@ def main():
                         "  Type /approve to execute, /reject to deny, or /suggest <text> for guidance\n"
                         "  Agent is BLOCKED waiting for your decision."
                     )
+                    banner.update(status)
+                    self._show_warning_banner()
                 else:
-                    status = (
-                        "⚠ AGENT WILL EXECUTE REAL BASH COMMANDS ON THIS SYSTEM ⚠\n"
-                        "Auto-approve is OFF. Every command requires /approve or /reject.\n"
-                        "Type /autoapprove (or /aa) to toggle auto-approve for this session."
-                    )
-                banner.update(status)
+                    # No pending approval: the informational banner stays
+                    # hidden after its initial grace period.
+                    self._hide_warning_banner()
             except Exception:
                 pass
 
