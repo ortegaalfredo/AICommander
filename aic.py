@@ -41,6 +41,73 @@ try:
 except ImportError:
     _TEXTUAL_AVAILABLE = False
 
+# --- Readline-style prompt history --------------------------------------
+# The standard `readline` module provides an in-memory history plus file
+# persistence. We wrap it so --nogui / platforms without readline still run.
+try:
+    import readline as _rl
+    _READLINE_AVAILABLE = True
+except ImportError:
+    _rl = None
+    _READLINE_AVAILABLE = False
+
+_HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".aic_history")
+_HISTORY_MAXLEN = 1000
+
+
+def _rl_add_history(line: str) -> None:
+    """Append a line to the readline history (dedupes consecutive repeats)."""
+    if not _READLINE_AVAILABLE or not line:
+        return
+    try:
+        if _rl.get_current_history_length() and \
+                _rl.get_history_item(_rl.get_current_history_length()) == line:
+            return
+        _rl.add_history(line)
+    except Exception:
+        pass
+
+
+def _rl_get_history_item(index: int) -> str:
+    """Return the history item at 1-based *index*, or '' if unavailable."""
+    if _READLINE_AVAILABLE:
+        try:
+            return _rl.get_history_item(index) or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def _rl_history_length() -> int:
+    """Return the current history length (0 when readline is unavailable)."""
+    if _READLINE_AVAILABLE:
+        try:
+            return _rl.get_current_history_length()
+        except Exception:
+            return 0
+    return 0
+
+
+def _rl_load_history() -> None:
+    """Load persisted history into readline at startup."""
+    if _READLINE_AVAILABLE:
+        try:
+            _rl.set_history_length(_HISTORY_MAXLEN)
+            if os.path.exists(_HISTORY_FILE):
+                _rl.read_history_file(_HISTORY_FILE)
+        except Exception:
+            pass
+
+
+def _rl_save_history() -> None:
+    """Persist the current readline history to disk."""
+    if _READLINE_AVAILABLE:
+        try:
+            _rl.set_history_length(_HISTORY_MAXLEN)
+            _rl.write_history_file(_HISTORY_FILE)
+        except Exception:
+            pass
+
 
 class colors:
     """ANSI codes used by ConsoleSink (stripped again by TUISink)."""
@@ -1176,6 +1243,212 @@ def main():
     from rich.text import Text as RichText
     import pyte
 
+    class PromptInput(Input):
+        """Textual Input with readline-style history navigation.
+
+        Up/Down (and Ctrl+P/Ctrl+N) walk the shared readline history while
+        preserving the in-progress line (readline semantics); Ctrl+R opens a
+        reverse incremental search modal.
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # 1-based readline history index currently shown, or None when the
+            # cursor sits at the bottom (editing a fresh line).
+            self._hist_pos: Optional[int] = None
+            # The in-progress line stashed when the user first navigates up.
+            self._pending: str = ""
+
+        def on_key(self, event):
+            key = event.key
+            if key in ("up", "ctrl+p"):
+                self._hist_previous()
+                event.stop()
+            elif key in ("down", "ctrl+n"):
+                self._hist_next()
+                event.stop()
+            elif key == "ctrl+r":
+                self._open_reverse_search()
+                event.stop()
+
+        def reset_history_nav(self):
+            """Return to the bottom of history after a prompt is submitted."""
+            self._hist_pos = None
+            self._pending = ""
+
+        def _hist_previous(self):
+            length = _rl_history_length()
+            if length == 0:
+                return
+            if self._hist_pos is None:
+                self._pending = self.value
+                self._hist_pos = length
+            elif self._hist_pos > 1:
+                self._hist_pos -= 1
+            self._show_hist_item()
+
+        def _hist_next(self):
+            if self._hist_pos is None:
+                return
+            length = _rl_history_length()
+            if self._hist_pos < length:
+                self._hist_pos += 1
+                self._show_hist_item()
+            else:
+                self._hist_pos = None
+                self.value = self._pending
+                self.cursor_position = len(self.value)
+
+        def _show_hist_item(self):
+            text = _rl_get_history_item(self._hist_pos)
+            self.value = text
+            self.cursor_position = len(text)
+
+        def _open_reverse_search(self):
+            def on_result(match: Optional[str]):
+                if match is not None:
+                    self.value = match
+                    self.cursor_position = len(match)
+                try:
+                    self.focus()
+                except Exception:
+                    pass
+            try:
+                self.app.push_screen(ReverseSearchScreen(on_result))
+            except Exception:
+                pass
+
+    class ReverseSearchScreen(ModalScreen):
+        """Modal incremental reverse search over the readline history.
+
+        Typing filters history (newest-first) for a case-insensitive substring;
+        Ctrl+R cycles to the next older match; Enter accepts the current match
+        back into the prompt; Esc/Ctrl+G cancels (restoring the prior text).
+        """
+
+        BINDINGS = [
+            Binding("ctrl+r", "next_match", "Next match", show=False),
+            Binding("enter", "accept", "Accept", show=False),
+            Binding("escape", "cancel", "Cancel", show=False),
+            Binding("ctrl+g", "cancel", "Cancel", show=False),
+        ]
+
+        CSS = """
+        ReverseSearchScreen {
+            align: center top;
+            /* Transparent so the underlying TUI stays visible behind the
+            search dialog (ModalScreen's default opaque background would
+            otherwise blank the whole screen). */
+            background: transparent;
+        }
+        #reverse-search-dialog {
+            width: 80;
+            height: auto;
+            background: #0b2f5e;
+            border: round #06989a;
+            padding: 1 2;
+            margin-top: 3;
+        }
+        #reverse-search-input {
+            width: 1fr;
+        }
+        #reverse-search-status {
+            color: #f2f2f2;
+            margin-top: 1;
+        }
+        """
+
+        def __init__(self, on_result):
+            super().__init__()
+            self._on_result = on_result
+            # Matches as (1-based_index, text) newest-first; _match_pos is the
+            # currently highlighted match.
+            self._matches: list = []
+            self._match_pos = 0
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="reverse-search-dialog"):
+                yield Static("(reverse-i-search)`': ", id="reverse-search-label", markup=False)
+                yield Input(id="reverse-search-input", placeholder="Search history")
+                yield Static("", id="reverse-search-status", markup=False)
+
+        def on_mount(self):
+            try:
+                self.query_one("#reverse-search-input").focus()
+            except Exception:
+                pass
+            self._refresh()
+
+        def on_input_changed(self, event):
+            if getattr(event.input, "id", None) == "reverse-search-input":
+                self._refresh()
+
+        def on_input_submitted(self, event):
+            # The search Input has focus, so Enter is consumed by the widget
+            # and never reaches the screen-level "enter" binding. Accept (or
+            # cancel when empty) here so Enter closes the modal.
+            if getattr(event.input, "id", None) == "reverse-search-input":
+                if self._matches:
+                    self.action_accept()
+                else:
+                    self.action_cancel()
+
+        def _refresh(self):
+            query = ""
+            try:
+                query = self.query_one("#reverse-search-input").value
+            except Exception:
+                pass
+            self._matches = []
+            self._match_pos = 0
+            length = _rl_history_length()
+            if query:
+                q = query.lower()
+                for i in range(length, 0, -1):
+                    text = _rl_get_history_item(i)
+                    if q in text.lower():
+                        self._matches.append((i, text))
+            label = f"(reverse-i-search)`{query}': "
+            if query and not self._matches:
+                label += "failing"
+            try:
+                self.query_one("#reverse-search-label", Static).update(label)
+            except Exception:
+                pass
+            self._update_status()
+
+        def _update_status(self):
+            try:
+                status = self.query_one("#reverse-search-status", Static)
+            except Exception:
+                return
+            if self._matches:
+                _, text = self._matches[self._match_pos]
+                status.update(
+                    f"{text}\n\n"
+                    f"[{self._match_pos + 1}/{len(self._matches)}] "
+                    "Ctrl+R next, Enter accept, Esc cancel"
+                )
+            else:
+                status.update("No matches. Esc to cancel.")
+
+        def action_next_match(self):
+            if self._matches:
+                self._match_pos = (self._match_pos + 1) % len(self._matches)
+                self._update_status()
+
+        def action_accept(self):
+            if self._matches:
+                _, text = self._matches[self._match_pos]
+                self._on_result(text)
+            else:
+                self._on_result(None)
+            self.dismiss()
+
+        def action_cancel(self):
+            self._on_result(None)
+            self.dismiss()
+
     class ShellWidget(Widget, can_focus=True):
         """An interactive shell embedded in a Textual widget.
 
@@ -1629,7 +1902,7 @@ def main():
             yield Horizontal(agent, RightPanel(id="right-panel"), id="panels")
             yield Horizontal(
                 Static(">", id="prompt-marker", markup=False),
-                Input(id="prompt-input", placeholder="Type a prompt or /command, then Enter"),
+                PromptInput(id="prompt-input", placeholder="Type a prompt or /command, then Enter"),
                 id="prompt-container",
             )
             yield Static(id="status-bar")
@@ -1637,6 +1910,9 @@ def main():
         def on_mount(self):
             self.title = "AI-Commander TUI"
             self.sub_title = f"Model: {self.model_name} | Session: {self.session_id}"
+            # Load any persisted prompt history into readline so Up/Down and
+            # Ctrl+R see prior sessions' prompts.
+            _rl_load_history()
             self.update_status_bar()
             # The banner is informational only; auto-hide after a grace period
             # (it is shown again while an approval is pending).
@@ -1892,6 +2168,10 @@ def main():
             try:
                 prompt = getattr(self, "_cli_request", "")
                 if prompt:
+                    # The initial CLI-supplied prompt is a real task, so make
+                    # it recallable via Up/Down and Ctrl+R like typed prompts.
+                    _rl_add_history(prompt)
+                    _rl_save_history()
                     self._start_agent(prompt)
             except Exception as exc:
                 self._write_agent(f"[ERROR] Failed to auto-start from CLI request: {exc}")
@@ -1963,12 +2243,21 @@ def main():
             """Handle Enter key in the prompt input field."""
             text = event.value.strip()
             try:
-                self.query_one("#prompt-input").value = ""
+                prompt_input = self.query_one("#prompt-input")
+                prompt_input.value = ""
+                # Return to the bottom of history for the next prompt.
+                prompt_input.reset_history_nav()
             except Exception:
                 pass
 
             if not text:
                 return
+
+            # Only plain prompts go into history; slash commands are UI
+            # controls, not tasks worth recalling.
+            if not text.startswith("/"):
+                _rl_add_history(text)
+                _rl_save_history()
 
             if text.startswith("/"):
                 self._handle_slash_command(text)
@@ -2058,6 +2347,8 @@ def main():
         def shutdown(self):
             """Clean shutdown: stop agent, close sink, exit app."""
             self._stop_agent()
+            # Persist prompt history so it survives this session.
+            _rl_save_history()
             if self.sink:
                 self.sink.close()
             try:
