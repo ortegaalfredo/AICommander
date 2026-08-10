@@ -322,41 +322,39 @@ class AICommander:
     def _log_error(self, message: str):
         self.sink.emit("ERROR", {"text": message})
 
-    def _get_message_length(self, msg: dict) -> int:
-        content = msg.get('content', '')
-        return len(content) if content is not None else 0
-
-    def _estimate_input_tokens(self, messages: List[Dict[str, Any]]) -> int:
-        """Rough input-token estimate for the live "context" counter.
+    def _estimate_message_tokens(self, msg: Dict[str, Any]) -> int:
+        """Rough token estimate for a single message.
 
         Approximates ~4 characters per token plus a fixed per-message and
         per-tool-call overhead. No tiktoken dependency; exact numbers come
         from the API usage stats reported once the call finishes.
         """
-        total = 0
-        for msg in messages:
-            total += 4  # structural overhead (role, separators)
-            content = msg.get("content")
-            if isinstance(content, str):
-                total += max(1, len(content) // 4)
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("text"):
-                        total += max(1, len(part["text"]) // 4)
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function") or {}
-                total += max(1, len(fn.get("name") or "") // 4)
-                total += max(1, len(fn.get("arguments") or "") // 4)
+        total = 4  # structural overhead (role, separators)
+        content = msg.get("content")
+        if isinstance(content, str):
+            total += max(1, len(content) // 4)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("text"):
+                    total += max(1, len(part["text"]) // 4)
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            total += max(1, len(fn.get("name") or "") // 4)
+            total += max(1, len(fn.get("arguments") or "") // 4)
         return total
+
+    def _estimate_input_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        """Rough input-token estimate for the live "context" counter."""
+        return sum(self._estimate_message_tokens(msg) for msg in messages)
 
     def _dump_conversation_history(self):
         """Dump the conversation history to commander-debug.txt for debugging."""
         with open("commander-debug.txt", "w", encoding="utf-8") as f:
             f.write(f"Conversation history dump at {datetime.now().isoformat()}\n")
             f.write(f"Total messages: {len(self.conversation_history)}\n")
-            total_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
-            f.write(f"Total content length: {total_len}\n")
-            f.write(f"Max prompt length: {self.max_prompt_len}\n")
+            total_tokens = sum(self._estimate_message_tokens(msg) for msg in self.conversation_history)
+            f.write(f"Total content length: {total_tokens} tokens (est)\n")
+            f.write(f"Max prompt length: {self.max_prompt_len} tokens\n")
             f.write("=" * 80 + "\n\n")
             for i, msg in enumerate(self.conversation_history):
                 content = msg.get('content', '') or ''
@@ -370,34 +368,35 @@ class AICommander:
         self._log(f"[DEBUG DUMP] Conversation history dumped to commander-debug.txt")
 
     def _truncate_conversation_history(self):
-        """Shrink conversation history below max_prompt_len.
+        """Shrink conversation history below max_prompt_len (in tokens).
 
         Keeps the system prompt (index 0) and first user instruction (index 1).
         Pass 1 condenses oversized tool outputs in-place; pass 2 drops the
         oldest messages from index 2 onwards until under the limit.
         """
-        total_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
+        total_tokens = sum(self._estimate_message_tokens(msg) for msg in self.conversation_history)
 
-        if total_len <= self.max_prompt_len:
+        if total_tokens <= self.max_prompt_len:
             return
 
-        self._log(f"[TRUNCATING] Prompt length ({total_len}) exceeds max ({self.max_prompt_len}). Truncating conversation history.")
+        self._log(f"[TRUNCATING] Prompt length ({total_tokens} tokens) exceeds max ({self.max_prompt_len}). Truncating conversation history.")
 
         for msg in self.conversation_history:
             if msg.get('role') == 'tool' and isinstance(msg.get('content'), str) and len(msg['content']) > 30:
-                removed_len = len(msg['content'])
+                removed_tokens = self._estimate_message_tokens(msg)
                 msg['content'] = '<condensed tool output>'
-                total_len -= (removed_len - len(msg['content']))
-                self._log(f"[TRUNCATED] Condensed tool message (removed {removed_len} chars)")
+                total_tokens -= (removed_tokens - self._estimate_message_tokens(msg))
+                self._log(f"[TRUNCATED] Condensed tool message (removed {removed_tokens} tokens)")
 
         i = 2
-        while i < len(self.conversation_history) and total_len > self.max_prompt_len:
+        while i < len(self.conversation_history) and total_tokens > self.max_prompt_len:
             removed_msg = self.conversation_history.pop(i)
-            total_len -= self._get_message_length(removed_msg)
-            self._log(f"[TRUNCATED] Removed {removed_msg.get('role')} message (removed {self._get_message_length(removed_msg)} chars, new length: {total_len})")
+            removed_tokens = self._estimate_message_tokens(removed_msg)
+            total_tokens -= removed_tokens
+            self._log(f"[TRUNCATED] Removed {removed_msg.get('role')} message (removed {removed_tokens} tokens, new length: {total_tokens})")
 
-        final_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
-        self._log(f"[TRUNCATING COMPLETE] Final prompt length: {final_len}")
+        final_tokens = sum(self._estimate_message_tokens(msg) for msg in self.conversation_history)
+        self._log(f"[TRUNCATING COMPLETE] Final prompt length: {final_tokens} tokens")
 
     def get_system_prompt(self) -> str:
         """Get the system prompt for the LLM"""
@@ -1218,7 +1217,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=30,
                         help="Command timeout in seconds (default: 30)")
     parser.add_argument("--max-prompt-len", type=int, default=80000,
-                        help="Maximum prompt length in characters (default: 80000)")
+                        help="Maximum prompt length in tokens (default: 80000)")
     parser.add_argument("--max-output-bytes", type=int, default=10240,
                         help="Maximum output bytes to return from commands (default: 10240)")
     parser.add_argument("--max-steps", type=int, default=500,
@@ -1795,6 +1794,7 @@ def main():
             background: #12488b;
         }
         #warning-banner {
+            display: none;
             background: #06989a;
             color: #000000;
             padding: 1 2;
@@ -1973,8 +1973,10 @@ def main():
             # Ctrl+R see prior sessions' prompts.
             _rl_load_history()
             self.update_status_bar()
-            # The banner is informational only; auto-hide after a grace period
-            # (it is shown again while an approval is pending).
+            # The banner is informational only: show it for a grace period,
+            # then auto-hide (it is shown again while an approval is pending).
+            # It is hidden by default in CSS so a remount never flashes it.
+            self._show_warning_banner()
             self.set_timer(20.0, self._auto_hide_warning_banner)
             try:
                 self.query_one("#right-panel ContentSwitcher").current = "console-log"
@@ -2116,6 +2118,15 @@ def main():
             out = payload.get("output_tokens", 0) or 0
             self._write_agent(f"[DEBUG] inp {inp} out {out}", style="bold green")
             if payload.get("estimate"):
+                # A new call is starting. If the previous call was aborted or
+                # errored before emitting an exact usage event, its in-flight
+                # input estimate and live-counted output tokens were never
+                # reconciled; roll them back so they aren't double counted,
+                # then add the new call's input estimate.
+                self.context_tokens -= self._pending_input_estimate
+                self.context_tokens -= self._pending_output_estimate
+                self._pending_input_estimate = 0
+                self._pending_output_estimate = 0
                 self._pending_input_estimate = inp
                 self.context_tokens += inp
             else:
@@ -2213,6 +2224,10 @@ def main():
                 pass
 
         def _show_warning_banner(self):
+            # With auto-approve on, commands never require approval, so the
+            # banner is irrelevant; keep it hidden entirely.
+            if self.auto_approve:
+                return
             try:
                 self.query_one("#warning-banner").display = True
             except Exception:
@@ -2419,6 +2434,32 @@ def main():
                 self.pending_approval = None
                 self._refresh_approval_prompt()
 
+            elif command in ("/clear", "/new"):
+                # Clear the conversation history and start a fresh session,
+                # reusing the same agent instance (like /new).
+                if self.agent_thread and self.agent_thread.is_alive():
+                    self._stop_agent()
+                if self.agent:
+                    self.agent.conversation_history = []
+                    self.agent.suggestion_queue = queue.Queue()
+                # Clear the on-screen output panels so old messages disappear.
+                for widget_id in ("#agent-log", "#console-log"):
+                    try:
+                        self.query_one(widget_id).clear()
+                    except Exception:
+                        pass
+                # Reset the session-scoped counters so the "context" readout
+                # reflects the fresh conversation rather than accumulating
+                # across /clear and /new. Also drop any in-flight estimate that
+                # was never reconciled by a completed API call.
+                self.context_tokens = 0
+                self._pending_input_estimate = 0
+                self._pending_output_estimate = 0
+                self.step_count = 0
+                self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self._write_agent("[CLEAR] New conversation started. Ready for your next prompt.")
+                self.update_status_bar()
+
             elif command == "/stop":
                 self._write_agent("[STOP] Stopping agent...")
                 self._stop_agent()
@@ -2429,7 +2470,7 @@ def main():
 
             else:
                 self._write_agent(f"[UNKNOWN COMMAND] {cmd}")
-                self._write_agent("Available: /autoapprove /aa /approve /reject /suggest /stop /quit /exit")
+                self._write_agent("Available: /autoapprove /aa /approve /reject /suggest /clear /new /stop /quit /exit")
 
         def key_press(self, event):
             """Ctrl+C / Escape: stop the agent and quit."""
