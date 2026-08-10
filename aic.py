@@ -139,7 +139,9 @@ class EventSink:
 
     Event kinds: LOG, ERROR, LLM_STREAM, THINKING_STREAM, CMD_EXEC,
     CMD_OUTPUT, CMD_COMPLETE, SYSTEM, STATUS_UPDATE, APPROVAL_REQUEST,
-    SHUTDOWN. Common payload keys: text, end, flush.
+    SHUTDOWN, TOKEN_USAGE. Common payload keys: text, end, flush.
+    TOKEN_USAGE carries input_tokens/output_tokens (estimate flag set while
+    streaming; exact numbers once the API call finishes).
     """
 
     def emit(self, kind: str, payload: dict):
@@ -169,8 +171,8 @@ class ConsoleSink(EventSink):
 
     def emit(self, kind: str, payload: dict):
         text = payload.get("text", "")
-        if kind == "STATUS_UPDATE":
-            return  # status footer is meaningless in CLI mode
+        if kind in ("STATUS_UPDATE", "TOKEN_USAGE"):
+            return  # status/token footer is meaningless in CLI mode
         # Streaming kinds must not append a newline after each token.
         end = "" if kind in ("LLM_STREAM", "THINKING_STREAM") else payload.get("end", "\n")
         flush = payload.get("flush", True)
@@ -323,6 +325,29 @@ class AICommander:
     def _get_message_length(self, msg: dict) -> int:
         content = msg.get('content', '')
         return len(content) if content is not None else 0
+
+    def _estimate_input_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        """Rough input-token estimate for the live "context" counter.
+
+        Approximates ~4 characters per token plus a fixed per-message and
+        per-tool-call overhead. No tiktoken dependency; exact numbers come
+        from the API usage stats reported once the call finishes.
+        """
+        total = 0
+        for msg in messages:
+            total += 4  # structural overhead (role, separators)
+            content = msg.get("content")
+            if isinstance(content, str):
+                total += max(1, len(content) // 4)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("text"):
+                        total += max(1, len(part["text"]) // 4)
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                total += max(1, len(fn.get("name") or "") // 4)
+                total += max(1, len(fn.get("arguments") or "") // 4)
+        return total
 
     def _dump_conversation_history(self):
         """Dump the conversation history to commander-debug.txt for debugging."""
@@ -636,6 +661,9 @@ Think carefully; response quality is the highest priority. You have unlimited th
             "temperature": temperature,
             "stream": True,
         }
+        # Ask the server to include usage stats in the final stream chunk so we
+        # can correct the live estimate with exact token counts.
+        request_params["stream_options"] = {"include_usage": True}
         if "gpt" not in self.model:  # OpenAI rejects these extra params
             request_params["max_tokens"] = self.max_tokens
             request_params['extra_body'] = {"chat_template_kwargs": {"enable_thinking": True}}
@@ -643,6 +671,14 @@ Think carefully; response quality is the highest priority. You have unlimited th
         if use_tools:
             request_params["tools"] = self.tool_schemas
             request_params["tool_choice"] = "auto"
+
+        # Live input-token estimate before the call starts; the TUI shows it in
+        # the status bar until the exact usage arrives with the final chunk.
+        self.sink.emit("TOKEN_USAGE", {
+            "input_tokens": self._estimate_input_tokens(messages),
+            "output_tokens": 0,
+            "estimate": True,
+        })
 
         max_retries = 5
         wait_seconds = 60
@@ -654,10 +690,14 @@ Think carefully; response quality is the highest priority. You have unlimited th
                 collected_tool_calls = []
                 in_thinking = False
                 thinking_buffer = ""
+                usage = None
 
                 stream = self.client.chat.completions.create(**request_params)
 
                 for chunk in stream:
+                    # The final chunk carries exact usage when include_usage is set.
+                    if getattr(chunk, "usage", None):
+                        usage = chunk.usage
                     if self.stop_event.is_set():
                         self._log("\n[STOP] Agent shutdown requested. Aborting LLM stream.")
                         return {
@@ -725,6 +765,15 @@ Think carefully; response quality is the highest priority. You have unlimited th
 
         self._log("")
         final_tool_calls = [tc for tc in collected_tool_calls if tc.get("id")]
+
+        # The API call finished: report the exact token counts so the TUI can
+        # replace the live estimate in the "context" status-bar counter.
+        if usage is not None:
+            self.sink.emit("TOKEN_USAGE", {
+                "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                "estimate": False,
+            })
 
         return {
             "choices": [{
@@ -1874,6 +1923,16 @@ def main():
             # Rolling ~1s window for the live tok/s display in the status bar.
             self._tok_window_start = time.monotonic()
             self._tok_window_tokens = 0
+            # "context" = cumulative input+output tokens consumed this session.
+            # The live value is an estimate while streaming; it is corrected to
+            # the exact server-reported numbers when each API call finishes.
+            self.context_tokens = 0
+            # Input-token estimate for the in-flight call, subtracted once the
+            # exact usage arrives so it is not double counted.
+            self._pending_input_estimate = 0
+            # Output-token chunks counted live while streaming, rolled back when
+            # the exact usage arrives.
+            self._pending_output_estimate = 0
             self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.model_name = args.model
             self.api_base = args.api_base
@@ -1958,6 +2017,7 @@ def main():
             sb.update(
                 f"Model: {self.model_name} | "
                 f"Step: {self.step_count}/{self.max_steps} | "
+                f"Context: {self.context_tokens} | "
                 f"tok/s: {self.tokens_per_second:.1f} | "
                 f"Session: {self.session_id} | "
                 f"Auto-approve: {ap_status} | "
@@ -2034,16 +2094,49 @@ def main():
                 self.step_count = payload.get("step", 0)
                 self.max_steps = payload.get("max_steps", 500)
                 self._decay_token_rate()
+            elif kind == "TOKEN_USAGE":
+                self._apply_token_usage(payload)
             elif kind == "SHUTDOWN":
                 self._write_agent("[READY] Agent loop terminated, waiting for next command.", style="bold green")
                 self._handle_agent_exit()
 
             self.update_status_bar()
 
+        def _apply_token_usage(self, payload: dict):
+            """Reconcile the live "context" estimate with token usage events.
+
+            While streaming, the agent emits an estimate=True event with the
+            input-token guess (added now, remembered in _pending_input_estimate)
+            and output tokens are counted per chunk by _track_token. When the
+            API call finishes, an estimate=False event carries the exact
+            numbers: the remembered input estimate is rolled back and the real
+            input+output totals are added so nothing is double counted.
+            """
+            inp = payload.get("input_tokens", 0) or 0
+            out = payload.get("output_tokens", 0) or 0
+            self._write_agent(f"[DEBUG] inp {inp} out {out}", style="bold green")
+            if payload.get("estimate"):
+                self._pending_input_estimate = inp
+                self.context_tokens += inp
+            else:
+                # Replace the in-flight estimate (input guess + output chunks
+                # counted live) with the exact server-reported totals so nothing
+                # is double counted.
+                self.context_tokens -= self._pending_input_estimate
+                self.context_tokens -= self._pending_output_estimate
+                self._pending_input_estimate = 0
+                self._pending_output_estimate = 0
+                self.context_tokens += inp + out
+            if self.context_tokens < 0:
+                self.context_tokens = 0
+
         def _track_token(self):
-            """Record a streamed token chunk and update the rolling rate."""
+            """Record a streamed token chunk: bump the live context estimate and
+            update the rolling tok/s rate."""
             now = time.monotonic()
             self._tok_window_tokens += 1
+            self.context_tokens += 1
+            self._pending_output_estimate += 1
             if now - self._tok_window_start >= 1.0:
                 elapsed = now - self._tok_window_start
                 if elapsed > 0:
