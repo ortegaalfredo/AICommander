@@ -256,7 +256,7 @@ class AICommander:
     OUTPUT_TRUNCATION_SENTINEL = "output too long: truncated"
 
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
-                  show_thinking: bool = True, command_timeout: int = 30,
+                  show_thinking: bool = True, command_timeout: int = 120,
                   max_prompt_len: int = 20000, max_output_bytes: int = 10240, debug: bool = False,
                   sink: EventSink = None, persist_history: bool = False, max_steps: int = 500):
         self.base_url = api_base.rstrip('/')
@@ -325,22 +325,27 @@ class AICommander:
     def _estimate_message_tokens(self, msg: Dict[str, Any]) -> int:
         """Rough token estimate for a single message.
 
-        Approximates ~4 characters per token plus a fixed per-message and
+        Approximates ~3 characters per token plus a fixed per-message and
         per-tool-call overhead. No tiktoken dependency; exact numbers come
         from the API usage stats reported once the call finishes.
+
+        The 3-char heuristic is deliberately conservative (it tends to
+        over-estimate vs. the server's tokenizer), so the live "Context"
+        counter and the truncation threshold trigger *before* the request
+        exceeds the model's window rather than after.
         """
         total = 4  # structural overhead (role, separators)
         content = msg.get("content")
         if isinstance(content, str):
-            total += max(1, len(content) // 4)
+            total += max(1, len(content) // 3)
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and part.get("text"):
-                    total += max(1, len(part["text"]) // 4)
+                    total += max(1, len(part["text"]) // 3)
         for tc in msg.get("tool_calls") or []:
             fn = tc.get("function") or {}
-            total += max(1, len(fn.get("name") or "") // 4)
-            total += max(1, len(fn.get("arguments") or "") // 4)
+            total += max(1, len(fn.get("name") or "") // 3)
+            total += max(1, len(fn.get("arguments") or "") // 3)
         return total
 
     def _estimate_input_tokens(self, messages: List[Dict[str, Any]]) -> int:
@@ -367,19 +372,38 @@ class AICommander:
             f.write("=" * 80 + "\nEnd of conversation history\n")
         self._log(f"[DEBUG DUMP] Conversation history dumped to commander-debug.txt")
 
+    def _prompt_budget(self) -> int:
+        """Max tokens the prompt may occupy, leaving room for model output.
+
+        The request reserves ``max_tokens`` tokens for the completion (sent as
+        the ``max_tokens`` request param for non-"gpt" models). The server's
+        context window must hold prompt + output, so the input prompt must be
+        kept under ``max_prompt_len - max_tokens`` or the server rejects the
+        call with an "exceed context size" error. For models that don't send
+        ``max_tokens`` the full window is available to the prompt.
+        """
+        if "gpt" not in self.model:
+            return max(0, self.max_prompt_len - self.max_tokens)
+        return self.max_prompt_len
+
     def _truncate_conversation_history(self):
-        """Shrink conversation history below max_prompt_len (in tokens).
+        """Shrink conversation history below the prompt budget (in tokens).
+
+        The budget is ``max_prompt_len`` minus the output reservation
+        (``max_tokens``) when the request carries one, so the prompt leaves
+        room for the completion inside the model's context window.
 
         Keeps the system prompt (index 0) and first user instruction (index 1).
         Pass 1 condenses oversized tool outputs in-place; pass 2 drops the
         oldest messages from index 2 onwards until under the limit.
         """
+        budget = self._prompt_budget()
         total_tokens = sum(self._estimate_message_tokens(msg) for msg in self.conversation_history)
 
-        if total_tokens <= self.max_prompt_len:
+        if total_tokens <= budget:
             return
 
-        self._log(f"[TRUNCATING] Prompt length ({total_tokens} tokens) exceeds max ({self.max_prompt_len}). Truncating conversation history.")
+        self._log(f"[TRUNCATING] Prompt length ({total_tokens} tokens) exceeds budget ({budget}). Truncating conversation history.")
 
         for msg in self.conversation_history:
             if msg.get('role') == 'tool' and isinstance(msg.get('content'), str) and len(msg['content']) > 30:
@@ -389,7 +413,7 @@ class AICommander:
                 self._log(f"[TRUNCATED] Condensed tool message (removed {removed_tokens} tokens)")
 
         i = 2
-        while i < len(self.conversation_history) and total_tokens > self.max_prompt_len:
+        while i < len(self.conversation_history) and total_tokens > budget:
             removed_msg = self.conversation_history.pop(i)
             removed_tokens = self._estimate_message_tokens(removed_msg)
             total_tokens -= removed_tokens
@@ -1214,8 +1238,8 @@ def main():
                         help="Auto-approve command execution (for testing)")
     parser.add_argument("--no-thinking", action="store_true",
                         help="Hide thinking tokens from output")
-    parser.add_argument("--timeout", type=int, default=30,
-                        help="Command timeout in seconds (default: 30)")
+    parser.add_argument("--timeout", type=int, default=120,
+                        help="Command timeout in seconds (default: 120)")
     parser.add_argument("--max-prompt-len", type=int, default=80000,
                         help="Maximum prompt length in tokens (default: 80000)")
     parser.add_argument("--max-output-bytes", type=int, default=10240,
@@ -1923,16 +1947,9 @@ def main():
             # Rolling ~1s window for the live tok/s display in the status bar.
             self._tok_window_start = time.monotonic()
             self._tok_window_tokens = 0
-            # "context" = cumulative input+output tokens consumed this session.
-            # The live value is an estimate while streaming; it is corrected to
-            # the exact server-reported numbers when each API call finishes.
+            # Cumulative session token total. Only exact server-reported usage
+            # is added (see _apply_token_usage), so it never over-counts.
             self.context_tokens = 0
-            # Input-token estimate for the in-flight call, subtracted once the
-            # exact usage arrives so it is not double counted.
-            self._pending_input_estimate = 0
-            # Output-token chunks counted live while streaming, rolled back when
-            # the exact usage arrives.
-            self._pending_output_estimate = 0
             self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.model_name = args.model
             self.api_base = args.api_base
@@ -2016,10 +2033,21 @@ def main():
                 if sandbox_on
                 else "[red]Sandbox: off[/red]"
             )
+            # "Context" = the current context window: the token estimate of the
+            # live conversation history (the prompt currently being sent). The
+            # cumulative session total (sum of every call's input+output) is
+            # shown separately as "Total Tokens".
+            history = self.agent.conversation_history if self.agent else []
+            context_window = (
+                sum(self.agent._estimate_message_tokens(m) for m in history)
+                if self.agent
+                else 0
+            )
             sb.update(
                 f"Model: {self.model_name} | "
                 f"Step: {self.step_count}/{self.max_steps} | "
-                f"Context: {self.context_tokens} | "
+                f"Context: {context_window} | "
+                f"Total Tokens: {self.context_tokens} | "
                 f"tok/s: {self.tokens_per_second:.1f} | "
                 f"Session: {self.session_id} | "
                 f"Auto-approve: {ap_status} | "
@@ -2105,49 +2133,25 @@ def main():
             self.update_status_bar()
 
         def _apply_token_usage(self, payload: dict):
-            """Reconcile the live "context" estimate with token usage events.
+            """Accumulate exact server-reported token usage.
 
-            While streaming, the agent emits an estimate=True event with the
-            input-token guess (added now, remembered in _pending_input_estimate)
-            and output tokens are counted per chunk by _track_token. When the
-            API call finishes, an estimate=False event carries the exact
-            numbers: the remembered input estimate is rolled back and the real
-            input+output totals are added so nothing is double counted.
+            The agent emits an estimate=True event (input-token guess) before
+            each call and an estimate=False event with exact numbers when the
+            call finishes. Only the exact numbers count toward the cumulative
+            total; the estimates and live-streamed chunks are ignored so the
+            counter never over-counts.
             """
             inp = payload.get("input_tokens", 0) or 0
             out = payload.get("output_tokens", 0) or 0
-            self._write_agent(f"[DEBUG] inp {inp} out {out}", style="bold green")
             if payload.get("estimate"):
-                # A new call is starting. If the previous call was aborted or
-                # errored before emitting an exact usage event, its in-flight
-                # input estimate and live-counted output tokens were never
-                # reconciled; roll them back so they aren't double counted,
-                # then add the new call's input estimate.
-                self.context_tokens -= self._pending_input_estimate
-                self.context_tokens -= self._pending_output_estimate
-                self._pending_input_estimate = 0
-                self._pending_output_estimate = 0
-                self._pending_input_estimate = inp
-                self.context_tokens += inp
-            else:
-                # Replace the in-flight estimate (input guess + output chunks
-                # counted live) with the exact server-reported totals so nothing
-                # is double counted.
-                self.context_tokens -= self._pending_input_estimate
-                self.context_tokens -= self._pending_output_estimate
-                self._pending_input_estimate = 0
-                self._pending_output_estimate = 0
-                self.context_tokens += inp + out
-            if self.context_tokens < 0:
-                self.context_tokens = 0
+                return
+            self.context_tokens += inp + out
 
         def _track_token(self):
-            """Record a streamed token chunk: bump the live context estimate and
-            update the rolling tok/s rate."""
+            """Update the rolling tok/s rate for a streamed chunk (does not
+            affect the cumulative token total, which comes from exact usage)."""
             now = time.monotonic()
             self._tok_window_tokens += 1
-            self.context_tokens += 1
-            self._pending_output_estimate += 1
             if now - self._tok_window_start >= 1.0:
                 elapsed = now - self._tok_window_start
                 if elapsed > 0:
@@ -2448,13 +2452,9 @@ def main():
                         self.query_one(widget_id).clear()
                     except Exception:
                         pass
-                # Reset the session-scoped counters so the "context" readout
-                # reflects the fresh conversation rather than accumulating
-                # across /clear and /new. Also drop any in-flight estimate that
-                # was never reconciled by a completed API call.
+                # Reset the cumulative token total so it doesn't accumulate
+                # across /clear and /new.
                 self.context_tokens = 0
-                self._pending_input_estimate = 0
-                self._pending_output_estimate = 0
                 self.step_count = 0
                 self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
                 self._write_agent("[CLEAR] New conversation started. Ready for your next prompt.")
