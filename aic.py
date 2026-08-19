@@ -1168,9 +1168,22 @@ Think carefully; response quality is the highest priority. You have unlimited th
         # The API call finished: report the exact token counts so the TUI can
         # replace the live estimate in the "context" status-bar counter.
         if usage is not None:
+            # Prompt-cached tokens are served from cache (not re-processed) and
+            # are typically not billed, so report them separately so the total
+            # can reflect only the tokens actually processed/charged.
+            #
+            # Cached-token field names differ per provider:
+            #   - OpenAI:      usage.prompt_tokens_details.cached_tokens
+            #   - DeepSeek:    usage.prompt_cache_hit_tokens
+            #   - Anthropic:   usage.cache_read_input_tokens
+            cached = 0
+            details = getattr(usage, "prompt_tokens_details", None)
+            if details is not None:
+                cached = getattr(details, "cached_tokens", 0) or 0
             self.sink.emit("TOKEN_USAGE", {
                 "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
                 "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                "cached_tokens": cached,
                 "estimate": False,
             })
 
@@ -2360,7 +2373,7 @@ def main():
                 id="warning-banner",
                 markup=False
             )
-            agent = RichLog(id="agent-log", auto_scroll=True, wrap=True, max_lines=2000)
+            agent = RichLog(id="agent-log", auto_scroll=True, wrap=True, max_lines=20000)
             agent.border_title = "Agent Output"
             yield Horizontal(agent, RightPanel(id="right-panel"), id="panels")
             yield Horizontal(
@@ -2535,7 +2548,11 @@ def main():
             out = payload.get("output_tokens", 0) or 0
             if payload.get("estimate"):
                 return
-            self.context_tokens += inp + out
+            # Prompt-cached tokens are served from cache and typically not
+            # billed, so exclude them from the cumulative total: only the
+            # non-cached (newly processed) tokens count.
+            cached = payload.get("cached_tokens", 0) or 0
+            self.context_tokens += max(0, inp - cached) + out
 
         def _track_token(self):
             """Update the rolling tok/s rate for a streamed chunk (does not
@@ -2554,6 +2571,35 @@ def main():
             if self._tok_window_tokens == 0 and time.monotonic() - self._tok_window_start >= 2.0:
                 self.tokens_per_second = 0.0
 
+        def _sync_autoscroll(self, widget):
+            """Pin the view to the bottom only when the user is already there,
+            so new messages don't yank the scroll bar away from history being
+            read. If the user has scrolled up, auto-scroll is disabled."""
+            try:
+                widget.auto_scroll = widget.scroll_y >= widget.max_scroll_y
+            except Exception:
+                pass
+
+        def _anchor_scroll(self, widget, start_line_before):
+            """Keep the viewport anchored to the same content after a write.
+
+            When the log hits its max_lines cap, the RichLog trims the oldest
+            lines off the top (incrementing its internal ``_start_line``). If the
+            user is scrolled up reading history, that trimming shifts the content
+            up and would yank the scroll bar to different, newer text. This
+            compensates by scrolling up by the same number of trimmed lines so
+            the lines being read stay put.
+            """
+            try:
+                trimmed = widget._start_line - start_line_before
+                if trimmed > 0 and not widget.auto_scroll:
+                    widget.scroll_to(
+                        y=max(0, widget.scroll_y - trimmed),
+                        animate=False,
+                    )
+            except Exception:
+                pass
+
         def _write_agent(self, text: str, streaming: bool = False, prefix: str = "", style: str = "", end: str = "\n"):
             """Write text to the agent output RichLog.
 
@@ -2564,12 +2610,14 @@ def main():
             try:
                 from rich.text import Text
                 widget = self.query_one("#agent-log")
+                self._sync_autoscroll(widget)
                 clean = _strip_ansi(text)
                 # Hide the internal completion marker from the panel; the
                 # agent loop still uses it to detect task completion.
                 clean = clean.replace("TASKCOMPLETE", "")
                 if not clean:
                     return
+                start_line_before = widget._start_line
                 buf_key = "#agent-log"
                 if streaming:
                     if prefix and buf_key not in self._stream_prefix_done:
@@ -2592,6 +2640,9 @@ def main():
 
                     full = _strip_ansi(prefix) + clean
                     widget.write(Text(full, style=style) if style else Text(full))
+                # If the log hit its max_lines cap and trimmed old lines off the
+                # top, re-anchor the viewport so the lines being read stay put.
+                self._anchor_scroll(widget, start_line_before)
             except Exception:
                 pass
 
@@ -2604,9 +2655,11 @@ def main():
             try:
                 from rich.text import Text
                 widget = self.query_one("#console-log")
+                self._sync_autoscroll(widget)
                 clean = _strip_ansi(text)
                 if not clean:
                     return
+                start_line_before = widget._start_line
                 buf_key = "#console-log"
                 if streaming:
                     buf = self._stream_buffer.get(buf_key, "") + clean
@@ -2619,6 +2672,9 @@ def main():
                     if pending:
                         widget.write(Text(pending, style=style) if style else Text(pending))
                     widget.write(Text(clean, style=style) if style else Text(clean))
+                # If the log hit its max_lines cap and trimmed old lines off the
+                # top, re-anchor the viewport so the lines being read stay put.
+                self._anchor_scroll(widget, start_line_before)
             except Exception:
                 pass
 
