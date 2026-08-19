@@ -258,7 +258,8 @@ class AICommander:
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
                   show_thinking: bool = True, command_timeout: int = 120,
                   max_prompt_len: int = 20000, max_output_bytes: int = 10240, debug: bool = False,
-                  sink: EventSink = None, persist_history: bool = False, max_steps: int = 500):
+                  sink: EventSink = None, persist_history: bool = False, max_steps: int = 500,
+                  compress_algorithm: str = "truncate"):
         self.base_url = api_base.rstrip('/')
         self.model = model
         self.api_key = api_key
@@ -276,6 +277,11 @@ class AICommander:
         self.max_output_bytes = max_output_bytes
         self.debug = debug
         self.sink: EventSink = sink if sink is not None else ConsoleSink()
+        # Context-compression algorithm applied when the conversation history
+        # exceeds the prompt budget. "truncate" is the default (and currently
+        # the only) algorithm; more will be added in later versions and
+        # selected here via the command line.
+        self.compress_algorithm = compress_algorithm
 
         # Checked between steps and during command execution so the TUI can
         # halt the agent cleanly.
@@ -386,16 +392,19 @@ class AICommander:
             return max(0, self.max_prompt_len - self.max_tokens)
         return self.max_prompt_len
 
-    def _truncate_conversation_history(self):
-        """Shrink conversation history below the prompt budget (in tokens).
+    def _context_compress(self):
+        """Compress conversation history below the prompt budget (in tokens).
 
         The budget is ``max_prompt_len`` minus the output reservation
         (``max_tokens``) when the request carries one, so the prompt leaves
         room for the completion inside the model's context window.
 
-        Keeps the system prompt (index 0) and first user instruction (index 1).
-        Pass 1 condenses oversized tool outputs in-place; pass 2 drops the
-        oldest messages from index 2 onwards until under the limit.
+        This is the single entry point for context compression. It computes the
+        trigger (is the history over budget?) and then dispatches to the
+        configured compression algorithm, ``self.compress_algorithm``. Each
+        algorithm is implemented as a ``_compress_<name>`` method; new
+        algorithms are added in later versions and selected via the command
+        line. Unknown algorithms fall back to the default, "truncate".
         """
         budget = self._prompt_budget()
         total_tokens = sum(self._estimate_message_tokens(msg) for msg in self.conversation_history)
@@ -403,7 +412,20 @@ class AICommander:
         if total_tokens <= budget:
             return
 
-        self._log(f"[TRUNCATING] Prompt length ({total_tokens} tokens) exceeds budget ({budget}). Truncating conversation history.")
+        algorithm = getattr(self, f"_compress_{self.compress_algorithm}", None)
+        if algorithm is None:
+            self._log(f"[COMPRESS] Unknown context-compression algorithm '{self.compress_algorithm}'. Falling back to 'truncate'.")
+            algorithm = self._compress_truncate
+        algorithm(budget, total_tokens)
+
+    def _compress_truncate(self, budget: int, total_tokens: int):
+        """Truncate algorithm: shrink conversation history below the prompt budget.
+
+        Keeps the system prompt (index 0) and first user instruction (index 1).
+        Pass 1 condenses oversized tool outputs in-place; pass 2 drops the
+        oldest messages from index 2 onwards until under the limit.
+        """
+        self._log(f"[COMPRESS] Using 'truncate' algorithm. Prompt length ({total_tokens} tokens) exceeds budget ({budget}). Compressing conversation history.")
 
         for msg in self.conversation_history:
             if msg.get('role') == 'tool' and isinstance(msg.get('content'), str) and len(msg['content']) > 30:
@@ -950,7 +972,7 @@ Think carefully; response quality is the highest priority. You have unlimited th
                 self.sink.emit("STATUS_UPDATE", {"step": step, "max_steps": self.max_steps, "phase": "llm_call"})
 
                 self._drain_suggestions()
-                self._truncate_conversation_history()
+                self._context_compress()
 
                 response = self.call_llm_api(list(self.conversation_history))
 
@@ -1252,6 +1274,12 @@ def main():
                         help="Run in direct CLI mode without TUI (original behaviour)")
     parser.add_argument("--disable-sandbox", action="store_true",
                         help="Disable the OS-level Landlock sandbox (Linux only)")
+    parser.add_argument("--compress-alg", default="truncate",
+                        help="Context-compression algorithm for shrinking the "
+                             "conversation history when it exceeds the prompt "
+                             "budget. Currently only 'truncate' is available "
+                             "(default: truncate); more algorithms will be added "
+                             "in future versions.")
     parser.add_argument("request", nargs="*", help="Task request")
 
     args = parser.parse_args()
@@ -1288,7 +1316,8 @@ def main():
             max_output_bytes=args.max_output_bytes,
             debug=args.debug,
             sink=sink,
-            max_steps=args.max_steps
+            max_steps=args.max_steps,
+            compress_algorithm=args.compress_alg
         )
         try:
             user_request = " ".join(args.request)
@@ -2324,7 +2353,8 @@ def main():
                     debug=self.args.debug,
                     sink=self.sink,
                     persist_history=True,
-                    max_steps=self.args.max_steps
+                    max_steps=self.args.max_steps,
+                    compress_algorithm=self.args.compress_alg
                 )
             else:
                 # Reuse the agent (and its history); re-sync mutable state in
