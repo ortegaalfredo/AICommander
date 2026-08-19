@@ -334,6 +334,64 @@ class TestRunner:
         self.check("history no-op: unchanged when under limit", c.conversation_history == before,
                    repr(c.conversation_history))
 
+    def test_history_truncate_leaves_headroom(self):
+        # The truncate algorithm must leave ~60% headroom (retain ~60% of the
+        # budget), not fill the full window. Truncating to the FULL budget makes
+        # every following prompt exceed the limit again and re-compress on each
+        # step, slowly losing more history than necessary. Retaining ~60% lets
+        # the agent run several more steps before the next compression, matching
+        # the context-compressor-llm algorithm.
+        c = self.make_commander(max_prompt_len=100, model="gpt-test",
+                                compress_algorithm="truncate")
+        big = "A" * 500
+        c.conversation_history = self._build_history("sys", "hello", [big, big, big, big])
+        c._context_compress()
+        total = sum(c._estimate_message_tokens(m) for m in c.conversation_history)
+        # Retained history must fit within ~60% of the budget, leaving headroom
+        # for new turns (while still preserving system + first user instruction).
+        self.check("truncate headroom: under 60% of budget",
+                   total <= int(100 * 0.6),
+                   f"total={total} budget=100 target={int(100*0.6)}")
+        self.check("truncate headroom: system prompt preserved",
+                   c.conversation_history[0]["role"] == "system",
+                   repr(c.conversation_history[0]))
+        self.check("truncate headroom: first user instruction preserved",
+                   len(c.conversation_history) >= 2
+                   and c.conversation_history[1]["role"] == "user",
+                   repr(c.conversation_history))
+
+    def test_truncate_does_not_over_truncate_tool_outputs(self):
+        # Pass 1 must condense tool outputs only as many as needed to reach the
+        # 60% target (largest first), NOT every oversized output. When tool
+        # outputs dominate the history, condensing them ALL collapses the
+        # context far below the target (e.g. 22505 -> 1476 tokens), wasting
+        # useful detail. Here the budget can absorb most of the messages, so
+        # several tool outputs must keep their full content while the total
+        # still lands within 60% of the budget.
+        c = self.make_commander(max_prompt_len=1000, model="gpt-test",
+                                compress_algorithm="truncate")
+        hist = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+        ]
+        for i in range(10):
+            hist.append({"role": "tool", "tool_call_id": f"c{i}",
+                         "content": "A" * 300})
+        c.conversation_history = hist
+        total = sum(c._estimate_message_tokens(m) for m in c.conversation_history)
+        self.check("truncate no-over-truncate: initial over budget",
+                   total > 1000, f"total={total}")
+        c._context_compress()
+        final = sum(c._estimate_message_tokens(m) for m in c.conversation_history)
+        self.check("truncate no-over-truncate: within 60% of budget",
+                   final <= int(1000 * 0.6), f"final={final}")
+        # At least one tool message must keep its full content (not condensed
+        # to the placeholder) because the budget can absorb it.
+        full = [m for m in c.conversation_history
+                if m.get("role") == "tool" and len(m.get("content", "")) > 30]
+        self.check("truncate no-over-truncate: some tool outputs kept full",
+                   len(full) >= 1, f"full_tools={len(full)} final={final}")
+
     def test_default_algorithm_is_context_compressor_llm(self):
         # The "context-compressor-llm" algorithm is selected by default, so a
         # commander built without an explicit algorithm compresses via that
@@ -769,6 +827,8 @@ def main():
     runner.test_history_condense()
     runner.test_history_drop()
     runner.test_history_noop()
+    runner.test_history_truncate_leaves_headroom()
+    runner.test_truncate_does_not_over_truncate_tool_outputs()
     runner.test_default_algorithm_is_context_compressor_llm()
     runner.test_explicit_algorithm_dispatch()
     runner.test_context_compressor_llm()

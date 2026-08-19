@@ -25,6 +25,16 @@ from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from openai import OpenAI
 
+try:
+    # context-compressor-llm provides the Factory.ai-style anchored-summary
+    # incremental compression algorithm used by the "context-compressor-llm"
+    # algorithm. Optional: when absent, that algorithm falls back to truncate.
+    from context_compressor import ContextCompressor as _ContextCompressorLib
+    _CONTEXT_COMPRESSOR_LLM_AVAILABLE = True
+except ImportError:
+    _ContextCompressorLib = None
+    _CONTEXT_COMPRESSOR_LLM_AVAILABLE = False
+
 # Browser-like User-Agent for all outbound HTTP (OpenAI API calls plus
 # curl/wget run through execute_bash) so Cloudflare-fronted endpoints do not
 # flag the script as a bot and block the IP.
@@ -137,11 +147,13 @@ def _strip_ansi(text: str) -> str:
 class EventSink:
     """Abstract presentation-layer I/O for AICommander.
 
-    Event kinds: LOG, ERROR, LLM_STREAM, THINKING_STREAM, CMD_EXEC,
-    CMD_OUTPUT, CMD_COMPLETE, SYSTEM, STATUS_UPDATE, APPROVAL_REQUEST,
-    SHUTDOWN, TOKEN_USAGE. Common payload keys: text, end, flush.
-    TOKEN_USAGE carries input_tokens/output_tokens (estimate flag set while
-    streaming; exact numbers once the API call finishes).
+    Event kinds: LOG, ERROR, LLM_STREAM, THINKING_STREAM, CONSOLE_STREAM,
+    CMD_EXEC, CMD_OUTPUT, CMD_COMPLETE, SYSTEM, STATUS_UPDATE,
+    APPROVAL_REQUEST, SHUTDOWN, TOKEN_USAGE. Common payload keys: text, end,
+    flush. CONSOLE_STREAM streams text to the console output pane (used by
+    internal calls like the context-compressor summarizer). TOKEN_USAGE
+    carries input_tokens/output_tokens (estimate flag set while streaming;
+    exact numbers once the API call finishes).
     """
 
     def emit(self, kind: str, payload: dict):
@@ -167,14 +179,14 @@ class ConsoleSink(EventSink):
         "CMD_COMPLETE": colors.BOLD,
         "SYSTEM": colors.BOLD + colors.BLUE,
     }
-    _LOG_STYLES = {"yellow": colors.YELLOW, "green": colors.GREEN, "red": colors.RED, "magenta": colors.MAGENTA}
+    _LOG_STYLES = {"yellow": colors.YELLOW, "green": colors.GREEN, "red": colors.RED}
 
     def emit(self, kind: str, payload: dict):
         text = payload.get("text", "")
         if kind in ("STATUS_UPDATE", "TOKEN_USAGE"):
             return  # status/token footer is meaningless in CLI mode
         # Streaming kinds must not append a newline after each token.
-        end = "" if kind in ("LLM_STREAM", "THINKING_STREAM") else payload.get("end", "\n")
+        end = "" if kind in ("LLM_STREAM", "THINKING_STREAM", "CONSOLE_STREAM") else payload.get("end", "\n")
         flush = payload.get("flush", True)
         if kind == "LOG":
             style = self._LOG_STYLES.get(payload.get("style", ""), "")
@@ -249,6 +261,29 @@ class TUISink(EventSink):
             self._approval_event.set()  # unblock any waiting approval
 
 
+class _AICommanderTokenCounter:
+    """Token-counter adapter that plugs aic.py's token estimator into the
+    context-compressor-llm library.
+
+    The library's ContextCompressor calls ``tokenizer.count_tokens(text)``
+    (and ``count_message_tokens``) to drive its thresholds. Reusing aic.py's
+    own estimator here keeps the compressor's accounting consistent with the
+    live "Context" counter and the prompt-budget trigger, so there is no drift
+    between the threshold check and the actual prompt size.
+    """
+
+    def __init__(self, commander):
+        self._commander = commander
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return self._commander._estimate_message_tokens({"role": "user", "content": text})
+
+    def count_message_tokens(self, messages: list) -> int:
+        return sum(self.count_tokens(m.get("content", "")) for m in messages)
+
+
 class AICommander:
     """Main class for AI-Commander functionality"""
 
@@ -259,7 +294,7 @@ class AICommander:
                   show_thinking: bool = True, command_timeout: int = 120,
                   max_prompt_len: int = 20000, max_output_bytes: int = 10240, debug: bool = False,
                   sink: EventSink = None, persist_history: bool = False, max_steps: int = 500,
-                  compress_algorithm: str = "truncate"):
+                  compress_algorithm: str = "context-compressor-llm"):
         self.base_url = api_base.rstrip('/')
         self.model = model
         self.api_key = api_key
@@ -278,9 +313,10 @@ class AICommander:
         self.debug = debug
         self.sink: EventSink = sink if sink is not None else ConsoleSink()
         # Context-compression algorithm applied when the conversation history
-        # exceeds the prompt budget. "truncate" is the default (and currently
-        # the only) algorithm; more will be added in later versions and
-        # selected here via the command line.
+        # exceeds the prompt budget. "context-compressor-llm" (the default)
+        # uses the anchored-summary incremental compressor from the
+        # context-compressor-llm package; "truncate" drops the oldest messages
+        # and condenses tool outputs. Selected via the command line.
         self.compress_algorithm = compress_algorithm
 
         # Checked between steps and during command execution so the TUI can
@@ -412,9 +448,12 @@ class AICommander:
         if total_tokens <= budget:
             return
 
-        algorithm = getattr(self, f"_compress_{self.compress_algorithm}", None)
+        # Hyphenated algorithm names (e.g. "context-compressor-llm") map to
+        # `_compress_<name>` methods with the hyphens replaced by underscores.
+        method_name = f"_compress_{self.compress_algorithm.replace('-', '_')}"
+        algorithm = getattr(self, method_name, None)
         if algorithm is None:
-            self._log(f"[COMPRESS] Unknown context-compression algorithm '{self.compress_algorithm}'. Falling back to 'truncate'.")
+            self._log(f"[COMPRESS] Unknown context-compression algorithm '{self.compress_algorithm}'. Falling back to 'truncate'.", style="yellow")
             algorithm = self._compress_truncate
         algorithm(budget, total_tokens)
 
@@ -422,27 +461,324 @@ class AICommander:
         """Truncate algorithm: shrink conversation history below the prompt budget.
 
         Keeps the system prompt (index 0) and first user instruction (index 1).
-        Pass 1 condenses oversized tool outputs in-place; pass 2 drops the
-        oldest messages from index 2 onwards until under the limit.
+        Pass 1 condenses oversized tool outputs in-place, but only as many as
+        needed; pass 2 drops the oldest messages from index 2 onwards. Both
+        stop once the retained history fits within ~60% of the budget, leaving
+        headroom so several new turns fit before the next compression.
         """
-        self._log(f"[COMPRESS] Using 'truncate' algorithm. Prompt length ({total_tokens} tokens) exceeds budget ({budget}). Compressing conversation history.")
+        # Leave ~60% headroom (matching the context-compressor-llm algorithm)
+        # so the agent can run several more steps before re-triggering
+        # compression. Truncating down to the FULL budget makes every following
+        # prompt exceed the limit again and re-compress on each step, slowly
+        # losing more history than necessary. Conversely, condensing EVERY tool
+        # output to a placeholder collapses the context far below the target
+        # (e.g. 22505 -> 1476 tokens) when tool outputs dominate, so pass 1
+        # must condense only as many as needed to reach the target.
+        retained_target = max(1, int(budget * 0.6))
+        self._log(f"[COMPRESS] Using 'truncate' algorithm. Prompt length ({total_tokens} tokens) exceeds budget ({budget}). Retaining up to ~{retained_target} tokens ({int(budget * 0.6 / budget * 100)}% of budget). Compressing conversation history.", style="yellow")
 
-        for msg in self.conversation_history:
-            if msg.get('role') == 'tool' and isinstance(msg.get('content'), str) and len(msg['content']) > 30:
-                removed_tokens = self._estimate_message_tokens(msg)
-                msg['content'] = '<condensed tool output>'
-                total_tokens -= (removed_tokens - self._estimate_message_tokens(msg))
-                self._log(f"[TRUNCATED] Condensed tool message (removed {removed_tokens} tokens)")
+        # Pass 1: condense oversized tool outputs, largest first (most tokens
+        # saved per operation, so the fewest messages lose detail), stopping as
+        # soon as the history fits the retained target.
+        oversized = [
+            (i, msg) for i, msg in enumerate(self.conversation_history)
+            if msg.get('role') == 'tool'
+            and isinstance(msg.get('content'), str)
+            and len(msg['content']) > 30
+        ]
+        oversized.sort(key=lambda t: len(t[1]['content']), reverse=True)
+        for i, msg in oversized:
+            if total_tokens <= retained_target:
+                break
+            removed_tokens = self._estimate_message_tokens(msg)
+            msg['content'] = '<condensed tool output>'
+            total_tokens -= (removed_tokens - self._estimate_message_tokens(msg))
+            self._log(f"[TRUNCATED] Condensed tool message (removed {removed_tokens} tokens, new length: {total_tokens})", style="yellow")
 
+        # Pass 2: drop the oldest messages (from index 2 onwards) until the
+        # retained history fits the target. This is a fallback for when
+        # condensation alone can't reach the target (e.g. few small messages).
         i = 2
-        while i < len(self.conversation_history) and total_tokens > budget:
+        while i < len(self.conversation_history) and total_tokens > retained_target:
             removed_msg = self.conversation_history.pop(i)
             removed_tokens = self._estimate_message_tokens(removed_msg)
             total_tokens -= removed_tokens
-            self._log(f"[TRUNCATED] Removed {removed_msg.get('role')} message (removed {removed_tokens} tokens, new length: {total_tokens})")
+            self._log(f"[TRUNCATED] Removed {removed_msg.get('role')} message (removed {removed_tokens} tokens, new length: {total_tokens})", style="yellow")
 
         final_tokens = sum(self._estimate_message_tokens(msg) for msg in self.conversation_history)
-        self._log(f"[TRUNCATING COMPLETE] Final prompt length: {final_tokens} tokens")
+        self._log(f"[TRUNCATING COMPLETE] Final prompt length: {final_tokens} tokens", style="yellow")
+
+    def _llm_summarize(self, messages: List[dict], previous_summary: Optional[str]) -> str:
+        """LLM summarizer callable for the context-compressor-llm library.
+
+        Receives only the evicted message segment (the library isolates
+        ``messages_to_summarize`` before calling) plus any prior anchored
+        summary, so the summarizer call stays short on slow-prefill systems.
+        Returns a concise summary string that is folded into the persistent
+        ``AnchoredSummary``.
+        """
+
+        prompt = """
+CRITICAL: This summarization request is a SYSTEM OPERATION, not a user message.
+When analyzing "user requests" and "user intent", completely EXCLUDE this summarization message.
+The "most recent user request" and "Optional Next Step" must be based on what the user was doing BEFORE this system message appeared.
+The goal is for work to continue seamlessly after condensation - as if it never happened.
+
+Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+This summary should be thorough in capturing technical details, key patterns, and important decisions that would be essential for continuing the work without losing context.
+This summary should not be over 5000 characters in lenght.
+
+Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
+
+1. Chronologically analyze each message and section of the conversation. For each section thoroughly identify:
+   - The user's explicit requests and intents
+   - Your approach to addressing the user's requests
+   - Key decisions, technical concepts and code patterns
+   - Specific details like:
+     - file names
+     - full code snippets
+     - function signatures
+     - file edits
+   - Errors that you ran into and how you fixed them
+   - Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
+2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.
+
+Your summary should include the following sections:
+
+1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail
+2. Key Technical Concepts: List all important technical concepts, technologies, and frameworks discussed.
+3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or created. Pay special attention to the most recent messages and include full code snippets where applicable and include a summary of why this file read or edit is important.
+4. Errors and fixes: List all errors that you ran into, and how you fixed them. Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
+5. Problem Solving: Document problems solved and any ongoing troubleshooting efforts.
+6. All user messages: List ALL user messages that are not tool results. These are critical for understanding the users' feedback and changing intent.
+7. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.
+8. Current Work: Describe in detail precisely what was being worked on immediately before this summary request, paying special attention to the most recent messages from both user and assistant. Include file names and code snippets where applicable.
+9. Optional Next Step: List the next step that you will take that is related to the most recent work you were doing. IMPORTANT: ensure that this step is DIRECTLY in line with the user's most recent explicit requests, and the task you were working on immediately before this summary request. If your last task was concluded, then only list next steps if they are explicitly in line with the users request. Do not start on tangential requests or really old requests that were already completed without confirming with the user first.
+
+If there is a next step, include direct quotes from the most recent conversation showing exactly what task you were working on and where you left off. This should be verbatim to ensure there's no drift in task interpretation.
+
+Here's an example of how your output should be structured:
+
+<example>
+<analysis>
+[Your thought process, ensuring all points are covered thoroughly and accurately]
+</analysis>
+
+<summary>
+1. Primary Request and Intent:
+   [Detailed description]
+
+2. Key Technical Concepts:
+   - [Concept 1]
+   - [Concept 2]
+   - [...]
+
+3. Files and Code Sections:
+   - [File Name 1]
+      - [Summary of why this file is important]
+      - [Summary of the changes made to this file, if any]
+      - [Important Code Snippet]
+   - [File Name 2]
+      - [Important Code Snippet]
+   - [...]
+
+4. Errors and fixes:
+   - [Detailed description of error 1]:
+      - [How you fixed the error]
+      - [User feedback on the error if any]
+   - [...]
+
+5. Problem Solving:
+   [Description of solved problems and ongoing troubleshooting]
+
+6. All user messages:
+   - [Detailed non tool use user message]
+   - [...]
+
+7. Pending Tasks:
+   - [Task 1]
+   - [Task 2]
+   - [...]
+
+8. Current Work:
+   [Precise description of current work]
+
+9. Optional Next Step:
+   [Optional Next step to take]
+
+</summary>
+</example>
+
+Please provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response.
+Remember to not exceed 5000 characters, its very important that the summary to be concise.
+"""
+
+
+
+        if previous_summary:
+            prompt += "\n\nPrior summary (fold new information into it):\n" + previous_summary
+        prompt += "\n\nMessages to summarize:\n"
+        for m in messages:
+            prompt += f"\n[{m.get('role', 'unknown')}] {m.get('content', '')}"
+
+        try:
+            # Some OpenAI-compatible endpoints reject a lone system message with
+            # "no user query found". Always include a user message carrying the
+            # summarization instruction so the summarizer call is accepted.
+            response = self.call_llm_api(
+                [
+                    {"role": "system", "content": "You are a precise conversation summarizer."},
+                    {"role": "user", "content": prompt},
+                ],
+                use_tools=False,
+                stream_display=False,
+                stream_label="[SESSION SUMMARY]",
+            )
+            msg = response.get("choices", [{}])[0].get("message", {})
+            summary = msg.get("content") or ""
+            return summary.strip() or "[summary unavailable]"
+        except Exception as e:
+            self._log_error(f"[COMPRESS] LLM summarizer failed: {e}. Using placeholder summary.")
+            return "[summary unavailable]"
+
+    def _compress_context_compressor_llm(self, budget: int, total_tokens: int):
+        """context-compressor-llm algorithm: anchored-summary incremental compression.
+
+        Delegates to the Factory.ai-style ``ContextCompressor`` from the
+        context-compressor-llm package. When the non-system log exceeds the
+        budget it evicts the oldest prefix, folds it into a persistent
+        ``AnchoredSummary`` via an LLM call on the evicted segment only, and
+        retains the newest suffix -- an append-only, KV-cache-friendly layout.
+        The system prompt is kept byte-identical at the front of the retained
+        context so unchanged prefixes are never re-prefilled.
+        """
+        if not _CONTEXT_COMPRESSOR_LLM_AVAILABLE:
+            self._log("[COMPRESS] 'context-compressor-llm' selected but the "
+                      "context-compressor-llm package is not installed. Falling back to 'truncate'.",
+                      style="yellow")
+            self._compress_truncate(budget, total_tokens)
+            return
+
+        self._log(f"[COMPRESS] Using 'context-compressor-llm' algorithm. Prompt length ({total_tokens} tokens) exceeds budget ({budget}). Compressing conversation history.",
+                  style="yellow")
+
+        # Keep the system prompt out of the compressor so it stays byte-identical.
+        system_prompt = None
+        if self.conversation_history and self.conversation_history[0].get("role") == "system":
+            system_prompt = self.conversation_history[0].get("content", "")
+        # Preserve the FIRST user instruction (the original task) so the LLM
+        # never forgets what it was initially asked to do. The "truncate"
+        # algorithm always keeps the system prompt (index 0) and the first user
+        # instruction (index 1); the context-compressor-llm algorithm must do
+        # the same. Otherwise the initial request gets evicted into the anchored
+        # summary (or dropped entirely on the "no user query" fallback) and the
+        # agent loses track of its primary objective. The first user message is
+        # kept verbatim, outside the summarizable log.
+        first_user = None
+        for i, m in enumerate(self.conversation_history):
+            if m.get("role") == "user":
+                first_user = m
+                log = [x for x in self.conversation_history[i + 1:] if x.get("role") != "system"]
+                break
+        else:
+            log = [m for m in self.conversation_history if m.get("role") != "system"]
+
+        # The compressor counts only the non-system log, so give it thresholds
+        # derived from the ACTUAL log size (in the library's token scheme) rather
+        # than from the overhead-inclusive budget. The trigger in _context_compress
+        # counts per-message overhead and tool_calls, which the library does not,
+        # so a log that fits the library's t_max can still trip the trigger and
+        # report "0 compressions". Forcing t_max below the real log size makes the
+        # library actually fold an oldest prefix into the anchored summary.
+        system_tokens = 0
+        if system_prompt is not None:
+            system_tokens = self._estimate_message_tokens({"role": "system", "content": system_prompt})
+        log_budget = max(1, budget - system_tokens)
+
+        token_counter = _AICommanderTokenCounter(self)
+        log_tokens_lib = sum(token_counter.count_tokens(m.get("content", "")) for m in log)
+        log_tokens_lib = max(1, log_tokens_lib)
+
+        # Summary budget: modest, but leave room for a retained suffix.
+        t_summary = max(20, min(budget // 20, log_budget // 3))
+        t_summary = max(1, min(t_summary, log_budget - 1))
+        # Retained target: keep the summary + suffix at a FRACTION of the log
+        # budget (plus the summary) so several new turns fit before the next
+        # compression. Retaining up to ~100% of the budget makes every following
+        # prompt exceed the limit again and re-compress on each step, which is
+        # wasteful. Headroom here keeps the agent running many steps before it
+        # must summarize again. The library also counts only content tokens, so
+        # keeping clear of the budget absorbs the per-message/tool_calls overhead
+        # that the trigger counts and the library does not.
+        t_retained = max(t_summary + 1, min(int(log_budget * 0.6),
+                                            log_tokens_lib - 1))
+        t_max = max(t_summary + 1, t_retained)
+
+        cc = _ContextCompressorLib(
+            summarizer=self._llm_summarize,
+            t_max=t_max,
+            t_retained=t_retained,
+            t_summary=t_summary,
+            tokenizer=token_counter,
+        )
+        for i, msg in enumerate(log):
+            content = msg.get("content")
+            if not isinstance(content, str):
+                content = ""
+            cc.add_message(content, role=msg.get("role", "user"),
+                           metadata={"original": msg, "index": i})
+
+        # Auto-compresses when over t_max; returns anchored summary + suffix.
+        context = cc.get_current_context(auto_compress=True)
+
+        new_history = []
+        summary_text = None
+        for m in context:
+            original = m.metadata.get("original")
+            if original is not None:
+                # Preserve the full original message (tool_calls, tool_call_id,
+                # role, content) so validation and the API stay consistent --
+                # stripping them would make an assistant-with-tool_calls look
+                # like a terminal text-only message and trigger a false
+                # [SAFETY STOP].
+                new_history.append(dict(original))
+            elif m.metadata.get("type") == "summary":
+                summary_text = m.content
+            else:
+                new_history.append({"role": m.role, "content": m.content})
+
+        # Merge the anchored summary into the single leading system prompt.
+        # OpenAI-compatible endpoints expect system messages at the very start
+        # (and usually exactly one); emitting the summary as a second system
+        # message is rejected with "System message must be at the beginning."
+        if system_prompt is not None:
+            if summary_text:
+                system_prompt = system_prompt + "\n\n[Prior conversation summary]\n" + summary_text
+            new_history.insert(0, {"role": "system", "content": system_prompt})
+        elif summary_text:
+            new_history.insert(0, {"role": "system",
+                                   "content": "[Prior conversation summary]\n" + summary_text})
+
+        # Re-insert the preserved FIRST user instruction (the original task)
+        # verbatim, immediately after the system prompt, mirroring the "truncate"
+        # algorithm. This guarantees the LLM always remembers its initial request
+        # even when the rest of the oldest history was folded into the summary.
+        if first_user is not None:
+            new_history.insert(1, dict(first_user))
+
+        # Ensure a user query exists. After aggressive compression the original
+        # user request can be folded into the summary, leaving only system/tool/
+        # assistant turns -- which some OpenAI-compatible endpoints reject with
+        # "error code 400: no user query found in messages".
+        if not any(m.get("role") == "user" for m in new_history):
+            new_history.append({"role": "user", "content": "Continue with the current task."})
+        self.conversation_history = new_history
+
+        stats = cc.get_stats()
+        final_tokens = sum(self._estimate_message_tokens(m) for m in self.conversation_history)
+        self._log(f"[COMPRESS] context-compressor-llm: {stats['compression_count']} compression(s), "
+                  f"tokens saved: {stats['total_tokens_saved']}. Final prompt length: {final_tokens} tokens.",
+                  style="yellow")
 
     def get_system_prompt(self) -> str:
         """Get the system prompt for the LLM"""
@@ -677,8 +1013,19 @@ Think carefully; response quality is the highest priority. You have unlimited th
 
         return validated
 
-    def call_llm_api(self, messages: List[Dict[str, str]], use_tools: bool = True) -> Dict[str, Any]:
-        """Call the LLM API using the OpenAI client with streaming support."""
+    def call_llm_api(self, messages: List[Dict[str, str]], use_tools: bool = True,
+                     stream_display: bool = True,
+                     stream_label: Optional[str] = None) -> Dict[str, Any]:
+        """Call the LLM API using the OpenAI client with streaming support.
+
+        When ``stream_display`` is True (default) the streamed content is echoed
+        to the agent output pane via ``LLM_STREAM``/``THINKING_STREAM`` events.
+        Pass False for internal calls (e.g. the context-compressor summarizer) so
+        their output is routed to the console output pane via ``CONSOLE_STREAM``
+        instead of appearing as if the agent were speaking. ``stream_label``, when
+        given, is prepended once at the start of the stream (used to tag internal
+        output such as ``[SESSION SUMMARY]``).
+        """
         messages = self._validate_messages(messages)
 
         # Empty list = terminal assistant state (see _validate_messages);
@@ -736,6 +1083,7 @@ Think carefully; response quality is the highest priority. You have unlimited th
                 in_thinking = False
                 thinking_buffer = ""
                 usage = None
+                label_sent = False
 
                 stream = self.client.chat.completions.create(**request_params)
 
@@ -769,7 +1117,8 @@ Think carefully; response quality is the highest priority. You have unlimited th
                         if self.show_thinking and reasoning_chunk:
                             collected_thinking += reasoning_chunk
                             thinking_buffer += reasoning_chunk
-                            self.sink.emit("THINKING_STREAM", {"text": reasoning_chunk})
+                            stream_kind = "THINKING_STREAM" if stream_display else "CONSOLE_STREAM"
+                            self.sink.emit(stream_kind, {"text": reasoning_chunk})
                             in_thinking = True
 
                         if delta.content:
@@ -777,7 +1126,12 @@ Think carefully; response quality is the highest priority. You have unlimited th
                             if self.show_thinking and in_thinking and thinking_buffer:
                                 self._log("[THINKING COMPLETE]", style="yellow")
                                 in_thinking = False
-                            self.sink.emit("LLM_STREAM", {"text": delta.content})
+                            stream_kind = "LLM_STREAM" if stream_display else "CONSOLE_STREAM"
+                            if stream_kind == "CONSOLE_STREAM" and stream_label and not label_sent:
+                                label_sent = True
+                                self.sink.emit(stream_kind, {"text": delta.content, "label": stream_label})
+                            else:
+                                self.sink.emit(stream_kind, {"text": delta.content})
 
                         if delta.tool_calls:
                             for tool_call_chunk in delta.tool_calls:
@@ -939,8 +1293,9 @@ Think carefully; response quality is the highest priority. You have unlimited th
                 "model": self.model,
                 "auto_approve": self.auto_approve,
                 "max_prompt_len": self.max_prompt_len,
+                "compress_algorithm": self.compress_algorithm,
             })
-        self._log(f"[USER REQUEST] {user_request}", style="magenta")
+        self._log(f"[USER REQUEST] {user_request}", style="yellow")
         self._log(f"{'='*60}")
 
         # With persist_history, refresh the system prompt in place and append
@@ -1274,12 +1629,15 @@ def main():
                         help="Run in direct CLI mode without TUI (original behaviour)")
     parser.add_argument("--disable-sandbox", action="store_true",
                         help="Disable the OS-level Landlock sandbox (Linux only)")
-    parser.add_argument("--compress-alg", default="truncate",
+    parser.add_argument("--compress-alg", default="context-compressor-llm",
                         help="Context-compression algorithm for shrinking the "
                              "conversation history when it exceeds the prompt "
-                             "budget. Currently only 'truncate' is available "
-                             "(default: truncate); more algorithms will be added "
-                             "in future versions.")
+                             "budget. Options: 'context-compressor-llm' (default) "
+                             "uses the anchored-summary incremental compressor "
+                             "from the context-compressor-llm package (LLM "
+                             "summarizer; falls back to truncate if the package "
+                             "is missing); 'truncate' drops the oldest messages "
+                             "and condenses tool outputs.")
     parser.add_argument("request", nargs="*", help="Task request")
 
     args = parser.parse_args()
@@ -2112,6 +2470,7 @@ def main():
                 self._write_agent(f"  Model: {payload.get('model','')}", style="blue")
                 self._write_agent(f"  Auto-approve: {payload.get('auto_approve', False)}", style="blue")
                 self._write_agent(f"  Max prompt len: {payload.get('max_prompt_len', 0)}", style="blue")
+                self._write_agent(f"  Context compression: {payload.get('compress_algorithm', 'truncate')}", style="blue")
                 self._write_agent("  [!] Agent starting. Commands will require approval unless /autoapprove is toggled.", style="yellow")
             elif kind == "LOG":
                 self._write_agent(payload.get("text", ""), end=payload.get("end", "\n"), style=payload.get("style", ""))
@@ -2123,6 +2482,8 @@ def main():
             elif kind == "THINKING_STREAM":
                 self._write_agent(payload.get("text", ""), streaming=True, prefix="[THINKING] ", style="yellow")
                 self._track_token()
+            elif kind == "CONSOLE_STREAM":
+                self._write_console(payload.get("text", ""), style="yellow", streaming=True)
             elif kind == "CMD_EXEC":
                 cmd = payload.get("command", "")
                 tcid = payload.get("tool_call_id", "")
@@ -2213,7 +2574,7 @@ def main():
                 if streaming:
                     if prefix and buf_key not in self._stream_prefix_done:
                         self._stream_prefix_done.add(buf_key)
-                        widget.write(Text(_strip_ansi(prefix).strip(), style=style or "magenta"))
+                        widget.write(Text(_strip_ansi(prefix).strip(), style=style or "yellow"))
 
                     # Flush complete lines; keep the partial line buffered.
                     buf = self._stream_buffer.get(buf_key, "") + clean
@@ -2234,13 +2595,30 @@ def main():
             except Exception:
                 pass
 
-        def _write_console(self, text: str, style: str = ""):
-            """Write text to the console output RichLog."""
+        def _write_console(self, text: str, style: str = "", streaming: bool = False):
+            """Write text to the console output RichLog.
+
+            When *streaming* is True, tokens are buffered and flushed as complete
+            lines so the partial line stays inline (used by CONSOLE_STREAM).
+            """
             try:
                 from rich.text import Text
                 widget = self.query_one("#console-log")
                 clean = _strip_ansi(text)
-                widget.write(Text(clean, style=style) if style else Text(clean))
+                if not clean:
+                    return
+                buf_key = "#console-log"
+                if streaming:
+                    buf = self._stream_buffer.get(buf_key, "") + clean
+                    parts = buf.split("\n")
+                    self._stream_buffer[buf_key] = parts[-1]
+                    for part in parts[:-1]:
+                        widget.write(Text(part, style=style) if style else Text(part))
+                else:
+                    pending = self._stream_buffer.pop(buf_key, "")
+                    if pending:
+                        widget.write(Text(pending, style=style) if style else Text(pending))
+                    widget.write(Text(clean, style=style) if style else Text(clean))
             except Exception:
                 pass
 
