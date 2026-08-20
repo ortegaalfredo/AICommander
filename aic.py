@@ -296,7 +296,8 @@ class AICommander:
                   sink: EventSink = None, persist_history: bool = False, max_steps: int = 500,
                   compress_algorithm: str = "context-compressor-llm",
                   compress_target: float = 0.4, fast: bool = False,
-                  reasoning_effort: Optional[str] = None):
+                  reasoning_effort: Optional[str] = None,
+                  sandbox_enabled: bool = False, sandbox_write_dir: str = ""):
         self.base_url = api_base.rstrip('/')
         self.model = model
         self.api_key = api_key
@@ -329,6 +330,14 @@ class AICommander:
         # Fast mode: use the truncation algorithm and a smaller, faster system
         # prompt. Set via the --fast command line flag.
         self.fast = fast
+        # Whether an OS-level Landlock sandbox is active. When True, writes are
+        # restricted to the writable directory, /tmp and /dev; the system prompt
+        # tells the agent which directories it may write to.
+        self.sandbox_enabled = sandbox_enabled
+        # The directory the Landlock sandbox allows writes to (the cwd when the
+        # rules were applied). Surfaced in the system prompt so the agent knows
+        # the exact path it may write to.
+        self.sandbox_write_dir = sandbox_write_dir
 
         # Checked between steps and during command execution so the TUI can
         # halt the agent cleanly.
@@ -837,6 +846,7 @@ Remember to not exceed 5000 characters, its very important that the summary to b
 - Output is capped at {self.max_output_bytes} bytes. If truncated, the literal sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}` is appended. If you see it, you are missing data — do NOT assume success or failure. Re-run with output redirected to a file and read in chunks via `sed -n 'start,end p' file`, or use `head -c N`/`tail -c N`. Prefer targeted commands (grep, wc, stat) over dumping large outputs.
 - Commands are killed after {self.command_timeout}s. For long operations use `nohup ... &` and check later, split into smaller steps, or set your own `timeout`.
 - Commands run in a PTY; use non-interactive flags (`-y`, `--no-interactive`) where available.
+- You are running inside an OS-level sandbox{'' if self.sandbox_enabled else ' (currently disabled)'}. {f'You may WRITE only to {self.sandbox_write_dir}, /tmp and /dev; reads and execution are allowed anywhere, and network access is preserved. Write files within these directories or they may fail.' if self.sandbox_enabled else f'When the sandbox is active, writes are restricted to {self.sandbox_write_dir}, /tmp and /dev.'}
 
 **Command Results:**
 - Never echo command execution metadata (e.g. "[EXECUTING]", "exit code X") into your response content; the tool system supplies that.
@@ -860,8 +870,8 @@ Think carefully; response quality is the highest priority. You have unlimited th
 
         Keeps only the essential instructions needed for the agent to function:
         the tool workflow, the completion marker, and the output-limit sentinel.
-        Removes the verbose persistence policy, internet-access recipe, PTY
-        notes, and the "think carefully" guidance to save tokens and latency.
+        Removes the verbose persistence policy, PTY notes, and the "think carefully" 
+        guidance to save tokens and latency.
         """
         return f"""You are an expert bash assistant. Complete the user's task by running commands via execute_bash, one at a time, and acting on each result.
 
@@ -874,6 +884,7 @@ Rules:
 - Output is capped at {self.max_output_bytes} bytes; if truncated the sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}` is appended. If you see it, you are missing data — do not assume success or failure; re-run a more targeted command.
 - Commands are killed after {self.command_timeout}s.
 - Only report conclusions from real tool output; never fabricate results.
+- Web search by printing JSON results to stdout: `python3 -c "import json; from ddgs import DDGS; print(json.dumps(list(DDGS().text('QUERY', max_results=10)), ensure_ascii=False, indent=2))"` (replace QUERY). Use wget/curl and the w3m browser to fetch page contents.
 - Keep working until the task is genuinely complete; partial completion is not completion."""
 
     def execute_bash_command(self, command: str) -> Tuple[str, int]:
@@ -1740,6 +1751,9 @@ def main():
     # Sandbox must be enabled before the agent thread starts so the Landlock
     # domain covers the whole process. The status message is routed through
     # the active sink below.
+    # The directory the sandbox allows writes to (the cwd when the Landlock
+    # rules were applied). Used so the agent is told the actual writable path.
+    args.sandbox_write_dir = os.getcwd()
     if args.disable_sandbox:
         args.sandbox_enabled = False
         args.sandbox_msg = "[SANDBOX] Sandbox disabled via --disable-sandbox"
@@ -1768,7 +1782,9 @@ def main():
             compress_algorithm="truncate" if args.fast else args.compress_alg,
             compress_target=args.compress_target,
             fast=args.fast,
-            reasoning_effort=args.reasoning_effort
+            reasoning_effort=args.reasoning_effort,
+            sandbox_enabled=args.sandbox_enabled,
+            sandbox_write_dir=args.sandbox_write_dir
         )
         try:
             user_request = " ".join(args.request)
@@ -2019,6 +2035,12 @@ def main():
             self._rows = 24
             self._history: list = []
             self._last_render = ""
+            # The shell's current working directory, kept in sync with the
+            # process-wide cwd (and therefore the agent thread) so commands the
+            # agent runs via execute_bash land in the same directory the user
+            # navigated the interactive shell to. Mirrors the shell's /proc
+            # cwd; None until the shell spawns.
+            self._cwd: Optional[str] = None
 
         def check_consume_key(self, key: str, character: Optional[str]) -> bool:
             # Return False so keys reach _on_key (which forwards them to the
@@ -2054,6 +2076,8 @@ def main():
             self._screen = pyte.Screen(self._cols, self._rows)
             self._stream = pyte.ByteStream(self._screen)
             self._stream.attach(self._screen)
+            # The fresh shell starts in the same directory the process is in.
+            self._cwd = os.getcwd()
 
         def _resize_pty(self) -> None:
             """Tell the kernel the pty window size (so full-screen apps work)."""
@@ -2069,7 +2093,7 @@ def main():
             # Don't spawn here: the widget starts hidden inside the
             # ContentSwitcher (size 0x0), which would give the pty a broken
             # window size. Spawn lazily in on_resize() instead.
-            self.set_interval(0.05, self._poll)
+            self.set_interval(0.10, self._poll)
 
         def on_resize(self, event: events.Resize) -> None:
             # Ignore degenerate (hidden) sizes reported by the ContentSwitcher.
@@ -2102,6 +2126,7 @@ def main():
                     pass
                 self._sync_history()
                 self.refresh()
+            self._sync_cwd()
             # Reap the child if it exited; resetting both fields lets the next
             # on_resize spawn a fresh shell.
             if self._pid is not None:
@@ -2116,6 +2141,40 @@ def main():
                         pass
                     self._master_fd = None
                     self._pid = None
+
+        def _sync_cwd(self) -> None:
+            """Mirror the interactive shell's directory onto the process (and
+            therefore the agent thread) by calling os.chdir() when it changes.
+
+            The shell runs in its own pty and can ``cd`` freely; the agent's
+            execute_bash children inherit the process cwd, so they would keep
+            running in the original directory unless we chdir here. The shell's
+            true cwd is read from /proc/<pid>/cwd (a symlink the kernel keeps
+            current), which is more reliable than parsing the prompt. os.chdir()
+            is process-wide, so once applied every subsequent command the agent
+            runs lands in the directory the user navigated to.
+            """
+            if self._pid is None:
+                return
+            # os.readlink reads the symlink target directly without requiring
+            # it to still exist, so a shell whose directory was deleted still
+            # reports the path it cd'd to (realpath would fail on such a path).
+            try:
+                shell_cwd = os.readlink(f"/proc/{self._pid}/cwd")
+            except (OSError, ProcessLookupError):
+                return
+            if not shell_cwd:
+                return
+            if shell_cwd == self._cwd:
+                return
+            # Only change the process cwd, never the shell's own (it is
+            # already there). Guarded so a transient /proc read failure or a
+            # cwd the parent cannot enter never breaks the poll loop.
+            try:
+                os.chdir(shell_cwd)
+                self._cwd = shell_cwd
+            except OSError:
+                pass
 
         def _sync_history(self) -> None:
             """Copy the pyte screen contents into self._history for rendering."""
@@ -2873,7 +2932,9 @@ def main():
                     compress_algorithm="truncate" if self.args.fast else self.args.compress_alg,
                     compress_target=self.args.compress_target,
                     fast=self.args.fast,
-                    reasoning_effort=self.args.reasoning_effort
+                    reasoning_effort=self.args.reasoning_effort,
+                    sandbox_enabled=self.args.sandbox_enabled,
+                    sandbox_write_dir=self.args.sandbox_write_dir
                 )
             else:
                 # Reuse the agent (and its history); re-sync mutable state in
