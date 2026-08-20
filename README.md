@@ -51,7 +51,6 @@ It supports two presentation modes:
 - **Shell access** — runs arbitrary commands and captures their output.
 - **Web search** — using the duck-duck-go `ddgs` Python package (installed via requirements.txt).
 - **Approval gate** — review each command before it runs, or auto-approve.
-- **Thinking tokens** — optional display/hiding of reasoning output.
 - **Command timeouts** — prevent runaway commands (configurable).
 - **Output limits** — command output is capped and truncated with a sentinel so
   the model never receives unbounded text.
@@ -123,7 +122,7 @@ panel. In `--nogui` mode a request is required on the command line.
 | `--disable-sandbox` | Disable the OS-level Landlock sandbox (Linux only). |
 | `--compress-alg` | Context-compression algorithm (`context-compressor-llm` or `truncate`). |
 | `--compress-target` | Fraction of the prompt budget retained as headroom (default: `0.4`). |
-| `--fast` | Fast mode: force `truncate` compression and a smaller system prompt. |
+| `--fast` | Fast mode: force `truncate` compression and a smaller system prompt, for slow inference systems. |
 | `--reasoning-effort` | Reasoning effort for the LLM (e.g. `low`, `medium`, `high`). |
 | `request` | The task request (positional, required in `--nogui` mode). |
 
@@ -400,9 +399,6 @@ instructions for the model.
 ├── aic.py            # The entire agent (single-file implementation)
 ├── requirements.txt  # Python dependencies
 ├── README.md         # This file
-├── context-compress.md   # Design notes on prefix-preserving compression
-├── context-compress-libs.md  # Notes on the context-compressor-llm library
-├── report.md         # Detailed architecture analysis
 ├── tests/            # Test suite (truncation + core helpers)
 └── LICENSE           # Apache 2.0
 ```
