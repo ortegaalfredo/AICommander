@@ -295,11 +295,13 @@ class AICommander:
                   max_prompt_len: int = 20000, max_output_bytes: int = 10240, debug: bool = False,
                   sink: EventSink = None, persist_history: bool = False, max_steps: int = 500,
                   compress_algorithm: str = "context-compressor-llm",
-                  compress_target: float = 0.4, fast: bool = False):
+                  compress_target: float = 0.4, fast: bool = False,
+                  reasoning_effort: Optional[str] = None):
         self.base_url = api_base.rstrip('/')
         self.model = model
         self.api_key = api_key
         self.auto_approve = auto_approve
+        self.reasoning_effort = reasoning_effort
         self.conversation_history = []
         # When True, run() extends the existing conversation history instead
         # of resetting it, so a fresh prompt keeps prior chat context.
@@ -1114,6 +1116,8 @@ Rules:
             "temperature": temperature,
             "stream": True,
         }
+        if self.reasoning_effort:
+            request_params["reasoning_effort"] = self.reasoning_effort
         # Ask the server to include usage stats in the final stream chunk so we
         # can correct the live estimate with exact token counts.
         request_params["stream_options"] = {"include_usage": True}
@@ -1368,6 +1372,7 @@ Rules:
                 "auto_approve": self.auto_approve,
                 "max_prompt_len": self.max_prompt_len,
                 "compress_algorithm": self.compress_algorithm,
+                "fast": self.fast,
             })
         self._log(f"[USER REQUEST] {user_request}", style="yellow")
         self._log(f"{'='*60}")
@@ -1720,6 +1725,8 @@ def main():
     parser.add_argument("--fast", action="store_true",
                         help="Fast mode: force the 'truncate' context-compression "
                              "algorithm and use a smaller, faster system prompt.")
+    parser.add_argument("--reasoning-effort", default=None,
+                        help="Reasoning effort for the LLM (e.g. low, medium, high)")
     parser.add_argument("request", nargs="*", help="Task request")
 
     args = parser.parse_args()
@@ -1760,7 +1767,8 @@ def main():
             # --fast forces the faster 'truncate' algorithm and the shorter prompt.
             compress_algorithm="truncate" if args.fast else args.compress_alg,
             compress_target=args.compress_target,
-            fast=args.fast
+            fast=args.fast,
+            reasoning_effort=args.reasoning_effort
         )
         try:
             user_request = " ".join(args.request)
@@ -2556,6 +2564,7 @@ def main():
                 self._write_agent(f"  Auto-approve: {payload.get('auto_approve', False)}", style="blue")
                 self._write_agent(f"  Max prompt len: {payload.get('max_prompt_len', 0)}", style="blue")
                 self._write_agent(f"  Context compression: {payload.get('compress_algorithm', 'truncate')}", style="blue")
+                self._write_agent(f"  Fast mode: {payload.get('fast', False)}", style="blue")
                 self._write_agent("  [!] Agent starting. Commands will require approval unless /autoapprove is toggled.", style="yellow")
             elif kind == "LOG":
                 self._write_agent(payload.get("text", ""), end=payload.get("end", "\n"), style=payload.get("style", ""))
@@ -2863,7 +2872,8 @@ def main():
                     # --fast forces the faster 'truncate' algorithm and the shorter prompt.
                     compress_algorithm="truncate" if self.args.fast else self.args.compress_alg,
                     compress_target=self.args.compress_target,
-                    fast=self.args.fast
+                    fast=self.args.fast,
+                    reasoning_effort=self.args.reasoning_effort
                 )
             else:
                 # Reuse the agent (and its history); re-sync mutable state in
