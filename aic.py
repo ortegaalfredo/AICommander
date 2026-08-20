@@ -294,7 +294,8 @@ class AICommander:
                   show_thinking: bool = True, command_timeout: int = 120,
                   max_prompt_len: int = 20000, max_output_bytes: int = 10240, debug: bool = False,
                   sink: EventSink = None, persist_history: bool = False, max_steps: int = 500,
-                  compress_algorithm: str = "context-compressor-llm"):
+                  compress_algorithm: str = "context-compressor-llm",
+                  compress_target: float = 0.4, fast: bool = False):
         self.base_url = api_base.rstrip('/')
         self.model = model
         self.api_key = api_key
@@ -318,6 +319,14 @@ class AICommander:
         # context-compressor-llm package; "truncate" drops the oldest messages
         # and condenses tool outputs. Selected via the command line.
         self.compress_algorithm = compress_algorithm
+        # Fraction of the prompt budget that compression retains as headroom.
+        # Both algorithms stop once the retained history fits within this
+        # fraction of the budget, leaving room for several new turns before the
+        # next compression. Default 0.4 (40%); configurable via --compress-target.
+        self.compress_target = compress_target
+        # Fast mode: use the truncation algorithm and a smaller, faster system
+        # prompt. Set via the --fast command line flag.
+        self.fast = fast
 
         # Checked between steps and during command execution so the TUI can
         # halt the agent cleanly.
@@ -463,30 +472,32 @@ class AICommander:
         Keeps the system prompt (index 0) and first user instruction (index 1).
         Pass 1 condenses oversized tool outputs in-place, but only as many as
         needed; pass 2 drops the oldest messages from index 2 onwards. Both
-        stop once the retained history fits within ~60% of the budget, leaving
-        headroom so several new turns fit before the next compression.
+        stop once the retained history fits within ~{int(self.compress_target * 100)}% of the
+        budget, leaving headroom so several new turns fit before the next
+        compression.
         """
-        # Leave ~60% headroom (matching the context-compressor-llm algorithm)
-        # so the agent can run several more steps before re-triggering
+        # Leave ~{int(self.compress_target * 100)}% headroom (matching the context-compressor-llm
+        # algorithm) so the agent can run several more steps before re-triggering
         # compression. Truncating down to the FULL budget makes every following
         # prompt exceed the limit again and re-compress on each step, slowly
         # losing more history than necessary. Conversely, condensing EVERY tool
         # output to a placeholder collapses the context far below the target
         # (e.g. 22505 -> 1476 tokens) when tool outputs dominate, so pass 1
         # must condense only as many as needed to reach the target.
-        retained_target = max(1, int(budget * 0.6))
-        self._log(f"[COMPRESS] Using 'truncate' algorithm. Prompt length ({total_tokens} tokens) exceeds budget ({budget}). Retaining up to ~{retained_target} tokens ({int(budget * 0.6 / budget * 100)}% of budget). Compressing conversation history.", style="yellow")
+        retained_target = max(1, int(budget * self.compress_target))
+        self._log(f"[COMPRESS] Using 'truncate' algorithm. Prompt length ({total_tokens} tokens) exceeds budget ({budget}). Retaining up to ~{retained_target} tokens ({int(budget * self.compress_target / budget * 100)}% of budget). Compressing conversation history.", style="yellow")
 
-        # Pass 1: condense oversized tool outputs, largest first (most tokens
-        # saved per operation, so the fewest messages lose detail), stopping as
-        # soon as the history fits the retained target.
+        # Pass 1: condense oversized tool outputs, oldest first (the newest
+        # tool outputs are usually the most relevant to the current step, so
+        # we sacrifice the oldest detail first), stopping as soon as the
+        # history fits the retained target.
         oversized = [
             (i, msg) for i, msg in enumerate(self.conversation_history)
             if msg.get('role') == 'tool'
             and isinstance(msg.get('content'), str)
             and len(msg['content']) > 30
         ]
-        oversized.sort(key=lambda t: len(t[1]['content']), reverse=True)
+        oversized.sort(key=lambda t: t[0])  # oldest first
         for i, msg in oversized:
             if total_tokens <= retained_target:
                 break
@@ -614,6 +625,21 @@ Remember to not exceed 5000 characters, its very important that the summary to b
 """
 
 
+        # Include the system prompt and the ORIGINAL first user command so the
+        # summarizer knows the primary objective even when the evicted segment
+        # contains no user message (the first user instruction is preserved
+        # separately, outside the summarizable log). Without these, an evicted
+        # segment of only system/tool/assistant turns yields "No explicit user
+        # message is visible" and the summary loses track of the task.
+        sys_prompt = getattr(self, "_compress_system_prompt", None)
+        first_user = getattr(self, "_compress_first_user", None)
+        if sys_prompt:
+            prompt += ("\n\nSYSTEM PROMPT (the agent's operating instructions, kept verbatim "
+                       "and always present at the front of the context):\n" + sys_prompt)
+        if first_user is not None:
+            prompt += ("\n\nORIGINAL FIRST USER COMMAND (the primary objective the agent was "
+                       "initially asked to do; preserved verbatim outside the summarized log):\n["
+                       + first_user.get("role", "user") + "] " + str(first_user.get("content", "")))
 
         if previous_summary:
             prompt += "\n\nPrior summary (fold new information into it):\n" + previous_summary
@@ -666,6 +692,11 @@ Remember to not exceed 5000 characters, its very important that the summary to b
         system_prompt = None
         if self.conversation_history and self.conversation_history[0].get("role") == "system":
             system_prompt = self.conversation_history[0].get("content", "")
+        # Expose the system prompt and first user command to the LLM summarizer
+        # so it can anchor the summary to the agent's operating instructions and
+        # primary objective, even when the evicted segment carries no user message.
+        self._compress_system_prompt = system_prompt
+        self._compress_first_user = None
         # Preserve the FIRST user instruction (the original task) so the LLM
         # never forgets what it was initially asked to do. The "truncate"
         # algorithm always keeps the system prompt (index 0) and the first user
@@ -682,6 +713,9 @@ Remember to not exceed 5000 characters, its very important that the summary to b
                 break
         else:
             log = [m for m in self.conversation_history if m.get("role") != "system"]
+        # Hand the preserved first user command to the summarizer so it always
+        # knows the agent's primary objective.
+        self._compress_first_user = first_user
 
         # The compressor counts only the non-system log, so give it thresholds
         # derived from the ACTUAL log size (in the library's token scheme) rather
@@ -710,7 +744,7 @@ Remember to not exceed 5000 characters, its very important that the summary to b
         # must summarize again. The library also counts only content tokens, so
         # keeping clear of the budget absorbs the per-message/tool_calls overhead
         # that the trigger counts and the library does not.
-        t_retained = max(t_summary + 1, min(int(log_budget * 0.6),
+        t_retained = max(t_summary + 1, min(int(log_budget * self.compress_target),
                                             log_tokens_lib - 1))
         t_max = max(t_summary + 1, t_retained)
 
@@ -781,7 +815,13 @@ Remember to not exceed 5000 characters, its very important that the summary to b
                   style="yellow")
 
     def get_system_prompt(self) -> str:
-        """Get the system prompt for the LLM"""
+        """Get the system prompt for the LLM.
+
+        In fast mode (--fast) the shorter, faster get_fast_system_prompt() is
+        used instead of this full prompt.
+        """
+        if self.fast:
+            return self.get_fast_system_prompt()
         return f"""You are an expert planning and execution assistant. Fulfill the user's request by breaking it into manageable steps and executing bash commands via the execute_bash tool (one command at a time, waiting for each result).
 
 **Workflow:**
@@ -812,6 +852,27 @@ Remember to not exceed 5000 characters, its very important that the summary to b
 - Before emitting '{self.COMPLETION_MARKER}', verify your last actions (check file contents, run tests, confirm services).
 
 Think carefully; response quality is the highest priority. You have unlimited thinking tokens."""
+
+    def get_fast_system_prompt(self) -> str:
+        """A smaller, faster system prompt for --fast mode.
+
+        Keeps only the essential instructions needed for the agent to function:
+        the tool workflow, the completion marker, and the output-limit sentinel.
+        Removes the verbose persistence policy, internet-access recipe, PTY
+        notes, and the "think carefully" guidance to save tokens and latency.
+        """
+        return f"""You are an expert bash assistant. Complete the user's task by running commands via execute_bash, one at a time, and acting on each result.
+
+Workflow:
+- Break complex tasks into steps and track them.
+- If a step fails, fix it and retry.
+- When the task is fully done and verified, emit '{self.COMPLETION_MARKER}' and stop.
+
+Rules:
+- Output is capped at {self.max_output_bytes} bytes; if truncated the sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}` is appended. If you see it, you are missing data — do not assume success or failure; re-run a more targeted command.
+- Commands are killed after {self.command_timeout}s.
+- Only report conclusions from real tool output; never fabricate results.
+- Keep working until the task is genuinely complete; partial completion is not completion."""
 
     def execute_bash_command(self, command: str) -> Tuple[str, int]:
         """Execute a bash command in a PTY with timeout; return (output, exit_code)."""
@@ -1651,6 +1712,14 @@ def main():
                              "summarizer; falls back to truncate if the package "
                              "is missing); 'truncate' drops the oldest messages "
                              "and condenses tool outputs.")
+    parser.add_argument("--compress-target", type=float, default=0.4,
+                        help="Fraction of the prompt budget that context "
+                             "compression retains as headroom (default: 0.4, "
+                             "i.e. 40%%). Both algorithms stop once the retained "
+                             "history fits within this fraction of the budget.")
+    parser.add_argument("--fast", action="store_true",
+                        help="Fast mode: force the 'truncate' context-compression "
+                             "algorithm and use a smaller, faster system prompt.")
     parser.add_argument("request", nargs="*", help="Task request")
 
     args = parser.parse_args()
@@ -1688,7 +1757,10 @@ def main():
             debug=args.debug,
             sink=sink,
             max_steps=args.max_steps,
-            compress_algorithm=args.compress_alg
+            # --fast forces the faster 'truncate' algorithm and the shorter prompt.
+            compress_algorithm="truncate" if args.fast else args.compress_alg,
+            compress_target=args.compress_target,
+            fast=args.fast
         )
         try:
             user_request = " ".join(args.request)
@@ -2788,7 +2860,10 @@ def main():
                     sink=self.sink,
                     persist_history=True,
                     max_steps=self.args.max_steps,
-                    compress_algorithm=self.args.compress_alg
+                    # --fast forces the faster 'truncate' algorithm and the shorter prompt.
+                    compress_algorithm="truncate" if self.args.fast else self.args.compress_alg,
+                    compress_target=self.args.compress_target,
+                    fast=self.args.fast
                 )
             else:
                 # Reuse the agent (and its history); re-sync mutable state in

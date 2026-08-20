@@ -335,23 +335,26 @@ class TestRunner:
                    repr(c.conversation_history))
 
     def test_history_truncate_leaves_headroom(self):
-        # The truncate algorithm must leave ~60% headroom (retain ~60% of the
-        # budget), not fill the full window. Truncating to the FULL budget makes
-        # every following prompt exceed the limit again and re-compress on each
-        # step, slowly losing more history than necessary. Retaining ~60% lets
-        # the agent run several more steps before the next compression, matching
-        # the context-compressor-llm algorithm.
+        # The truncate algorithm must leave ~compress_target headroom (retain
+        # that fraction of the budget), not fill the full window. Truncating to
+        # the FULL budget makes every following prompt exceed the limit again
+        # and re-compress on each step, slowly losing more history than
+        # necessary. Retaining the target fraction lets the agent run several
+        # more steps before the next compression, matching the
+        # context-compressor-llm algorithm.
         c = self.make_commander(max_prompt_len=100, model="gpt-test",
                                 compress_algorithm="truncate")
         big = "A" * 500
         c.conversation_history = self._build_history("sys", "hello", [big, big, big, big])
         c._context_compress()
         total = sum(c._estimate_message_tokens(m) for m in c.conversation_history)
-        # Retained history must fit within ~60% of the budget, leaving headroom
-        # for new turns (while still preserving system + first user instruction).
-        self.check("truncate headroom: under 60% of budget",
-                   total <= int(100 * 0.6),
-                   f"total={total} budget=100 target={int(100*0.6)}")
+        # Retained history must fit within the compress_target fraction of the
+        # budget, leaving headroom for new turns (while still preserving system
+        # + first user instruction).
+        target = int(100 * c.compress_target)
+        self.check("truncate headroom: under target fraction of budget",
+                   total <= target,
+                   f"total={total} budget=100 target={target}")
         self.check("truncate headroom: system prompt preserved",
                    c.conversation_history[0]["role"] == "system",
                    repr(c.conversation_history[0]))
@@ -362,12 +365,12 @@ class TestRunner:
 
     def test_truncate_does_not_over_truncate_tool_outputs(self):
         # Pass 1 must condense tool outputs only as many as needed to reach the
-        # 60% target (largest first), NOT every oversized output. When tool
+        # target fraction (oldest first), NOT every oversized output. When tool
         # outputs dominate the history, condensing them ALL collapses the
         # context far below the target (e.g. 22505 -> 1476 tokens), wasting
         # useful detail. Here the budget can absorb most of the messages, so
         # several tool outputs must keep their full content while the total
-        # still lands within 60% of the budget.
+        # still lands within the target fraction of the budget.
         c = self.make_commander(max_prompt_len=1000, model="gpt-test",
                                 compress_algorithm="truncate")
         hist = [
@@ -383,8 +386,9 @@ class TestRunner:
                    total > 1000, f"total={total}")
         c._context_compress()
         final = sum(c._estimate_message_tokens(m) for m in c.conversation_history)
-        self.check("truncate no-over-truncate: within 60% of budget",
-                   final <= int(1000 * 0.6), f"final={final}")
+        target = int(1000 * c.compress_target)
+        self.check("truncate no-over-truncate: within target fraction of budget",
+                   final <= target, f"final={final}")
         # At least one tool message must keep its full content (not condensed
         # to the placeholder) because the budget can absorb it.
         full = [m for m in c.conversation_history
@@ -404,6 +408,32 @@ class TestRunner:
                    callable(getattr(c, "_compress_context_compressor_llm", None)))
         self.check("truncate dispatcher still exists",
                    callable(getattr(c, "_compress_truncate", None)))
+
+    def test_compress_target_configurable(self):
+        # The retained-headroom fraction is configurable via `compress_target`
+        # (default 0.4, i.e. 40%). A commander built with a custom target must
+        # retain only that fraction of the budget, not the hardcoded 0.6 used
+        # previously.
+        c = self.make_commander(max_prompt_len=100, model="gpt-test",
+                                compress_algorithm="truncate",
+                                compress_target=0.3)
+        self.check("compress_target default wiring",
+                   c.compress_target == 0.3, f"target={c.compress_target}")
+        big = "A" * 500
+        c.conversation_history = self._build_history("sys", "hello", [big, big, big, big])
+        c._context_compress()
+        total = sum(c._estimate_message_tokens(m) for m in c.conversation_history)
+        target = int(100 * c.compress_target)
+        self.check("compress_target: under custom fraction of budget",
+                   total <= target,
+                   f"total={total} budget=100 target={target}")
+
+    def test_compress_target_default(self):
+        # The default compress_target is 0.4 (40%), replacing the previous
+        # hardcoded 0.6 (60%).
+        c = self.make_commander(max_prompt_len=100, model="gpt-test")
+        self.check("compress_target default is 0.4",
+                   c.compress_target == 0.4, f"target={c.compress_target}")
 
     def test_explicit_algorithm_dispatch(self):
         # An explicit "truncate" selection is honored, and an unknown algorithm
@@ -830,6 +860,8 @@ def main():
     runner.test_history_truncate_leaves_headroom()
     runner.test_truncate_does_not_over_truncate_tool_outputs()
     runner.test_default_algorithm_is_context_compressor_llm()
+    runner.test_compress_target_configurable()
+    runner.test_compress_target_default()
     runner.test_explicit_algorithm_dispatch()
     runner.test_context_compressor_llm()
     runner.test_prompt_budget_reserves_output()
