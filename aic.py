@@ -26,6 +26,40 @@ from datetime import datetime
 from openai import OpenAI
 
 try:
+    from importlib.metadata import version as _pkg_version
+    _OPENAI_VERSION = _pkg_version("openai")
+except Exception:
+    _OPENAI_VERSION = None
+
+
+def _check_openai_version() -> None:
+    """Warn (and hard-fail in TUI mode) when the installed `openai` package
+    is older than the minimum required by requirements.txt (>=2.0.0).
+
+    The v2 SDK changed the API surface (e.g. `client.responses`, `client.chat`)
+    in incompatible ways, so running against an old version silently breaks
+    function calling. We surface a clear message instead of an obscure traceback.
+    """
+    if not _OPENAI_VERSION:
+        # Can't determine the version (e.g. editable/odd install); skip check.
+        return
+    try:
+        major = int(_OPENAI_VERSION.split(".")[0])
+    except (ValueError, IndexError):
+        return
+    if major >= 2:
+        return
+    msg = (
+        f"AI-Commander requires the openai package >=2.0.0 but found "
+        f"{_OPENAI_VERSION} installed. Please upgrade: "
+        f"pip install --upgrade 'openai>=2.0.0'"
+    )
+    if _TEXTUAL_AVAILABLE:
+        raise SystemExit(f"ERROR: {msg}")
+    print(f"ERROR: {msg}", file=sys.stderr)
+    exit(0)
+
+try:
     # context-compressor-llm provides the Factory.ai-style anchored-summary
     # incremental compression algorithm used by the "context-compressor-llm"
     # algorithm. Optional: when absent, that algorithm falls back to truncate.
@@ -1697,6 +1731,7 @@ def enable_sandbox() -> Tuple[bool, str]:
 
 def main():
     """Main entry point"""
+    _check_openai_version()
     parser = argparse.ArgumentParser(description="AI-Commander - a ralph-loop AI agent")
     parser.add_argument("--api-base", required=True, help="API base URL")
     parser.add_argument("--model", required=True, help="Model name")
