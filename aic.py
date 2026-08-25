@@ -704,6 +704,7 @@ Remember to not exceed 5000 characters, its very important that the summary to b
                 use_tools=False,
                 stream_display=False,
                 stream_label="[SESSION SUMMARY]",
+                enable_thinking=False,
             )
             msg = response.get("choices", [{}])[0].get("message", {})
             summary = msg.get("content") or ""
@@ -1123,7 +1124,8 @@ Rules:
 
     def call_llm_api(self, messages: List[Dict[str, str]], use_tools: bool = True,
                      stream_display: bool = True,
-                     stream_label: Optional[str] = None) -> Dict[str, Any]:
+                     stream_label: Optional[str] = None,
+                     enable_thinking: bool = True) -> Dict[str, Any]:
         """Call the LLM API using the OpenAI client with streaming support.
 
         When ``stream_display`` is True (default) the streamed content is echoed
@@ -1132,7 +1134,10 @@ Rules:
         their output is routed to the console output pane via ``CONSOLE_STREAM``
         instead of appearing as if the agent were speaking. ``stream_label``, when
         given, is prepended once at the start of the stream (used to tag internal
-        output such as ``[SESSION SUMMARY]``).
+        output such as ``[SESSION SUMMARY]``). ``enable_thinking`` controls
+        whether the model's reasoning/thinking mode is active (default True);
+        pass False for easy internal calls like the summarizer to skip
+        thinking tokens and reduce latency.
         """
         messages = self._validate_messages(messages)
 
@@ -1168,7 +1173,7 @@ Rules:
         request_params["stream_options"] = {"include_usage": True}
         if "gpt" not in self.model:  # OpenAI rejects these extra params
             request_params["max_tokens"] = self.max_tokens
-            request_params['extra_body'] = {"chat_template_kwargs": {"enable_thinking": True}}
+            request_params['extra_body'] = {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
 
         if use_tools:
             request_params["tools"] = self.tool_schemas
