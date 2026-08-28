@@ -794,6 +794,343 @@ class TestRunner:
     # 5. Live integration tests (network)                                #
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    # 4b. Session persistence (.aicsession JSON file)                    #
+    # ------------------------------------------------------------------ #
+
+    def _session_commander(self, tmpdir, name=".aicsession", **overrides):
+        """AICommander wired to a session file inside a throwaway directory."""
+        path = os.path.join(tmpdir, name)
+        c = self.make_commander(session_file=path, **overrides)
+        return c, path
+
+    def test_session_save_writes_json(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            c, path = self._session_commander(tmp)
+            c.conversation_history = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "call_0", "type": "function",
+                     "function": {"name": "execute_bash",
+                                  "arguments": "{\"command\": \"ls\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_0", "content": "file.txt"},
+            ]
+            self.check("session: save_session reports success", c.save_session("unit_test"))
+            self.check("session: file created", os.path.exists(path), path)
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            try:
+                data = json.loads(raw)
+            except ValueError as e:
+                self.check("session: file is valid JSON", False, str(e))
+                return
+            self.check("session: file is valid JSON", True)
+            self.check("session: version recorded",
+                       data.get("aic_session_version") == aic._SESSION_VERSION, repr(data.get("aic_session_version")))
+            self.check("session: reason recorded", data.get("reason") == "unit_test")
+            self.check("session: messages saved verbatim",
+                       data.get("messages") == c.conversation_history,
+                       repr(data.get("messages"))[:200])
+            self.check("session: human-readable (indented) JSON", "\n  \"messages\"" in raw, raw[:120])
+            self.check("session: no temp files left behind",
+                       not [f for f in os.listdir(tmp) if ".tmp." in f], os.listdir(tmp))
+
+    def test_session_round_trip(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            c, path = self._session_commander(tmp)
+            history = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "task"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_9", "type": "function",
+                     "function": {"name": "execute_bash",
+                                  "arguments": "{\"command\": \"echo hi\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_9", "content": "hi"},
+                {"role": "user", "content": "and now?"},
+            ]
+            c.conversation_history = [dict(m) for m in history]
+            c.usage_totals = {"input_tokens": 11, "output_tokens": 22,
+                              "cached_tokens": 3, "billable_tokens": 30}
+            c.step_count = 7
+            c.save_session("unit_test")
+
+            c2, _ = self._session_commander(tmp)
+            self.check("session reload: reports restored", c2.load_session(notify=False))
+            self.check("session reload: complete history restored exactly",
+                       c2.conversation_history == history, repr(c2.conversation_history)[:300])
+            self.check("session reload: session id restored",
+                       c2.session_id == c.session_id, f"{c2.session_id} != {c.session_id}")
+            self.check("session reload: step count restored", c2.step_count == 7, str(c2.step_count))
+            self.check("session reload: usage totals restored",
+                       c2.usage_totals == {"input_tokens": 11, "output_tokens": 22,
+                                           "cached_tokens": 3, "billable_tokens": 30},
+                       repr(c2.usage_totals))
+
+    def test_session_picks_up_external_edits(self):
+        """The messages array is re-read from disk, so hand edits take effect."""
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            c, path = self._session_commander(tmp)
+            c.conversation_history = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "original"},
+            ]
+            c.save_session("unit_test")
+
+            # Edit the session the way a user would: open, change messages, save.
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data["messages"][1]["content"] = "edited by hand"
+            data["messages"].append({"role": "user", "content": "injected turn"})
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+
+            c2, _ = self._session_commander(tmp)
+            self.check("session edits: reload succeeds", c2.load_session(notify=False))
+            self.check("session edits: edited content loaded",
+                       c2.conversation_history[1]["content"] == "edited by hand",
+                       repr(c2.conversation_history)[:300])
+            self.check("session edits: appended turn loaded",
+                       any(m.get("content") == "injected turn" for m in c2.conversation_history),
+                       repr(c2.conversation_history)[:300])
+            self.check("session edits: history ready for the API",
+                       c2._validate_messages(c2.conversation_history) != [],
+                       "validation returned empty")
+
+            # Deleting a turn on disk is honoured too (fewer messages after reload).
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            del data["messages"][1]
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            c3, _ = self._session_commander(tmp)
+            self.check("session edits: deleted turn stays deleted",
+                       c3.load_session(notify=False)
+                       and not any(m.get("content") == "edited by hand"
+                                   for m in c3.conversation_history),
+                       repr(c3.conversation_history)[:300])
+
+    def test_session_bare_array_and_repair(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".aicsession")
+            # A bare messages array, a tool message with no matching call, and a
+            # trailing assistant message: all repaired on load.
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([
+                    {"role": "user", "content": "hello"},
+                    {"role": "tool", "tool_call_id": "nope", "content": "orphan"},
+                    {"role": "assistant", "content": "dangling"},
+                ], f)
+            c, _ = self._session_commander(tmp)
+            self.check("session repair: bare array loaded", c.load_session(notify=False))
+            roles = [m.get("role") for m in c.conversation_history]
+            self.check("session repair: system prompt prepended", roles[0] == "system", str(roles))
+            self.check("session repair: orphan tool message dropped", "tool" not in roles, str(roles))
+            self.check("session repair: dangling assistant turn dropped",
+                       roles[-1] != "assistant", str(roles))
+
+    def test_session_closes_unanswered_tool_call(self):
+        """A crash right after an assistant tool call still reloads cleanly."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            c, path = self._session_commander(tmp)
+            c.conversation_history = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "run it"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "call_x", "type": "function",
+                     "function": {"name": "execute_bash",
+                                  "arguments": "{\"command\": \"rm -rf /\"}"}}]},
+            ]
+            c.save_session("assistant_message")
+
+            c2, _ = self._session_commander(tmp)
+            self.check("session recovery: reload succeeds", c2.load_session(notify=False))
+            last = c2.conversation_history[-1]
+            self.check("session recovery: tool result synthesized",
+                       last.get("role") == "tool" and last.get("tool_call_id") == "call_x",
+                       repr(last)[:200])
+            self.check("session recovery: notice says the command was not re-run",
+                       "NOT re-executed" in (last.get("content") or ""), repr(last)[:200])
+            self.check("session recovery: history still ends ready for the API",
+                       c2._validate_messages(c2.conversation_history) != [], "validation returned empty")
+
+    def test_session_corrupt_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".aicsession")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"messages": [ {"role": "user" ')  # truncated write
+            c, _ = self._session_commander(tmp)
+            self.check("session corrupt: load reports failure", not c.load_session(notify=False))
+            self.check("session corrupt: original empty (no partial parse)",
+                       c.conversation_history == [])
+            backups = [f for f in os.listdir(tmp) if ".corrupt." in f]
+            self.check("session corrupt: bad file preserved as backup", len(backups) == 1,
+                       os.listdir(tmp))
+            # A fresh save still works afterwards.
+            c.conversation_history = [{"role": "system", "content": "s"},
+                                      {"role": "user", "content": "u"}]
+            self.check("session corrupt: usable after recovery", c.save_session("unit_test"))
+
+    def test_session_missing_file_is_quiet(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            c, path = self._session_commander(tmp)
+            self.check("session missing: load returns False", not c.load_session(notify=False))
+            self.check("session missing: nothing created", not os.path.exists(path))
+
+    def test_session_disabled_without_path(self):
+        c = self.make_commander()  # session_file defaults to ""
+        self.check("session disabled: save is a no-op", not c.save_session("unit_test"))
+        self.check("session disabled: load is a no-op", not c.load_session(notify=False))
+
+    def test_session_written_during_run(self):
+        """run() mirrors history to disk after each step, tool result included."""
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".aicsession")
+            c, _fake = self.make_fake_commander(
+                script=[
+                    [
+                        fake_openai.tool_call_chunk(0, id="call_1", name="execute_bash",
+                                                    arguments='{"command": "echo seeded"}'),
+                        fake_openai.usage_chunk(20, 5),
+                    ],
+                    [
+                        fake_openai.content_chunk("all done TASKCOMPLETE"),
+                        fake_openai.usage_chunk(30, 4),
+                    ],
+                ],
+                session_file=path,
+            )
+            c.run("do the thing")
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            saved = data.get("messages")
+            self.check("session run: file matches final history exactly",
+                       saved == c.conversation_history,
+                       f"saved={len(saved) if saved else 0} live={len(c.conversation_history)}")
+            self.check("session run: tool output captured",
+                       any("seeded" in (m.get("content") or "") for m in saved if isinstance(m, dict)),
+                       repr(saved)[:300])
+            self.check("session run: step recorded", data.get("step_count") == c.step_count,
+                       f"{data.get('step_count')} vs {c.step_count}")
+            self.check("session run: usage accumulated",
+                       data.get("usage", {}).get("input_tokens") == 50, repr(data.get("usage")))
+
+            # Simulated crash: the command dies mid-flight (SystemExit is not
+            # caught by the loop's error handling), so the file must end on the
+            # unanswered tool call rather than losing the turn.
+            path2 = os.path.join(tmp, "crash.aicsession")
+            c2, _fake2 = self.make_fake_commander(
+                script=[[
+                    fake_openai.tool_call_chunk(0, id="call_2", name="execute_bash",
+                                                arguments='{"command": "sleep 999"}'),
+                    fake_openai.usage_chunk(20, 5),
+                ]],
+                session_file=path2,
+            )
+
+            def _die(command):
+                # Hard kill while the command runs: no tool result is recorded.
+                raise SystemExit(9)
+
+            c2.execute_bash_command = _die
+            try:
+                c2.run("hang forever")
+            except SystemExit:
+                pass
+            with open(path2, "r", encoding="utf-8") as f:
+                crashed = json.load(f)["messages"]
+            self.check("session crash: assistant tool call preserved",
+                       crashed[-1].get("role") == "assistant"
+                       and bool(crashed[-1].get("tool_calls")),
+                       repr(crashed[-1])[:200])
+            c3, _ = self._session_commander(tmp, name="crash.aicsession")
+            self.check("session crash: reload succeeds", c3.load_session(notify=False))
+            self.check("session crash: full pre-crash history restored",
+                       len(c3.conversation_history) == len(crashed) + 1,
+                       f"{len(c3.conversation_history)} vs {len(crashed)}")
+
+    def test_session_discard(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            c, path = self._session_commander(tmp)
+            c.conversation_history = [{"role": "system", "content": "s"},
+                                      {"role": "user", "content": "u"}]
+            c.save_session("unit_test")
+            c.discard_session()
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.check("session discard: file emptied", data.get("messages") == [], repr(data)[:200])
+            c2, _ = self._session_commander(tmp)
+            self.check("session discard: nothing to restore", not c2.load_session(notify=False))
+
+    def test_session_instance_locking(self):
+        """A second live instance in the same directory shifts to .aicsession2."""
+        import subprocess
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            first, n1 = aic.acquire_session_file(os.path.join(tmp, ".aicsession"))
+            self.check("session lock: first instance takes the default name",
+                       first == os.path.join(tmp, ".aicsession") and n1 == 1, f"{first} n={n1}")
+            second, n2 = aic.acquire_session_file(os.path.join(tmp, ".aicsession"))
+            self.check("session lock: second instance shifts to .aicsession2",
+                       second == os.path.join(tmp, ".aicsession2") and n2 == 2, f"{second} n={n2}")
+            third, n3 = aic.acquire_session_file(os.path.join(tmp, ".aicsession"))
+            self.check("session lock: third instance shifts to .aicsession3",
+                       third == os.path.join(tmp, ".aicsession3") and n3 == 3, f"{third} n={n3}")
+            self.check("session lock: lock files written",
+                       os.path.exists(first + ".lock"), os.listdir(tmp))
+
+            # Cross-process: a holder in another live process pushes the next
+            # instance onto the numbered fallback, and the name is free again
+            # once that process is gone (the kernel drops the flock), so a
+            # crashed run can never block the default name forever.
+            with tempfile.TemporaryDirectory() as tmp2:
+                base = os.path.join(tmp2, ".aicsession")
+                holder = subprocess.Popen(
+                    [sys.executable, "-c",
+                     "import sys, time; sys.path.insert(0, %r); import aic;"
+                     "p, _ = aic.acquire_session_file(%r);"
+                     "print(p, flush=True); time.sleep(5)"
+                     % (os.path.dirname(aic.__file__), base)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                try:
+                    held = holder.stdout.readline().strip()
+                    self.check("session lock: separate process holds the default name",
+                               held == base, f"holder said {held!r}")
+                    blocked, nb = aic.acquire_session_file(base)
+                    self.check("session lock: foreign holder shifts the next instance",
+                               blocked == base + "2" and nb == 2, f"{blocked} n={nb}")
+                finally:
+                    holder.kill()
+                    holder.wait(timeout=30)
+                back, nb2 = aic.acquire_session_file(base)
+                self.check("session lock: name reusable after holder exits",
+                           back == base and nb2 == 1, f"{back} n={nb2}")
+
+            # An explicit --session path bypasses the default-name dance.
+            custom, nc = aic.acquire_session_file(os.path.join(tmp, "my-session.json"))
+            self.check("session lock: explicit path honoured",
+                       custom == os.path.join(tmp, "my-session.json") and nc == 1, custom)
+
+    # ------------------------------------------------------------------ #
+    # 5. Live integration tests (network)                                #
+    # ------------------------------------------------------------------ #
+
     def test_live_call_llm(self):
         c = self.make_commander()
         msgs = [
@@ -878,6 +1215,17 @@ def main():
     runner.test_call_llm_api_emits_estimate_then_exact()
     runner.test_call_llm_api_streams_thinking_and_tool_calls()
     runner.test_context_counter_after_full_loop()
+    runner.test_session_save_writes_json()
+    runner.test_session_round_trip()
+    runner.test_session_picks_up_external_edits()
+    runner.test_session_bare_array_and_repair()
+    runner.test_session_closes_unanswered_tool_call()
+    runner.test_session_corrupt_file()
+    runner.test_session_missing_file_is_quiet()
+    runner.test_session_disabled_without_path()
+    runner.test_session_written_during_run()
+    runner.test_session_discard()
+    runner.test_session_instance_locking()
 
     if not args.skip_live:
         print("\n=== Live integration tests (network) ===")

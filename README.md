@@ -36,6 +36,11 @@ It supports two presentation modes:
   - [The `truncate` algorithm](#the-truncate-algorithm)
   - [The `context-compressor-llm` algorithm](#the-context-compressor-llm-algorithm)
   - [Choosing an algorithm](#choosing-an-algorithm)
+- [Session persistence](#session-persistence)
+  - [The session file format](#the-session-file-format)
+  - [Editing a session by hand](#editing-a-session-by-hand)
+  - [Multiple instances in one directory](#multiple-instances-in-one-directory)
+  - [Crash recovery semantics](#crash-recovery-semantics)
 - [Sandboxing (Linux)](#sandboxing-linux)
 - [Fast mode](#fast-mode)
 - [Debugging](#debugging)
@@ -62,6 +67,9 @@ It supports two presentation modes:
 - **Two presentation modes** — full TUI or plain CLI (`--nogui`).
 - **Prompt history** — readline-style history with reverse incremental search
   (Ctrl+R) in the TUI.
+- **Session persistence** — the complete conversation history is mirrored to a
+  hand-editable JSON file (`.aicsession`) after every step and reloaded on every
+  startup, so a crash or Ctrl+C loses nothing already produced.
 
 ---
 
@@ -119,6 +127,8 @@ panel. In `--nogui` mode a request is required on the command line.
 | `--max-steps` | Maximum number of agent loop steps before stopping (default: `500`). |
 | `--debug` | Enable debug mode (dump conversation history on truncation). |
 | `--nogui` | Run in direct CLI mode without TUI (original behaviour). |
+| `--session` | Session file mirroring the conversation history (default: `./.aicsession`). |
+| `--no-session` | Disable session persistence (nothing is written or loaded). |
 | `--disable-sandbox` | Disable the OS-level Landlock sandbox (Linux only). |
 | `--compress-alg` | Context-compression algorithm (`context-compressor-llm` or `truncate`). |
 | `--compress-target` | Fraction of the prompt budget retained as headroom (default: `0.4`). |
@@ -200,7 +210,9 @@ are **not** added to prompt history):
 | `/approve` | — | Approve the currently pending command. |
 | `/reject` | — | Reject the currently pending command. |
 | `/suggest <text>` | — | Reject the pending command **with a steering suggestion** that is fed back to the agent (e.g. `/suggest use a different approach`). |
-| `/clear` | `/new` | Clear the conversation history and start a fresh session (resets tokens, step count, and session id). |
+| `/clear` | `/new` | Clear the conversation history and start a fresh session (resets tokens, step count, and session id). The session file is emptied too, so nothing is resurrected on the next startup. |
+| `/session` | — | Show the session file, session id, instance number, and what is currently saved on disk. |
+| `/reload` | — | Re-read the session file, picking up edits made to its `messages` array outside AI-Commander (requires a stopped agent). |
 | `/stop` | — | Stop the running agent. |
 | `/quit` | `/exit` | Stop the agent and exit the application. |
 
@@ -322,6 +334,132 @@ back to `truncate`.
 Use `--compress-target` to control how much headroom is retained (default
 `0.4` = 40%). A higher value keeps more history but triggers compression sooner;
 a lower value compresses harder but loses more context.
+
+---
+
+## Session persistence
+
+AI-Commander mirrors the **complete conversation history** to a JSON file and
+reloads it on every startup, so nothing already produced is lost to a crash, a
+`kill`, a closed terminal, or `Ctrl+C`.
+
+- **Where** — `.aicsession` in the current working directory by default;
+  override with `--session <path>` or turn persistence off with
+  `--no-session`. Because the file lives in the working directory, it stays
+  writable inside the Landlock sandbox.
+- **When it is written** — after the user request, before every LLM call, right
+  after each assistant turn, after every tool result, and again on exit
+  (`atexit` plus `SIGTERM`/`SIGHUP` handlers). Writes are atomic
+  (temp file → `fsync` → `os.replace`), so the file is never half-written.
+- **What is reloaded** — the message history verbatim, plus the session id,
+  step count, and cumulative token usage. `--nogui` resumes the conversation
+  where the previous run stopped; the TUI restores history at startup and shows
+  the session file in the status bar.
+- **A corrupt file is never destroyed** — unparseable JSON is moved to
+  `.aicsession.corrupt.<timestamp>` and the run starts clean.
+
+The status line at startup reports what happened, e.g.
+`[SESSION] Persisting session to /project/.aicsession` or
+`[SESSION] Restored 14 message(s) from .aicsession (session 20260828_134851, step 4)`.
+
+### The session file format
+
+Plain, indented, UTF-8 JSON — deliberately simple enough to read and edit:
+
+```json
+{
+  "aic_session_version": 1,
+  "session_id": "20260828_134851",
+  "updated_at": "2026-08-28T13:52:58",
+  "reason": "tool_result",
+  "model": "gpt-4o",
+  "api_base": "https://api.example.com/v1",
+  "cwd": "/home/me/project",
+  "instance_number": 1,
+  "step_count": 4,
+  "usage": {
+    "input_tokens": 5321,
+    "output_tokens": 812,
+    "cached_tokens": 4096,
+    "billable_tokens": 2037
+  },
+  "messages": [
+    { "role": "system", "content": "You are an expert planning..." },
+    { "role": "user", "content": "summarize this repo" },
+    { "role": "assistant", "content": null, "tool_calls": [
+      { "id": "call_1", "type": "function",
+        "function": { "name": "execute_bash",
+                      "arguments": "{\"command\": \"ls\"}" } } ] },
+    { "role": "tool", "tool_call_id": "call_1", "content": "aic.py\nREADME.md" }
+  ]
+}
+```
+
+`messages` is the raw OpenAI message list, saved **exactly** as the agent holds
+it (same roles, `tool_calls`, and `tool_call_id`s). `reason` records which
+checkpoint produced the file (`user_request`, `before_llm_call`,
+`assistant_message`, `tool_result`, `loop_terminated`, `process_exit`,
+`signal_15`, `interrupted`, `cleared`, …), which makes it easy to tell where a
+crashed run stopped.
+
+### Editing a session by hand
+
+Because the `messages` array is stored verbatim, a session can be reshaped with
+any text editor or JSON tool:
+
+```bash
+# drop the last 6 turns, then resume
+python3 - <<'EOF'
+import json
+d = json.load(open(".aicsession"))
+d["messages"] = d["messages"][:-6]
+json.dump(d, open(".aicsession", "w"), indent=2)
+EOF
+python3 aic.py --api-base ... "continue from here"
+```
+
+- Change, insert, or delete turns; edits are picked up on the next startup, or
+  immediately inside the TUI with `/reload`.
+- A **bare JSON array** of messages is accepted in place of the full object, so
+  you can paste a transcript straight into the file.
+- Invalid content is repaired rather than rejected: a missing system prompt is
+  prepended, orphan `tool` messages are dropped, and a trailing assistant turn
+  with no tool calls is removed (the API rejects prompts ending on an assistant
+  turn). Each repair is reported so nothing changes silently.
+- If the file ended on an assistant turn that **did** issue tool calls (the
+  process died mid-command), the tool calls are answered with a
+  `[SESSION RECOVERED]` notice stating the command was **not** re-executed — the
+  agent is told not to assume it had any effect, rather than replaying it.
+
+### Multiple instances in one directory
+
+Each process claims its session file with an `flock` on a sidecar
+`.aicsession.lock` (the data file itself is atomically replaced, so the lock
+lives beside it). Launching a second AI-Commander in the same directory warns
+and shifts to a numbered file instead of clobbering the first:
+
+```
+[SESSION] WARNING: another AI-Commander instance is already using .aicsession
+          in this directory; this instance uses .aicsession2 instead (instance 2)
+```
+
+Third instance → `.aicsession3`, and so on. The lock is released by the kernel
+when a process exits or dies, so a crashed run can never permanently squatter a
+name. `--session <path>` participates in the same numbering
+(`<path>2`, `<path>3`, …).
+
+### Crash recovery semantics
+
+| Failure | What the file holds | On restart |
+| ------- | ------------------- | ---------- |
+| `Ctrl+C` / unhandled exception | History through the last completed step, re-saved in `finally` | Resumed verbatim |
+| `kill` / terminal closed | Same, via the `SIGTERM`/`SIGHUP` handlers | Resumed verbatim |
+| `kill -9` / power loss / segfault | Everything up to the last completed assistant turn or tool result | Resumed; an in-flight tool call is closed with a "not re-executed" notice |
+| Hand-broken JSON | Previous good file kept, bad copy saved as `.corrupt.*` | Starts clean |
+
+At most the single in-flight turn — never earlier history — can be missing, and
+the only thing never replayed automatically is a shell command that had not
+finished when the process died.
 
 ---
 

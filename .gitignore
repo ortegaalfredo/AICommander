@@ -37,6 +37,13 @@ htmlcov/
 # Debug artifacts
 commander-debug.txt
 
+# Session files (mirrored conversation history, reloaded on startup)
+.aicsession
+.aicsession[0-9]*
+.aicsession*.lock
+.aicsession*.tmp.*
+.aicsession*.corrupt.*
+
 # ---------------------------------------------------------------------------
 # Editors / OS
 # ---------------------------------------------------------------------------

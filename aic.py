@@ -7,6 +7,7 @@ either presentation.
 """
 
 import argparse
+import atexit
 import json
 import sys
 import time
@@ -151,6 +152,117 @@ def _rl_save_history() -> None:
             _rl.write_history_file(_HISTORY_FILE)
         except Exception:
             pass
+
+
+# --- Session persistence --------------------------------------------------
+# The conversation history is mirrored to a JSON file after every step, so a
+# crash, Ctrl+C or a killed terminal loses at most the in-flight turn: the next
+# startup reloads the complete message history exactly as it was (including the
+# tool results captured before the tool call that was never re-run).
+#
+# The file is plain, human-editable JSON (indent=2, UTF-8):
+#
+#   {
+#     "aic_session_version": 1,
+#     "session_id": "20260828_041500",
+#     "updated_at": "2026-08-28T07:40:00",   # last write
+#     "reason": "tool_result",               # what triggered the last write
+#     "model": "...", "api_base": "...", "cwd": "...",
+#     "step_count": 12,                      # last completed agent step
+#     "usage": { "input_tokens": 0, "output_tokens": 0,
+#                "cached_tokens": 0, "billable_tokens": 0 },
+#     "messages": [ ...verbatim OpenAI message dicts... ]
+#   }
+#
+# Concurrent instances: each running process holds an flock on
+# "<session file>.lock". The kernel drops the lock when the process dies for
+# any reason, so a crashed run never leaves a stale lock behind. When a second
+# instance is launched in the same directory it detects the held lock, warns
+# and takes ".aicsession2", ".aicsession3", ... instead of clobbering the first
+# session.
+_SESSION_BASENAME = ".aicsession"
+_SESSION_LOCK_SUFFIX = ".lock"
+_SESSION_VERSION = 1
+# Lock fds are kept open for the whole process lifetime (closing one would
+# release the lock). They are FD_CLOEXEC so children spawned by execute_bash
+# never inherit them and keep a lock alive after the agent exits.
+_SESSION_LOCK_FDS: List[int] = []
+
+
+def _acquire_instance_lock(session_path: str) -> Optional[int]:
+    """Non-blocking exclusive flock on ``<session_path>.lock``.
+
+    Returns the open fd (kept open for the process lifetime) on success, or
+    None when another live AI-Commander instance already owns it.
+    """
+    try:
+        fd = os.open(session_path + _SESSION_LOCK_SUFFIX,
+                     os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return None
+    try:
+        os.set_inheritable(fd, False)
+    except OSError:
+        pass
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    # Record the owner for diagnostics only; the lock itself is the truth.
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()}\n".encode())
+        os.fsync(fd)
+    except OSError:
+        pass
+    _SESSION_LOCK_FDS.append(fd)
+    return fd
+
+
+def acquire_session_file(session_path: Optional[str] = None) -> Tuple[str, int]:
+    """Reserve this process's session file; returns ``(path, instance_number)``.
+
+    Prefers *session_path* (default ``<cwd>/.aicsession``). When that file is
+    already held by another live instance, ``<path>2``, ``<path>3`` ... are
+    tried in order, so multiple AI-Commander processes can share a directory
+    without overwriting each other's sessions. An empty path means persistence
+    could not be set up at all and should be treated as disabled.
+    """
+    base = (os.path.abspath(os.path.expanduser(session_path))
+            if session_path else os.path.join(os.getcwd(), _SESSION_BASENAME))
+    for instance in range(1, 1000):
+        candidate = base if instance == 1 else f"{base}{instance}"
+        if _acquire_instance_lock(candidate) is not None:
+            return candidate, instance
+    return "", 0
+
+
+def read_session_file(path: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Load a session file, returning ``(data, error)``.
+
+    A missing file yields ``(None, None)`` (a fresh start, not an error);
+    unreadable or malformed JSON yields ``(None, error_message)``.
+
+    A bare JSON array is accepted too (the file reduced to just its messages),
+    so a hand-written ``[{"role": ...}, ...]`` file reloads as a session.
+    """
+    if not path:
+        return None, None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, f"{exc}"
+    except ValueError as exc:
+        return None, f"invalid JSON: {exc}"
+    if isinstance(data, list):
+        return {"messages": data}, None
+    if not isinstance(data, dict):
+        return None, "session file is neither a JSON object nor an array"
+    return data, None
 
 
 class colors:
@@ -331,7 +443,8 @@ class AICommander:
                   compress_algorithm: str = "context-compressor-llm",
                   compress_target: float = 0.4, fast: bool = False,
                   reasoning_effort: Optional[str] = None,
-                  sandbox_enabled: bool = False, sandbox_write_dir: str = ""):
+                  sandbox_enabled: bool = False, sandbox_write_dir: str = "",
+                  session_file: str = "", instance_number: int = 1):
         self.base_url = api_base.rstrip('/')
         self.model = model
         self.api_key = api_key
@@ -372,6 +485,21 @@ class AICommander:
         # rules were applied). Surfaced in the system prompt so the agent knows
         # the exact path it may write to.
         self.sandbox_write_dir = sandbox_write_dir
+        # JSON file mirroring the conversation history (see save_session).
+        # An empty string disables persistence. The file is owned by this
+        # process through an flock, so a second instance in the same directory
+        # takes .aicsession2, .aicsession3, ... instead of overwriting.
+        self.session_file = session_file
+        self.instance_number = instance_number
+        # Last completed step of the current run; stored in the session file so
+        # a resumed session shows where it stopped.
+        self.step_count = 0
+        # Cumulative exact token usage reported by the server (see
+        # call_llm_api); persisted so a resumed session keeps its totals.
+        self.usage_totals = {"input_tokens": 0, "output_tokens": 0,
+                             "cached_tokens": 0, "billable_tokens": 0}
+        # Serializes session writes (the agent loop and atexit both save).
+        self._session_write_lock = threading.Lock()
 
         # Checked between steps and during command execution so the TUI can
         # halt the agent cleanly.
@@ -447,6 +575,198 @@ class AICommander:
     def _estimate_input_tokens(self, messages: List[Dict[str, Any]]) -> int:
         """Rough input-token estimate for the live "context" counter."""
         return sum(self._estimate_message_tokens(msg) for msg in messages)
+
+    # --- Session persistence ----------------------------------------------
+
+    def session_snapshot(self, reason: str = "") -> Dict[str, Any]:
+        """Build the JSON document written to the session file.
+
+        ``messages`` is the live conversation history verbatim (no reshaping,
+        no truncation), which keeps the file both a faithful crash snapshot and
+        a hand-editable session definition.
+        """
+        return {
+            "aic_session_version": _SESSION_VERSION,
+            "session_id": self.session_id,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "reason": reason,
+            "model": self.model,
+            "api_base": self.base_url,
+            "cwd": os.getcwd(),
+            "instance_number": self.instance_number,
+            "step_count": self.step_count,
+            "usage": dict(self.usage_totals),
+            "messages": self.conversation_history,
+        }
+
+    def save_session(self, reason: str = "") -> bool:
+        """Mirror the current conversation history to ``self.session_file``.
+
+        Called after every state-changing step of the agent loop (and at exit),
+        so an abnormal termination loses at most the in-flight turn. The write
+        is atomic: the document goes to a temp file that is fsynced and then
+        ``os.replace``d over the target, so a crash mid-write cannot leave a
+        partially written session. Failures never propagate — persistence must
+        not break the agent — and are only surfaced in debug mode.
+        """
+        if not self.session_file:
+            return False
+        payload = self.session_snapshot(reason)
+        tmp = f"{self.session_file}.tmp.{os.getpid()}"
+        try:
+            with self._session_write_lock:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.session_file)
+            return True
+        except Exception as exc:
+            if self.debug:
+                self._log(f"[SESSION] Could not save {self.session_file}: {exc}", style="yellow")
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+
+    def _repair_loaded_history(self, messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Make a loaded message list safe to send back to the API.
+
+        Applied on top of the (verbatim, possibly hand-edited) messages array:
+        non-dict entries and unknown roles are dropped, orphan ``tool``
+        messages are dropped, index 0 is forced to a system prompt, trailing
+        assistant messages without tool calls are removed, and tool calls left
+        dangling by an interrupted run get a synthetic tool result so the API
+        accepts the resumed conversation. Returns the repaired list plus notes
+        describing each change (surfaced to the user).
+        """
+        notes: List[str] = []
+        cleaned: List[Dict[str, Any]] = []
+        known_tool_call_ids = set()
+        for msg in messages:
+            if not isinstance(msg, dict):
+                notes.append("dropped a non-object message entry")
+                continue
+            role = msg.get("role")
+            if role not in ("system", "user", "assistant", "tool", "developer", "function"):
+                notes.append(f"dropped a message with invalid role {role!r}")
+                continue
+            if role == "tool":
+                tcid = msg.get("tool_call_id")
+                if not tcid or tcid not in known_tool_call_ids:
+                    notes.append("dropped a tool message without a matching tool call")
+                    continue
+            if role == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        known_tool_call_ids.add(tc["id"])
+            cleaned.append(msg)
+
+        # A prompt must start with the system message; run() refreshes index 0
+        # in place, so guarantee that slot really is one.
+        if not cleaned or cleaned[0].get("role") != "system":
+            cleaned.insert(0, {"role": "system", "content": self.get_system_prompt()})
+            notes.append("prepended a fresh system prompt")
+
+        # The API rejects a prompt ending on an assistant turn (nothing left for
+        # the model to answer), so drop such trailing turns.
+        while cleaned and cleaned[-1].get("role") == "assistant" and not cleaned[-1].get("tool_calls"):
+            cleaned.pop()
+            notes.append("dropped a trailing assistant message")
+
+        # Tool calls without results (crash while the command ran) become an
+        # explicit interruption notice: the command is never silently re-run and
+        # the model sees exactly where the previous session stopped.
+        if cleaned and cleaned[-1].get("role") == "assistant":
+            answered = {m.get("tool_call_id") for m in cleaned if m.get("role") == "tool"}
+            for tc in cleaned[-1].get("tool_calls") or []:
+                tcid = tc.get("id") if isinstance(tc, dict) else None
+                if not tcid or tcid in answered:
+                    continue
+                fn = (tc.get("function") or {}).get("name") if isinstance(tc, dict) else None
+                cleaned.append({
+                    "role": "tool",
+                    "tool_call_id": tcid,
+                    "content": (f"[SESSION RECOVERED] This tool call ({fn or 'unknown function'}) was "
+                                f"issued in a previous AI-Commander session that ended before its "
+                                f"result was recorded, so it was NOT re-executed. Do not assume it "
+                                f"had any effect; verify the current state before retrying it."),
+                })
+                notes.append(f"closed an unanswered tool call ({fn or 'unknown function'})")
+        return cleaned, notes
+
+    def load_session(self, notify: bool = True) -> bool:
+        """Restore a previously saved session from ``self.session_file``.
+
+        The stored ``messages`` array is loaded verbatim — including any edits
+        made by hand while AI-Commander was not running — and only structurally
+        repaired (see _repair_loaded_history). The saved session id and token
+        usage are restored too, so a resumed session keeps its identity and
+        counters. Returns True when messages were restored; a missing file is a
+        normal fresh start (False, no noise).
+        """
+        if not self.session_file:
+            return False
+        data, err = read_session_file(self.session_file)
+        if err:
+            # Unparseable file: keep it aside instead of silently destroying it,
+            # then continue with a fresh session.
+            backup = f"{self.session_file}.corrupt.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            try:
+                os.replace(self.session_file, backup)
+                moved = f"; original moved to {backup}"
+            except OSError:
+                moved = ""
+            self._log(f"[SESSION] Ignoring unreadable session file {self.session_file} ({err}){moved}", style="yellow")
+            return False
+        if not data:
+            return False
+
+        messages = data.get("messages")
+        if not isinstance(messages, list) or not messages:
+            if notify:
+                self._log(f"[SESSION] {self.session_file} has no messages to restore", style="yellow")
+            return False
+
+        restored, notes = self._repair_loaded_history(messages)
+        if not restored:
+            if notify:
+                self._log(f"[SESSION] {self.session_file} contained no usable messages", style="yellow")
+            return False
+
+        self.conversation_history = restored
+        self.persist_history = True
+        saved_id = data.get("session_id")
+        if isinstance(saved_id, str) and saved_id:
+            self.session_id = saved_id
+        step_count = data.get("step_count")
+        if isinstance(step_count, int) and step_count >= 0:
+            self.step_count = step_count
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            for key in self.usage_totals:
+                value = usage.get(key)
+                if isinstance(value, int) and value >= 0:
+                    self.usage_totals[key] = value
+
+        if notify:
+            self._log(f"[SESSION] Restored {len(restored)} message(s) from {self.session_file} "
+                      f"(session {self.session_id}, stopped after {self.step_count} step(s))", style="cyan")
+            for note in notes:
+                self._log(f"[SESSION]   repaired: {note}", style="yellow")
+        return True
+
+    def discard_session(self, reason: str = "discarded"):
+        """Forget the restored conversation and overwrite the session file.
+
+        Used by /clear and /new so the next startup begins fresh instead of
+        re-loading the conversation that was just cleared.
+        """
+        self.conversation_history = []
+        self.step_count = 0
+        self.save_session(reason)
 
     def _dump_conversation_history(self):
         """Dump the conversation history to commander-debug.txt for debugging."""
@@ -1295,6 +1615,13 @@ Rules:
             details = getattr(usage, "prompt_tokens_details", None)
             if details is not None:
                 cached = getattr(details, "cached_tokens", 0) or 0
+            # Accumulate the session totals persisted in the session file.
+            inp = getattr(usage, "prompt_tokens", 0) or 0
+            out = getattr(usage, "completion_tokens", 0) or 0
+            self.usage_totals["input_tokens"] += inp
+            self.usage_totals["output_tokens"] += out
+            self.usage_totals["cached_tokens"] += cached
+            self.usage_totals["billable_tokens"] += max(0, inp - cached) + out
             self.sink.emit("TOKEN_USAGE", {
                 "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
                 "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
@@ -1443,6 +1770,9 @@ Rules:
                 {"role": "system", "content": self.get_system_prompt()},
                 {"role": "user", "content": user_request}
             ]
+        # Snapshot immediately so the request survives even if the very first
+        # API call dies.
+        self.save_session("user_request")
 
         step = 0
 
@@ -1453,10 +1783,14 @@ Rules:
                     self._dump_conversation_history()
 
                 step += 1
+                self.step_count = step
                 self.sink.emit("STATUS_UPDATE", {"step": step, "max_steps": self.max_steps, "phase": "llm_call"})
 
                 self._drain_suggestions()
                 self._context_compress()
+                # Persist the exact prompt state (suggestions + compression
+                # applied) before the request goes out.
+                self.save_session("before_llm_call")
 
                 response = self.call_llm_api(list(self.conversation_history))
 
@@ -1484,6 +1818,11 @@ Rules:
                     self.conversation_history[-1] = clean_message
                 else:
                     self.conversation_history.append(clean_message)
+                # Persist the assistant turn before any tool runs: if the
+                # process dies mid-command, the session ends on this (possibly
+                # unanswered) tool call and load_session() marks it as not
+                # re-executed instead of losing the turn.
+                self.save_session("assistant_message")
                 content, tool_calls_info, first_tool_call_id, thinking, malformed_tool_calls = self.process_llm_response(response)
 
                 # LLM content was already streamed via LLM_STREAM events; do
@@ -1511,6 +1850,7 @@ Rules:
                             "tool_call_id": mal["tool_call_id"],
                             "content": err_msg,
                         })
+                    self.save_session("malformed_tool_calls")
                     self._log(f"[INFO] Correction messages appended. Continuing to next step for LLM to fix the tool calls.")
                     continue
 
@@ -1531,6 +1871,7 @@ Rules:
                                     "tool_call_id": tool_call_id,
                                     "content": result
                                 })
+                                self.save_session("tool_result")
                             continue
 
                         self.sink.emit("CMD_EXEC", {"command": command, "tool_call_id": tool_call_id, "function_name": function_name})
@@ -1584,6 +1925,9 @@ Rules:
                                         "role": "user",
                                         "content": f"I suggest you {user_suggestion}"
                                     })
+                        # Persist after every tool result so a crash keeps the
+                        # full history exactly as it was when the tool exited.
+                        self.save_session("tool_result")
                 else:
                     _content_check = content if isinstance(content, str) else ""
 
@@ -1602,6 +1946,7 @@ Rules:
                         f"task is fully finished, then emit \"{self.COMPLETION_MARKER}\"."
                     )
                     self.conversation_history.append({"role": "user", "content": continuation_msg})
+                    self.save_session("continuation_prompt")
 
                 if self.COMPLETION_MARKER in content:
                     self._log(f"[{self.COMPLETION_MARKER} DETECTED - TASK COMPLETED SUCCESSFULLY]")
@@ -1611,6 +1956,9 @@ Rules:
                     self._log(f"[LIMIT REACHED] Maximum steps ({self.max_steps}) exceeded")
 
         finally:
+            # Final snapshot of the loop (normal end, stop, or exception), so
+            # the file on disk always reflects the last complete state.
+            self.save_session("loop_terminated")
             self.sink.emit("SHUTDOWN", {"reason": "agent_loop_terminated"})
 
         self.sink.close()
@@ -1778,6 +2126,19 @@ def main():
                              "algorithm and use a smaller, faster system prompt.")
     parser.add_argument("--reasoning-effort", default=None,
                         help="Reasoning effort for the LLM (e.g. low, medium, high)")
+    parser.add_argument("--session", default=None,
+                        help=f"Session file mirroring the conversation history "
+                             f"(default: ./{_SESSION_BASENAME} in the current "
+                             f"directory). The history is written after every "
+                             f"step and reloaded on startup, so a crash loses at "
+                             f"most the in-flight turn. Plain JSON: the "
+                             f"\"messages\" array can be edited by hand to shape "
+                             f"a session. When another AI-Commander instance "
+                             f"already holds the default file, .aicsession2, "
+                             f".aicsession3, ... are used instead.")
+    parser.add_argument("--no-session", action="store_true",
+                        help="Disable session persistence (no session file is "
+                             "written and none is loaded)")
     parser.add_argument("request", nargs="*", help="Task request")
 
     args = parser.parse_args()
@@ -1787,6 +2148,29 @@ def main():
     if args.nogui and not args.request:
         print("[ERROR] Please provide a task request", file=sys.stderr)
         sys.exit(1)
+
+    # Reserve this process's session file before anything can fail, so a second
+    # instance launched in the same directory never shares (or clobbers) the
+    # first one's session. The flock is held for the process lifetime and is
+    # released by the kernel if the process dies.
+    if args.no_session:
+        args.session_file = ""
+        args.instance_number = 1
+        args.session_msg = "[SESSION] Persistence disabled (--no-session)"
+    else:
+        args.session_file, args.instance_number = acquire_session_file(args.session)
+        if not args.session_file:
+            args.session_msg = ("[SESSION] WARNING: could not lock a session file; "
+                                "running without session persistence")
+        elif args.instance_number > 1:
+            args.session_msg = (
+                f"[SESSION] WARNING: another AI-Commander instance is already using "
+                f"{_SESSION_BASENAME} in this directory; this instance uses "
+                f"{os.path.basename(args.session_file)} instead "
+                f"(instance {args.instance_number})"
+            )
+        else:
+            args.session_msg = f"[SESSION] Persisting session to {args.session_file}"
 
     # Sandbox must be enabled before the agent thread starts so the Landlock
     # domain covers the whole process. The status message is routed through
@@ -1806,6 +2190,10 @@ def main():
             "text": args.sandbox_msg,
             "style": "green" if args.sandbox_enabled else "red",
         })
+        sink.emit("LOG", {
+            "text": args.session_msg,
+            "style": "yellow" if args.instance_number != 1 or not args.session_file else "green",
+        })
         commander = AICommander(
             api_base=args.api_base,
             model=args.model,
@@ -1824,13 +2212,43 @@ def main():
             fast=args.fast,
             reasoning_effort=args.reasoning_effort,
             sandbox_enabled=args.sandbox_enabled,
-            sandbox_write_dir=args.sandbox_write_dir
+            sandbox_write_dir=args.sandbox_write_dir,
+            session_file=args.session_file,
+            instance_number=args.instance_number,
         )
+        # Reload a previous (or hand-edited) session and keep appending to it,
+        # so --nogui resumes where the last run stopped instead of starting
+        # from scratch.
+        commander.persist_history = bool(commander.load_session())
+        # Safety net: persist the final history on any exit path, including
+        # errors raised outside the agent loop.
+        atexit.register(commander.save_session, "process_exit")
+
+        # SIGTERM/SIGHUP (kill, closed terminal) bypass atexit-style cleanup, so
+        # mirror the history first and then re-raise with the default handler to
+        # keep the conventional exit status.
+        def _save_then_reraise(signum, _frame):
+            commander.save_session(f"signal_{signum}")
+            try:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+            except Exception:
+                sys.exit(128 + signum)
+
+        for _sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
+            if _sig is None:
+                continue
+            try:
+                signal.signal(_sig, _save_then_reraise)
+            except (ValueError, OSError, RuntimeError):
+                pass  # not in the main thread / unsupported signal
+
         try:
             user_request = " ".join(args.request)
             commander.run(user_request)
         except KeyboardInterrupt:
             commander._log("[INTERRUPTED] AI-Commander stopped by user")
+            commander.save_session("interrupted")
             sys.exit(0)
         except Exception:
             commander._log_error(f"\n[FATAL ERROR] An unexpected error occurred:")
@@ -2542,6 +2960,8 @@ def main():
             self._stream_prefix_done: set = set()
             # Show the [SANDBOX] status once per session, not on every re-run.
             self._sandbox_notified = False
+            # Guards the one-shot session restore performed in on_mount.
+            self._session_loaded = False
 
         def compose(self) -> ComposeResult:
             yield Static(
@@ -2568,6 +2988,14 @@ def main():
             # Load any persisted prompt history into readline so Up/Down and
             # Ctrl+R see prior sessions' prompts.
             _rl_load_history()
+            # Restore the persisted conversation once per process (a Textual
+            # remount must not load the session a second time).
+            if not self._session_loaded:
+                self._session_loaded = True
+                try:
+                    self._init_session()
+                except Exception as exc:
+                    self._write_agent(f"[SESSION] Could not restore session: {exc}", style="red")
             self.update_status_bar()
             # The banner is informational only: show it for a grace period,
             # then auto-hide (it is shown again while an approval is pending).
@@ -2622,13 +3050,17 @@ def main():
                 if self.agent
                 else 0
             )
+            session_txt = (
+                os.path.basename(self.args.session_file)
+                if getattr(self.args, "session_file", "") else "off"
+            )
             sb.update(
                 f"Model: {self.model_name} | "
                 f"Step: {self.step_count}/{self.max_steps} | "
                 f"Context: {context_window} | "
                 f"Total Tokens: {self.context_tokens} | "
                 f"tok/s: {self.tokens_per_second:.1f} | "
-                f"Session: {self.session_id} | "
+                f"Session: {self.session_id} ({session_txt}) | "
                 f"Auto-approve: {ap_status} | "
                 f"Pending approval: {'YES' if self.pending_approval else 'no'} | "
                 f"{sandbox_txt}"
@@ -2933,6 +3365,58 @@ def main():
             finally:
                 return False
 
+        def _make_agent(self) -> AICommander:
+            """Build the AICommander for this app, wired to the session file."""
+            return AICommander(
+                api_base=self.api_base,
+                model=self.model_name,
+                api_key=self.args.api_key,
+                auto_approve=self.auto_approve,
+                show_thinking=not self.args.no_thinking,
+                command_timeout=self.args.timeout,
+                max_prompt_len=self.args.max_prompt_len,
+                max_output_bytes=self.args.max_output_bytes,
+                debug=self.args.debug,
+                sink=self.sink,
+                persist_history=True,
+                max_steps=self.args.max_steps,
+                # --fast forces the faster 'truncate' algorithm and the shorter prompt.
+                compress_algorithm="truncate" if self.args.fast else self.args.compress_alg,
+                compress_target=self.args.compress_target,
+                fast=self.args.fast,
+                reasoning_effort=self.args.reasoning_effort,
+                sandbox_enabled=self.args.sandbox_enabled,
+                sandbox_write_dir=self.args.sandbox_write_dir,
+                session_file=self.args.session_file,
+                instance_number=self.args.instance_number,
+            )
+
+        def _init_session(self):
+            """Create the agent and reload the persisted session at startup.
+
+            The JSON session file mirrors the conversation history after every
+            agent step, so a crash, Ctrl+C or a closed terminal loses at most
+            the in-flight turn. Restoring here — before the first prompt — means
+            the resumed conversation (and its token/step counters) are already in
+            place, including any edits made to the file while AI-Commander was
+            not running.
+            """
+            self.sink = TUISink(self.event_queue, self.stop_event)
+            self.sink.auto_approve = self.auto_approve
+            self.agent = self._make_agent()
+            # Save on exit even if the user quits without running anything.
+            atexit.register(self.agent.save_session, "process_exit")
+            # session_msg already carries the [SESSION] tag (same string the
+            # --nogui path prints), so it is emitted verbatim here.
+            self._write_agent(self.args.session_msg,
+                              style="yellow" if (self.args.instance_number != 1
+                                                 or not self.args.session_file) else "green")
+            if self.agent.load_session():
+                # Keep the status bar consistent with the restored session.
+                self.session_id = self.agent.session_id
+                self.step_count = self.agent.step_count
+                self.context_tokens = self.agent.usage_totals.get("billable_tokens", 0)
+
         def _start_agent(self, prompt: str):
             """Start the agent thread with the given prompt. If already
             running, queue the text as a mid-run steering suggestion."""
@@ -2953,29 +3437,11 @@ def main():
                 })
                 self._sandbox_notified = True
             if self.agent is None:
-                # persist_history lets later commands reuse this instance and
-                # its conversation history.
-                self.agent = AICommander(
-                    api_base=self.api_base,
-                    model=self.model_name,
-                    api_key=self.args.api_key,
-                    auto_approve=self.auto_approve,
-                    show_thinking=not self.args.no_thinking,
-                    command_timeout=self.args.timeout,
-                    max_prompt_len=self.args.max_prompt_len,
-                    max_output_bytes=self.args.max_output_bytes,
-                    debug=self.args.debug,
-                    sink=self.sink,
-                    persist_history=True,
-                    max_steps=self.args.max_steps,
-                    # --fast forces the faster 'truncate' algorithm and the shorter prompt.
-                    compress_algorithm="truncate" if self.args.fast else self.args.compress_alg,
-                    compress_target=self.args.compress_target,
-                    fast=self.args.fast,
-                    reasoning_effort=self.args.reasoning_effort,
-                    sandbox_enabled=self.args.sandbox_enabled,
-                    sandbox_write_dir=self.args.sandbox_write_dir
-                )
+                # Fallback: _init_session normally builds the agent at startup so
+                # the persisted session is already restored. persist_history lets
+                # later commands reuse this instance and its conversation history.
+                self.agent = self._make_agent()
+                atexit.register(self.agent.save_session, "process_exit")
             else:
                 # Reuse the agent (and its history); re-sync mutable state in
                 # case the user toggled /aa since the last run.
@@ -3094,8 +3560,11 @@ def main():
                 if self.agent_thread and self.agent_thread.is_alive():
                     self._stop_agent()
                 if self.agent:
-                    self.agent.conversation_history = []
                     self.agent.suggestion_queue = queue.Queue()
+                    # Emptying the history and re-saving means the next startup
+                    # does not resurrect the conversation just cleared.
+                    self.agent.discard_session()
+                    self.agent.usage_totals = {k: 0 for k in self.agent.usage_totals}
                 # Clear the on-screen output panels so old messages disappear.
                 for widget_id in ("#agent-log", "#console-log"):
                     try:
@@ -3107,7 +3576,31 @@ def main():
                 self.context_tokens = 0
                 self.step_count = 0
                 self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                if self.agent:
+                    self.agent.session_id = self.session_id
+                    self.agent.save_session("cleared")
                 self._write_agent("[CLEAR] New conversation started. Ready for your next prompt.")
+                self.update_status_bar()
+
+            elif command == "/session":
+                self._report_session()
+
+            elif command == "/reload":
+                # Re-read the session file, picking up edits made to its
+                # "messages" array outside AI-Commander.
+                if not self.agent or not self.agent.session_file:
+                    self._write_agent("[ERROR] Session persistence is disabled.", style="bold red")
+                    return
+                if self.agent_thread and self.agent_thread.is_alive():
+                    self._write_agent("[ERROR] Stop the agent (/stop) before reloading the session.", style="bold red")
+                    return
+                if self.agent.load_session():
+                    self.session_id = self.agent.session_id
+                    self.step_count = self.agent.step_count
+                    self.context_tokens = self.agent.usage_totals.get("billable_tokens", 0)
+                    self._write_agent("[RELOAD] Session reloaded from disk.", style="bold green")
+                else:
+                    self._write_agent(f"[RELOAD] Nothing reloaded from {self.agent.session_file}.", style="yellow")
                 self.update_status_bar()
 
             elif command == "/stop":
@@ -3120,7 +3613,32 @@ def main():
 
             else:
                 self._write_agent(f"[UNKNOWN COMMAND] {cmd}")
-                self._write_agent("Available: /autoapprove /aa /approve /reject /suggest /clear /new /stop /quit /exit")
+                self._write_agent("Available: /autoapprove /aa /approve /reject /suggest /clear /new /session /reload /stop /quit /exit")
+
+        def _report_session(self):
+            """Show where the session is stored and what it currently holds."""
+            path = getattr(self.args, "session_file", "")
+            if not path:
+                self._write_agent("[SESSION] Persistence disabled (started with --no-session).")
+                return
+            data, err = read_session_file(path)
+            msgs = len(self.agent.conversation_history) if self.agent else 0
+            self._write_agent(f"[SESSION] File: {path} (instance {self.args.instance_number})")
+            self._write_agent(f"  Session id: {self.session_id} | messages in memory: {msgs}")
+            if err:
+                self._write_agent(f"  Saved file unreadable: {err}", style="yellow")
+            elif data:
+                saved = data.get("messages") if isinstance(data.get("messages"), list) else []
+                self._write_agent(
+                    f"  Last saved: {data.get('updated_at', 'unknown')} "
+                    f"(reason: {data.get('reason', 'unknown')}, "
+                    f"step {data.get('step_count', '?')}, {len(saved)} message(s))"
+                )
+            else:
+                self._write_agent("  Nothing saved yet.", style="yellow")
+            self._write_agent(
+                "  Edit the \"messages\" array of the file and run /reload to reshape this session."
+            )
 
         def key_press(self, event):
             """Ctrl+C / Escape: stop the agent and quit."""
@@ -3131,6 +3649,9 @@ def main():
         def shutdown(self):
             """Clean shutdown: stop agent, close sink, exit app."""
             self._stop_agent()
+            # Mirror the final conversation state before leaving.
+            if self.agent:
+                self.agent.save_session("tui_shutdown")
             # Persist prompt history so it survives this session.
             _rl_save_history()
             if self.sink:
@@ -3146,6 +3667,8 @@ def main():
         app.run()
     except KeyboardInterrupt:
         app._stop_agent()
+        if app.agent:
+            app.agent.save_session("interrupted")
         sys.exit(0)
     except Exception as e:
         print(f"[FATAL ERROR] TUI crashed: {e}", file=sys.stderr)
