@@ -676,6 +676,42 @@ class AICommander:
             cleaned.pop()
             notes.append("dropped a trailing assistant message")
 
+        # Older sessions can contain runs of identical continuation prompts:
+        # a thinking model that returned empty turns (no content, no tool
+        # calls) made the loop inject "Continue working..." after every one.
+        # Collapse each run of consecutive [continuation, empty-assistant]
+        # pairs into a single continuation prompt followed by nothing, so the
+        # restored history matches what the fixed loop would have produced.
+        continuation_prefix = "Continue working on the task. You previously responded without using any tools."
+        collapsed: List[Dict[str, Any]] = []
+        for msg in cleaned:
+            is_cont = (msg.get("role") == "user"
+                       and isinstance(msg.get("content"), str)
+                       and msg["content"].startswith(continuation_prefix))
+            prev = collapsed[-1] if collapsed else None
+            prev_cont = (prev is not None and prev.get("role") == "user"
+                         and isinstance(prev.get("content"), str)
+                         and prev["content"].startswith(continuation_prefix))
+            prev_empty_asst = (prev is not None and prev.get("role") == "assistant"
+                               and not prev.get("tool_calls")
+                               and not (prev.get("content") or "").strip())
+            if is_cont and prev_empty_asst:
+                # The pair [old continuation, empty assistant] collapses into
+                # just this continuation prompt.
+                collapsed[-1] = msg
+                notes.append("collapsed a stacked continuation prompt")
+                continue
+            if is_cont and prev_cont:
+                notes.append("collapsed a duplicate continuation prompt")
+                continue
+            if (msg.get("role") == "assistant" and not msg.get("tool_calls")
+                    and not (msg.get("content") or "").strip()):
+                # Empty assistant turns carry no information for the model.
+                notes.append("dropped an empty assistant message")
+                continue
+            collapsed.append(msg)
+        cleaned = collapsed
+
         # Tool calls without results (crash while the command ran) become an
         # explicit interruption notice: the command is never silently re-run and
         # the model sees exactly where the previous session stopped.
@@ -1933,6 +1969,19 @@ Rules:
 
                     if _content_check.strip().endswith(self.COMPLETION_MARKER) or self.COMPLETION_MARKER in _content_check:
                         break
+
+                    if not _content_check.strip() and not thinking:
+                        # The assistant returned nothing at all: no text, no
+                        # tool calls, no reasoning (thinking models sometimes
+                        # burn a whole turn inside reasoning_content, which is
+                        # not persisted). Appending the empty turn and a
+                        # continuation prompt every step stacked identical
+                        # "Continue working..." messages forever. Drop the
+                        # empty turn instead and simply retry the same step.
+                        self._log("[INFO] Empty assistant response (no content, no tool calls); retrying this step.")
+                        self.conversation_history.pop()  # remove the empty turn
+                        self.save_session("empty_response_retry")
+                        continue
 
                     # The assistant stopped with neither tool calls nor the
                     # completion marker: a premature stop. Inject a
@@ -3416,6 +3465,55 @@ def main():
                 self.session_id = self.agent.session_id
                 self.step_count = self.agent.step_count
                 self.context_tokens = self.agent.usage_totals.get("billable_tokens", 0)
+                self._render_restored_history()
+
+        def _render_restored_history(self):
+            """Refill the agent and console panels from the restored session.
+
+            load_session() puts the previous conversation back into the agent,
+            but the on-screen RichLogs start empty. Replay the messages here so
+            the user sees the full prior exchange: the agent panel shows user
+            prompts and assistant replies; the console panel shows the bash
+            commands the assistant requested and each command's output, in
+            session order (the same split the live view uses).
+            """
+            if not self.agent:
+                return
+            pending_tool_calls = {}  # tool_call_id -> command text
+            for msg in self.agent.conversation_history:
+                role = msg.get("role")
+                if role == "system":
+                    continue
+                if role == "user":
+                    content = msg.get("content") or ""
+                    if isinstance(content, str) and content.strip():
+                        self._write_agent(f"[USER REQUEST] {content}", style="yellow")
+                elif role == "assistant":
+                    content = msg.get("content") or ""
+                    if isinstance(content, str) and content.strip():
+                        self._write_agent(content, style="cyan")
+                    for tc in msg.get("tool_calls") or []:
+                        try:
+                            args = json.loads((tc.get("function") or {}).get("arguments") or "{}")
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                        cmd = args.get("command")
+                        if cmd:
+                            pending_tool_calls[tc.get("id")] = cmd
+                            self._write_console(f"[COMMAND REQUESTED] {cmd}", style="bold yellow")
+                elif role == "tool":
+                    tcid = msg.get("tool_call_id")
+                    cmd = pending_tool_calls.pop(tcid, None)
+                    if cmd:
+                        self._write_console(f"[Executing] {cmd}", style="yellow")
+                    output = msg.get("content")
+                    if isinstance(output, str) and output.strip():
+                        # Keep the console excerpt bounded like a live run: the
+                        # full text stays in the conversation history either way.
+                        if len(output) > 4000:
+                            output = output[:4000] + "\n... (truncated)"
+                        self._write_console(output, style="green")
+                        self._write_console("[COMMAND COMPLETE] (restored from session)", style="bold green")
 
         def _start_agent(self, prompt: str):
             """Start the agent thread with the given prompt. If already
@@ -3598,6 +3696,7 @@ def main():
                     self.session_id = self.agent.session_id
                     self.step_count = self.agent.step_count
                     self.context_tokens = self.agent.usage_totals.get("billable_tokens", 0)
+                    self._render_restored_history()
                     self._write_agent("[RELOAD] Session reloaded from disk.", style="bold green")
                 else:
                     self._write_agent(f"[RELOAD] Nothing reloaded from {self.agent.session_file}.", style="yellow")
