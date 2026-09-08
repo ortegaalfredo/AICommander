@@ -83,14 +83,44 @@ It supports two presentation modes:
 
 ## Installation
 
-Clone the repository and install the dependencies:
+### From PyPI (or from source)
+
+```bash
+pip install aiCommander
+```
+
+This installs the `aic` command plus every runtime dependency, including the
+Textual TUI and the `context-compressor-llm` context compressor, so both the
+TUI and LLM-based compression work out of the box. (`py-landlock` is installed
+only on Linux; elsewhere the agent simply runs unsandboxed.)
+
+Upgrade with:
+
+```bash
+pip install --upgrade aiCommander
+```
+
+### From a checkout of this repository
 
 ```bash
 git clone https://github.com/ortegaalfredo/AICommander
 cd AICommander
 python3 -m venv venv
 source venv/bin/activate
+pip install .
+```
+
+Or, to install in editable mode while hacking on the code:
+
+```bash
+pip install -e .
+```
+
+Alternatively, install only the dependencies and run the script directly:
+
+```bash
 pip install -r requirements.txt
+python3 aic.py ...
 ```
 > **Note:** The `py-landlock` package is only used on Linux and
 > is optional — the agent runs unsandboxed if it is not installed.
@@ -99,7 +129,8 @@ pip install -r requirements.txt
 
 ## Usage
 
-AI-Commander is a single-file script. Run it from the repository root:
+AI-Commander is a single-file script. Run it from the repository root
+(or just `aic` instead of `python3 aic.py` when installed via pip):
 
 ```bash
 python3 aic.py \

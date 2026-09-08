@@ -6,6 +6,8 @@ through an EventSink (ConsoleSink or TUISink) so the same agent code drives
 either presentation.
 """
 
+__version__ = "1.0.0"
+
 import argparse
 import atexit
 import json
@@ -325,7 +327,12 @@ class ConsoleSink(EventSink):
         "CMD_COMPLETE": colors.BOLD,
         "SYSTEM": colors.BOLD + colors.BLUE,
     }
-    _LOG_STYLES = {"yellow": colors.YELLOW, "green": colors.GREEN, "red": colors.RED}
+    _LOG_STYLES = {"yellow": colors.YELLOW, "green": colors.GREEN, "red": colors.RED,
+                   # Bold vivid yellow (ANSI 11) so user input stands out from
+                   # the darker ANSI-3 yellow used for thinking/warnings, and
+                   # reads as bold like the [READY]/[COMMAND COMPLETE] markers.
+                   "bright_yellow": colors.BOLD + colors.YELLOW,
+                   "bold bright_yellow": colors.BOLD + colors.YELLOW}
 
     def emit(self, kind: str, payload: dict):
         text = payload.get("text", "")
@@ -1785,7 +1792,7 @@ Rules:
                 "role": "user",
                 "content": f"[Suggestion from user] {s}"
             })
-            self._log(f"[USER SUGGESTION] {s}")
+            self._log(f"[USER SUGGESTION] {s}", style="bold bright_yellow")
 
     def generate_task_summary(self, user_request: str, generation: int = 0):
         """Summarize a request with the same LLM and title the panel.
@@ -1840,7 +1847,7 @@ Rules:
                 "compress_algorithm": self.compress_algorithm,
                 "fast": self.fast,
             })
-        self._log(f"[USER REQUEST] {user_request}", style="yellow")
+        self._log(f"[USER REQUEST] {user_request}", style="bold bright_yellow")
         self._log(f"{'='*60}")
 
         # Every new request starts a fresh agent loop, so the agent panel
@@ -2197,6 +2204,9 @@ def main():
     """Main entry point"""
     _check_openai_version()
     parser = argparse.ArgumentParser(description="AI-Commander - a ralph-loop AI agent")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {__version__}",
+                        help="Show the AI-Commander version and exit")
     parser.add_argument("--api-base", required=True, help="API base URL")
     parser.add_argument("--model", required=True, help="Model name")
     parser.add_argument("--api-key", required=True, help="API key")
@@ -2988,6 +2998,12 @@ def main():
             color: #f2f2f2;
             border: solid #f2f2f2;
             width: 1fr;
+            /* Border-title styling: Textual 8.x drops per-span styles from a
+               Rich Text border_title when rendering the border, so the title
+               must be styled here. Frame lines keep the #f2f2f2 border color
+               above; only the title text is bold bright yellow. */
+            border-title-color: ansi_bright_yellow;
+            border-title-style: bold;
         }
         /* Explicit min-heights keep the switcher body from collapsing to
         zero in real terminals (tab strip rendered, body blank). */
@@ -3341,6 +3357,9 @@ def main():
             """
             try:
                 agent = self.query_one("#agent-log")
+                # Plain string: the bold bright-yellow look comes from the
+                # border-title-color/border-title-style CSS on #agent-log
+                # (Textual 8.x ignores span styles on border titles).
                 agent.border_title = f"Agent task: {summary}" if summary else "Agent Output"
             except Exception:
                 pass
@@ -3573,7 +3592,7 @@ def main():
                 if role == "user":
                     content = msg.get("content") or ""
                     if isinstance(content, str) and content.strip():
-                        self._write_agent(f"[USER REQUEST] {content}", style="yellow")
+                        self._write_agent(f"[USER REQUEST] {content}", style="bold bright_yellow")
                 elif role == "assistant":
                     content = msg.get("content") or ""
                     if isinstance(content, str) and content.strip():
@@ -3607,7 +3626,7 @@ def main():
             if self.agent_thread and self.agent_thread.is_alive():
                 if self.agent:
                     self.agent.inject_suggestion(prompt)
-                    self._write_agent(f"[SUGGESTION QUEUED] Steering agent: {prompt}")
+                    self._write_agent(f"[SUGGESTION QUEUED] Steering agent: {prompt}", style="bold bright_yellow")
                 else:
                     self._write_agent("[ERROR] Agent is running but not available for suggestions.")
                 return
