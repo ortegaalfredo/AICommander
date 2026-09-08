@@ -57,3 +57,21 @@ commander-debug.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Secrets / credentials (never commit these)
+# ---------------------------------------------------------------------------
+pypi-token.txt
+*.token
+*.token.txt
+*token.txt
+!token-spec.md
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_ed25519
+credentials.json
+secrets.json

@@ -1,5 +1,7 @@
 # AI-Commander
 
+**PyPI package:** [`aic-agent`](https://pypi.org/project/aic-agent/) — install with `pip install aic-agent` (the command is `aic`).
+
 AI-Commander is a **ralph-loop AI agent** that provides shell access and task
 planning capabilities to Large Language Models through function calling. It
 runs a tight agent loop: it plans, executes shell commands, observes the
@@ -86,7 +88,7 @@ It supports two presentation modes:
 ### From PyPI (or from source)
 
 ```bash
-pip install aiCommander
+pip install aic-agent
 ```
 
 This installs the `aic` command plus every runtime dependency, including the
@@ -97,7 +99,7 @@ only on Linux; elsewhere the agent simply runs unsandboxed.)
 Upgrade with:
 
 ```bash
-pip install --upgrade aiCommander
+pip install --upgrade aic-agent
 ```
 
 ### From a checkout of this repository
@@ -129,10 +131,19 @@ python3 aic.py ...
 
 ## Usage
 
-AI-Commander is a single-file script. Run it from the repository root
-(or just `aic` instead of `python3 aic.py` when installed via pip):
+AI-Commander is a single-file script. Run it from the repository root with
+`python3 aic.py`, or use the `aic` command installed by the
+[`aic-agent`](https://pypi.org/project/aic-agent/) package:
 
 ```bash
+# Installed via pip (package: aic-agent)
+aic \
+  --api-base https://api.example.com/v1 \
+  --model your-model-name \
+  --api-key YOUR_API_KEY \
+  "your task request"
+
+# From a repository checkout
 python3 aic.py \
   --api-base https://api.example.com/v1 \
   --model your-model-name \
