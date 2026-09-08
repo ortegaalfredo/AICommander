@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+include requirements.txt
+include aic.py
+recursive-include tests *.py
+global-exclude __pycache__ *.py[cod]

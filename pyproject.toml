@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiCommander"
+# Version is single-sourced from aic.__version__ (see [tool.setuptools.dynamic]).
+dynamic = ["version"]
+description = "AI-Commander: a ralph-loop AI agent giving LLMs shell access via function calling (TUI + CLI)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "ortegaalfredo", email = "ortegaalfredo@gmail.com" },
+]
+requires-python = ">=3.10"
+keywords = ["ai", "agent", "llm", "shell", "openai", "tui", "textual"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Utilities",
+]
+
+# All runtime dependencies are mandatory so that a plain `pip install`
+# yields a fully working TUI *and* the LLM context compressor.
+dependencies = [
+    "openai>=2.0.0",
+    "context-compressor-llm>=0.1.0",
+    "ddgs>=8.0.0",
+    "textual>=8.0.0",
+    "rich>=14.2.0",
+    "pyte>=0.8.2",
+    # Landlock is a Linux-only kernel sandbox; the agent runs unsandboxed
+    # (graceful fallback) where it is unavailable.
+    "py-landlock>=0.1.0; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.0.0",
+    "twine>=5.0.0",
+    "pytest>=8.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ortegaalfredo/AICommander"
+Repository = "https://github.com/ortegaalfredo/AICommander"
+Issues = "https://github.com/ortegaalfredo/AICommander/issues"
+
+[project.scripts]
+aic = "aic:main"
+
+[tool.setuptools]
+py-modules = ["aic"]
+
+[tool.setuptools.dynamic]
+version = {attr = "aic.__version__"}

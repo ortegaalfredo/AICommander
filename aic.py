@@ -6,7 +6,7 @@ through an EventSink (ConsoleSink or TUISink) so the same agent code drives
 either presentation.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import argparse
 import atexit
