@@ -501,6 +501,12 @@ class AICommander:
         # Serializes session writes (the agent loop and atexit both save).
         self._session_write_lock = threading.Lock()
 
+        # Latest request and its LLM-generated 10-15 word summary, shown as
+        # the agent panel title ("Agent task: ...") and persisted in the
+        # session file so a resumed session keeps its title.
+        self.initial_prompt = ""
+        self.task_summary = ""
+
         # Checked between steps and during command execution so the TUI can
         # halt the agent cleanly.
         self.stop_event = threading.Event()
@@ -596,6 +602,8 @@ class AICommander:
             "instance_number": self.instance_number,
             "step_count": self.step_count,
             "usage": dict(self.usage_totals),
+            "initial_prompt": self.initial_prompt,
+            "task_summary": self.task_summary,
             "messages": self.conversation_history,
         }
 
@@ -787,6 +795,10 @@ class AICommander:
                 value = usage.get(key)
                 if isinstance(value, int) and value >= 0:
                     self.usage_totals[key] = value
+        # Restore the panel title ("Agent task: ...") so a resumed session
+        # shows what the session is about.
+        self.initial_prompt = data.get("initial_prompt") or ""
+        self.task_summary = data.get("task_summary") or ""
 
         if notify:
             self._log(f"[SESSION] Restored {len(restored)} message(s) from {self.session_file} "
@@ -801,6 +813,8 @@ class AICommander:
         """
         self.conversation_history = []
         self.step_count = 0
+        self.initial_prompt = ""
+        self.task_summary = ""
         self.save_session(reason)
 
     def _dump_conversation_history(self):
@@ -1773,6 +1787,46 @@ Rules:
             })
             self._log(f"[USER SUGGESTION] {s}")
 
+    def generate_task_summary(self, user_request: str, generation: int = 0):
+        """Summarize a request with the same LLM and title the panel.
+
+        Runs in the background so the task itself is never delayed. The result
+        becomes the agent panel border title ("Agent task: ...") and is stored
+        in the session file so a resumed session keeps its title. Any failure
+        falls back to a truncated version of the prompt. A slow summary of an
+        older request never overwrites a newer one (``generation``).
+        """
+        prompt = (user_request or "").strip()
+        if not prompt:
+            return
+        instruction = (
+            "Summarize the following task in 10 to 15 words. "
+            "Reply with the summary only, no quotes, no punctuation at the end.\n\n" + prompt
+        )
+        try:
+            response = self.call_llm_api(
+                [
+                    {"role": "system", "content": "You are a precise summarizer."},
+                    {"role": "user", "content": instruction},
+                ],
+                use_tools=False,
+                stream_display=False,
+                enable_thinking=False,
+            )
+            summary = (response.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            summary = " ".join(summary.split())
+        except Exception as exc:
+            if self.debug:
+                self._log(f"[TASK TITLE] LLM summary failed: {exc}", style="yellow")
+            summary = ""
+        if not summary:
+            summary = " ".join(prompt.split())[:80]
+        if generation != getattr(self, "_summary_generation", 0):
+            return  # a newer request already took over the title
+        self.task_summary = summary
+        self.sink.emit("TASK_TITLE", {"summary": summary})
+        self.save_session("task_summary")
+
     def run(self, user_request: str):
         """Main interactive loop"""
         if not self._started_banner_shown:
@@ -1788,6 +1842,15 @@ Rules:
             })
         self._log(f"[USER REQUEST] {user_request}", style="yellow")
         self._log(f"{'='*60}")
+
+        # Every new request starts a fresh agent loop, so the agent panel
+        # title follows the latest request: summarize it with the LLM in a
+        # background thread (never blocks the task).
+        self.initial_prompt = user_request
+        self._summary_generation = getattr(self, "_summary_generation", 0) + 1
+        threading.Thread(target=self.generate_task_summary,
+                         args=(user_request, self._summary_generation),
+                         daemon=True).start()
 
         # With persist_history, refresh the system prompt in place and append
         # the new request so prior chat context carries over; otherwise reset.
@@ -3196,6 +3259,8 @@ def main():
                 self._decay_token_rate()
             elif kind == "TOKEN_USAGE":
                 self._apply_token_usage(payload)
+            elif kind == "TASK_TITLE":
+                self._set_agent_task_title(payload.get("summary", ""))
             elif kind == "SHUTDOWN":
                 self._write_agent("[READY] Agent loop terminated, waiting for next command.", style="bold green")
                 self._handle_agent_exit()
@@ -3264,6 +3329,19 @@ def main():
                         y=max(0, widget.scroll_y - trimmed),
                         animate=False,
                     )
+            except Exception:
+                pass
+
+        def _set_agent_task_title(self, summary: str = ""):
+            """Title the agent panel with the session's task.
+
+            "Agent task: <summary>" when a summary exists (LLM-generated from
+            the initial prompt, or restored from the session file), otherwise
+            the plain "Agent Output".
+            """
+            try:
+                agent = self.query_one("#agent-log")
+                agent.border_title = f"Agent task: {summary}" if summary else "Agent Output"
             except Exception:
                 pass
 
@@ -3472,6 +3550,8 @@ def main():
                 self.step_count = self.agent.step_count
                 self.context_tokens = self.agent.usage_totals.get("billable_tokens", 0)
                 self._render_restored_history()
+            # Title the panel from the restored session (no-op when empty).
+            self._set_agent_task_title(self.agent.task_summary)
 
         def _render_restored_history(self):
             """Refill the agent and console panels from the restored session.
@@ -3683,6 +3763,7 @@ def main():
                 if self.agent:
                     self.agent.session_id = self.session_id
                     self.agent.save_session("cleared")
+                self._set_agent_task_title("")
                 self._write_agent("[CLEAR] New conversation started. Ready for your next prompt.")
                 self.update_status_bar()
 
