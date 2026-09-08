@@ -640,7 +640,8 @@ class AICommander:
         assistant messages without tool calls are removed, and tool calls left
         dangling by an interrupted run get a synthetic tool result so the API
         accepts the resumed conversation. Returns the repaired list plus notes
-        describing each change (surfaced to the user).
+        describing each change (kept out of the console so they never clobber
+        agent output).
         """
         notes: List[str] = []
         cleaned: List[Dict[str, Any]] = []
@@ -766,7 +767,7 @@ class AICommander:
                 self._log(f"[SESSION] {self.session_file} has no messages to restore", style="yellow")
             return False
 
-        restored, notes = self._repair_loaded_history(messages)
+        restored, _ = self._repair_loaded_history(messages)
         if not restored:
             if notify:
                 self._log(f"[SESSION] {self.session_file} contained no usable messages", style="yellow")
@@ -790,8 +791,6 @@ class AICommander:
         if notify:
             self._log(f"[SESSION] Restored {len(restored)} message(s) from {self.session_file} "
                       f"(session {self.session_id}, stopped after {self.step_count} step(s))", style="cyan")
-            for note in notes:
-                self._log(f"[SESSION]   repaired: {note}", style="yellow")
         return True
 
     def discard_session(self, reason: str = "discarded"):
@@ -3011,6 +3010,8 @@ def main():
             self._sandbox_notified = False
             # Guards the one-shot session restore performed in on_mount.
             self._session_loaded = False
+            # Last status-bar text, so we only refresh it when it changes.
+            self._last_status_text = None
 
         def compose(self) -> ComposeResult:
             yield Static(
@@ -3059,7 +3060,7 @@ def main():
                 self.query_one("#prompt-input").focus()
             except Exception:
                 pass
-            self.set_interval(0.05, self._drain_queue)
+            self.set_interval(0.25, self._drain_queue)
 
             # Auto-start the agent with a CLI-supplied request, mirroring
             # --nogui. Deferred so widgets exist before the thread starts;
@@ -3103,7 +3104,7 @@ def main():
                 os.path.basename(self.args.session_file)
                 if getattr(self.args, "session_file", "") else "off"
             )
-            sb.update(
+            text = (
                 f"Model: {self.model_name} | "
                 f"Step: {self.step_count}/{self.max_steps} | "
                 f"Context: {context_window} | "
@@ -3114,6 +3115,11 @@ def main():
                 f"Pending approval: {'YES' if self.pending_approval else 'no'} | "
                 f"{sandbox_txt}"
             )
+            # Static.update() always triggers a full refresh, so skip it when
+            # nothing changed (otherwise the UI repaints on every tick).
+            if text != self._last_status_text:
+                self._last_status_text = text
+                sb.update(text)
 
         def _drain_queue(self):
             """Poll the event queue and dispatch events to widgets (main
