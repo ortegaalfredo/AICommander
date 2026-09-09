@@ -18,11 +18,21 @@ import queue
 import re
 import signal
 import os
-import pty
+import subprocess
 import select
-import fcntl
-import termios
 import struct
+import base64
+
+# pty/fcntl/termios are POSIX-only modules. On Windows commands run through
+# subprocess instead (see _execute_bash_command_windows) and the interactive
+# shell tab is disabled.
+_IS_WINDOWS = (os.name == "nt")
+if _IS_WINDOWS:
+    pty = fcntl = termios = None
+else:
+    import pty
+    import fcntl
+    import termios
 import traceback
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
@@ -76,6 +86,42 @@ except ImportError:
 # curl/wget run through execute_bash) so Cloudflare-fronted endpoints do not
 # flag the script as a bot and block the IP.
 USER_AGENT = 'Mozilla/5.0 (compatible; OpenAI-Client/1.0)'
+
+
+# Windows PowerShell writes redirected stdout using the console's OEM code
+# page, which this module decodes as UTF-8; without this a command printing
+# "Bogota" with an accent would come back mojibake. Guarded so a failure can
+# never stop the real command from running.
+_PS_UTF8_PREFIX = (
+    # 1) Make PowerShell itself speak UTF-8 on the redirected pipe (it would
+    #    otherwise use the OEM code page, which aic decodes as UTF-8).
+    "try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) }"
+    " catch {}\n"
+    "try { $OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}\n"
+    # 2) Make child processes UTF-8 too: python defaults to the ANSI code page
+    #    for piped stdout on Windows, so printing accented text crashes with
+    #    UnicodeEncodeError ('charmap' codec) or arrives as mojibake.
+    "$env:PYTHONIOENCODING = 'utf-8'\n"
+    "$env:PYTHONUTF8 = '1'\n"
+)
+
+# cmd /c propagated the exit code of the last native command; PowerShell does
+# not unless told to, so restore that behavior for the agent loop.
+_PS_UTF8_SUFFIX = "\nif ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }\n"
+
+
+def _powershell_argv(command: str) -> list:
+    """Build the powershell.exe argv for a command (Windows).
+
+    PowerShell ships with Windows 10+, so it is used unconditionally. The
+    command is handed over with -EncodedCommand (base64 UTF-16LE), so it
+    arrives verbatim: no cmd.exe re-parsing, no caret/percent expansion and no
+    quote mangling for nested "python -c '...'" style commands.
+    """
+    script = _PS_UTF8_PREFIX + command + _PS_UTF8_SUFFIX
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return ["powershell", "-NoProfile", "-NonInteractive",
+            "-EncodedCommand", encoded]
 
 try:
     # Textual is only required for TUI mode; --nogui runs without it.
@@ -206,11 +252,21 @@ def _acquire_instance_lock(session_path: str) -> Optional[int]:
         os.set_inheritable(fd, False)
     except OSError:
         pass
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        return None
+    if _IS_WINDOWS:
+        # No fcntl on Windows: msvcrt.locking() on one byte marks ownership.
+        import msvcrt
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            os.close(fd)
+            return None
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
     # Record the owner for diagnostics only; the lock itself is the truth.
     try:
         os.ftruncate(fd, 0)
@@ -322,6 +378,9 @@ class ConsoleSink(EventSink):
         "ERROR": colors.RED,
         "LLM_STREAM": colors.CYAN,
         "THINKING_STREAM": colors.YELLOW,
+        # Match the TUI, which renders CONSOLE_STREAM in yellow; without this
+        # --nogui printed internal streams (e.g. [SESSION SUMMARY]) uncolored.
+        "CONSOLE_STREAM": colors.YELLOW,
         "CMD_OUTPUT": colors.GREEN,
         "CMD_EXEC": colors.YELLOW,
         "CMD_COMPLETE": colors.BOLD,
@@ -508,6 +567,12 @@ class AICommander:
         # Serializes session writes (the agent loop and atexit both save).
         self._session_write_lock = threading.Lock()
 
+        # When False, run() skips the background task-title summarizer. Tests
+        # driving run() with a scripted fake client turn this off: the
+        # summarizer issues its own LLM call from a daemon thread and would
+        # otherwise race the agent loop for the scripted responses.
+        self.task_summary_enabled = True
+
         # Latest request and its LLM-generated 10-15 word summary, shown as
         # the agent panel title ("Agent task: ...") and persisted in the
         # session file so a resumed session keeps its title.
@@ -538,7 +603,7 @@ class AICommander:
                 "type": "function",
                 "function": {
                     "name": "execute_bash",
-                    "description": "Execute a bash command in the terminal",
+                    "description": "Execute a shell command in the terminal (bash on Linux/macOS, cmd.exe/PowerShell on Windows)",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -686,11 +751,12 @@ class AICommander:
             cleaned.insert(0, {"role": "system", "content": self.get_system_prompt()})
             notes.append("prepended a fresh system prompt")
 
-        # The API rejects a prompt ending on an assistant turn (nothing left for
-        # the model to answer), so drop such trailing turns.
-        while cleaned and cleaned[-1].get("role") == "assistant" and not cleaned[-1].get("tool_calls"):
-            cleaned.pop()
-            notes.append("dropped a trailing assistant message")
+        # NOTE: a trailing assistant message is deliberately KEPT. It is
+        # usually the previous run's final answer, and dropping it made every
+        # resume silently forget what the agent last said. A prompt that still
+        # ends on an assistant turn is not an error here: call_llm_api()
+        # detects the terminal state via _validate_messages() and stops
+        # gracefully instead of hitting an API rejection.
 
         # Older sessions can contain runs of identical continuation prompts:
         # a thinking model that returned empty turns (no content, no tool
@@ -808,8 +874,21 @@ class AICommander:
         self.task_summary = data.get("task_summary") or ""
 
         if notify:
-            self._log(f"[SESSION] Restored {len(restored)} message(s) from {self.session_file} "
-                      f"(session {self.session_id}, stopped after {self.step_count} step(s))", style="cyan")
+            # Show where the previous run left off so the user sees the last
+            # thing the agent said (its final answer, or the tool call that
+            # was interrupted) instead of a bare message count.
+            last = restored[-1]
+            if last.get("role") == "assistant":
+                text = (last.get("content") or "").strip()
+                if last.get("tool_calls"):
+                    names = []
+                    for tc in last["tool_calls"]:
+                        fn = (tc.get("function") or {}).get("name") if isinstance(tc, dict) else None
+                        names.append(fn or "unknown function")
+                    text = "tool call: " + ", ".join(names)
+                if text:
+                    preview = text if len(text) <= 200 else text[:197] + "..."
+                    self._log(f"[SESSION] Last assistant message: {preview}", style="cyan")
         return True
 
     def discard_session(self, reason: str = "discarded"):
@@ -1081,6 +1160,7 @@ Remember to not exceed 5000 characters, its very important that the summary to b
                 stream_display=False,
                 stream_label="[SESSION SUMMARY]",
                 enable_thinking=False,
+                show_thinking=False,
             )
             msg = response.get("choices", [{}])[0].get("message", {})
             summary = msg.get("content") or ""
@@ -1256,7 +1336,7 @@ Remember to not exceed 5000 characters, its very important that the summary to b
 **Runtime Constraints (execute_bash):**
 - Output is capped at {self.max_output_bytes} bytes. If truncated, the literal sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}` is appended. If you see it, you are missing data — do NOT assume success or failure. Re-run with output redirected to a file and read in chunks via `sed -n 'start,end p' file`, or use `head -c N`/`tail -c N`. Prefer targeted commands (grep, wc, stat) over dumping large outputs.
 - Commands are killed after {self.command_timeout}s. For long operations use `nohup ... &` and check later, split into smaller steps, or set your own `timeout`.
-- Commands run in a PTY; use non-interactive flags (`-y`, `--no-interactive`) where available.
+- Commands run in a PTY (a plain pipe on Windows); use non-interactive flags (`-y`, `--no-interactive`) where available.
 - You are running inside an OS-level sandbox{'' if self.sandbox_enabled else ' (currently disabled)'}. {f'You may WRITE only to {self.sandbox_write_dir}, /tmp and /dev; reads and execution are allowed anywhere, and network access is preserved. Write files within these directories or they may fail.' if self.sandbox_enabled else f'When the sandbox is active, writes are restricted to {self.sandbox_write_dir}, /tmp and /dev.'}
 
 **Command Results:**
@@ -1299,7 +1379,12 @@ Rules:
 - Keep working until the task is genuinely complete; partial completion is not completion."""
 
     def execute_bash_command(self, command: str) -> Tuple[str, int]:
-        """Execute a bash command in a PTY with timeout; return (output, exit_code)."""
+        """Execute a shell command with timeout; return (output, exit_code).
+
+        POSIX runs it in a PTY; Windows falls back to subprocess pipes.
+        """
+        if _IS_WINDOWS:
+            return self._execute_bash_command_windows(command)
         output_buffer = bytearray()
         pid, master_fd = pty.fork()
 
@@ -1453,6 +1538,110 @@ Rules:
 
         return final_output, exit_code
 
+    def _execute_bash_command_windows(self, command: str) -> Tuple[str, int]:
+        """Windows implementation of execute_bash_command().
+
+        Windows has no pty/fcntl/termios, so the command runs through
+        subprocess with pipes instead of a pseudo-terminal, using PowerShell.
+        """
+        argv = _powershell_argv(command)
+
+        creationflags = 0
+        if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+        except OSError as e:
+            msg = f"Failed to start shell: {e}"
+            self.sink.emit("CMD_OUTPUT", {"text": msg + "\n", "command": command})
+            self.sink.emit("CMD_COMPLETE",
+                           {"command": command, "exit_code": 1, "output": msg})
+            return msg, 1
+
+        output_buffer = bytearray()
+        buf_lock = threading.Lock()
+        output_kill_threshold = 5 * self.max_output_bytes
+
+        def _reader(stream, buf):
+            try:
+                for chunk in iter(lambda: stream.read(1024), b""):
+                    with buf_lock:
+                        buf.extend(chunk)
+                        if len(buf) > output_kill_threshold:
+                            return
+            except Exception:
+                pass
+
+        reader = threading.Thread(target=_reader,
+                                  args=(proc.stdout, output_buffer), daemon=True)
+        reader.start()
+
+        def _terminate():
+            """Best-effort kill of the child process tree."""
+            try:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=0.5)
+            except Exception:
+                pass
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        exit_code = 1
+        timed_out = False
+        start_time = time.time()
+        while True:
+            if self.stop_event.is_set():
+                self._log_error("[STOP] Agent shutdown requested. Terminating command.")
+                _terminate()
+                break
+            if time.time() - start_time > self.command_timeout:
+                self._log_error(f"[TIMEOUT] Command timed out after {self.command_timeout} seconds.")
+                _terminate()
+                timed_out = True
+                break
+            with buf_lock:
+                over_limit = len(output_buffer) > output_kill_threshold
+            if over_limit:
+                self._log_error(f"[OUTPUT LIMIT] Command output exceeded {output_kill_threshold} bytes. Stopping command.")
+                _terminate()
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+
+        reader.join(timeout=2)
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        if proc.returncode is not None:
+            exit_code = proc.returncode
+
+        final_output = output_buffer.decode('utf-8', errors='replace')
+        # Normalize line endings (Windows tools emit \r\n).
+        final_output = final_output.replace('\r\n', '\n').replace('\r', '\n')
+        if len(final_output.encode('utf-8')) > self.max_output_bytes:
+            final_output = final_output[:self.max_output_bytes] + "\n" + self.OUTPUT_TRUNCATION_SENTINEL
+
+        self.sink.emit("CMD_COMPLETE", {"command": command, "exit_code": exit_code, "output": final_output})
+
+        if timed_out:
+            raise CommandTimeoutError(f"Command timed out after {self.command_timeout} seconds")
+
+        return final_output, exit_code
+
     def get_user_confirmation(self, command: str) -> Tuple[bool, Optional[str]]:
         """Get user confirmation for command execution via the sink.
 
@@ -1501,20 +1690,33 @@ Rules:
     def call_llm_api(self, messages: List[Dict[str, str]], use_tools: bool = True,
                      stream_display: bool = True,
                      stream_label: Optional[str] = None,
-                     enable_thinking: bool = True) -> Dict[str, Any]:
+                     enable_thinking: bool = True,
+                     show_thinking: Optional[bool] = None) -> Dict[str, Any]:
         """Call the LLM API using the OpenAI client with streaming support.
 
         When ``stream_display`` is True (default) the streamed content is echoed
         to the agent output pane via ``LLM_STREAM``/``THINKING_STREAM`` events.
-        Pass False for internal calls (e.g. the context-compressor summarizer) so
-        their output is routed to the console output pane via ``CONSOLE_STREAM``
-        instead of appearing as if the agent were speaking. ``stream_label``, when
+        Pass False for internal calls so their output is not mistaken for the
+        agent speaking: with a ``stream_label`` the stream is routed to the
+        console output pane via ``CONSOLE_STREAM`` (tagged with the label),
+        without one the call is fully silent — nothing is streamed to the UI
+        (used by background calls like the task-title summarizer). ``stream_label``, when
         given, is prepended once at the start of the stream (used to tag internal
         output such as ``[SESSION SUMMARY]``). ``enable_thinking`` controls
         whether the model's reasoning/thinking mode is active (default True);
         pass False for easy internal calls like the summarizer to skip
-        thinking tokens and reduce latency.
+        thinking tokens and reduce latency. ``show_thinking`` overrides the
+        instance-level ``show_thinking`` flag for this call only: internal
+        callers pass False so their reasoning is never streamed to the UI,
+        even when the server ignores ``enable_thinking=False`` and sends
+        ``reasoning_content`` chunks anyway.
         """
+        # Resolve the per-call override (None = follow the instance flag).
+        if show_thinking is None:
+            show_thinking = self.show_thinking
+        # Background internal calls (no label) never touch the UI.
+        silent_stream = not stream_display and not stream_label
+
         messages = self._validate_messages(messages)
 
         # Empty list = terminal assistant state (see _validate_messages);
@@ -1527,7 +1729,8 @@ Rules:
                         "role": "assistant",
                         "content": f"I have completed my response. No further actions are needed.\n\n{self.COMPLETION_MARKER}",
                         "tool_calls": None,
-                        "reasoning_content": None
+                        "reasoning_content": None,
+                        "synthesized_terminal": True
                     }
                 }]
             }
@@ -1605,24 +1808,26 @@ Rules:
                         elif hasattr(delta, 'thinking') and delta.thinking:
                             reasoning_chunk = delta.thinking
 
-                        if self.show_thinking and reasoning_chunk:
+                        if show_thinking and reasoning_chunk:
                             collected_thinking += reasoning_chunk
                             thinking_buffer += reasoning_chunk
-                            stream_kind = "THINKING_STREAM" if stream_display else "CONSOLE_STREAM"
-                            self.sink.emit(stream_kind, {"text": reasoning_chunk})
-                            in_thinking = True
+                            if not silent_stream:
+                                stream_kind = "THINKING_STREAM" if stream_display else "CONSOLE_STREAM"
+                                self.sink.emit(stream_kind, {"text": reasoning_chunk})
+                                in_thinking = True
 
                         if delta.content:
                             collected_content += delta.content
-                            if self.show_thinking and in_thinking and thinking_buffer:
+                            if show_thinking and in_thinking and thinking_buffer:
                                 self._log("[THINKING COMPLETE]", style="yellow")
                                 in_thinking = False
-                            stream_kind = "LLM_STREAM" if stream_display else "CONSOLE_STREAM"
-                            if stream_kind == "CONSOLE_STREAM" and stream_label and not label_sent:
-                                label_sent = True
-                                self.sink.emit(stream_kind, {"text": delta.content, "label": stream_label})
-                            else:
-                                self.sink.emit(stream_kind, {"text": delta.content})
+                            if not silent_stream:
+                                stream_kind = "LLM_STREAM" if stream_display else "CONSOLE_STREAM"
+                                if stream_kind == "CONSOLE_STREAM" and stream_label and not label_sent:
+                                    label_sent = True
+                                    self.sink.emit(stream_kind, {"text": delta.content, "label": stream_label})
+                                else:
+                                    self.sink.emit(stream_kind, {"text": delta.content})
 
                         if delta.tool_calls:
                             for tool_call_chunk in delta.tool_calls:
@@ -1819,6 +2024,7 @@ Rules:
                 use_tools=False,
                 stream_display=False,
                 enable_thinking=False,
+                show_thinking=False,
             )
             summary = (response.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
             summary = " ".join(summary.split())
@@ -1855,9 +2061,10 @@ Rules:
         # background thread (never blocks the task).
         self.initial_prompt = user_request
         self._summary_generation = getattr(self, "_summary_generation", 0) + 1
-        threading.Thread(target=self.generate_task_summary,
-                         args=(user_request, self._summary_generation),
-                         daemon=True).start()
+        if self.task_summary_enabled:
+            threading.Thread(target=self.generate_task_summary,
+                             args=(user_request, self._summary_generation),
+                             daemon=True).start()
 
         # With persist_history, refresh the system prompt in place and append
         # the new request so prior chat context carries over; otherwise reset.
@@ -1906,17 +2113,20 @@ Rules:
                 assistant_message = response["choices"][0]["message"]
 
                 # Terminal safety response synthesized by call_llm_api.
-                _content_raw = assistant_message.get("content") or ""
-                if (_content_raw.strip().endswith(self.COMPLETION_MARKER) and
-                    not assistant_message.get("tool_calls") and
-                    not assistant_message.get("reasoning_content") and
-                    len(_content_raw) < 200):
+                # Terminal safety response synthesized by call_llm_api when
+                # the history already ends on an assistant turn. Detected by
+                # its explicit tag: a content-shape heuristic would also
+                # swallow REAL short final answers that happen to end with
+                # the completion marker, and those must be stored in the
+                # session file like any other assistant turn.
+                if assistant_message.get("synthesized_terminal"):
                     break
 
                 # Don't store reasoning_content; it confuses APIs that don't
                 # expect it in subsequent requests.
                 clean_message = dict(assistant_message)
                 clean_message.pop("reasoning_content", None)
+                clean_message.pop("synthesized_terminal", None)
 
                 # Never create consecutive assistant messages.
                 if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
@@ -2200,8 +2410,32 @@ def enable_sandbox() -> Tuple[bool, str]:
         return (False, f"[SANDBOX] Failed to enable Landlock sandbox: {e}")
 
 
+def _enable_windows_console_vt() -> None:
+    """Best-effort enablement of ANSI escape-sequence processing on Windows.
+
+    Classic conhost starts with ENABLE_VIRTUAL_TERMINAL_PROCESSING off, so
+    ConsoleSink's color codes print literally (e.g. "ESC[93m") until some
+    child process flips the flag for the shared console buffer -- the first
+    tool call's PowerShell does exactly that, which is why colors suddenly
+    "start working" after the first command.
+
+    Spawning cmd.exe via os.system('') leaves VT mode enabled as a side
+    effect (cmd.exe switches the console into VT mode for itself and fails
+    to restore the previous mode on exit), which enables it for this process
+    too. Stdlib-only: no ctypes, no new dependency. No-op on other platforms
+    and harmless if it fails (legacy consoles just keep printing raw codes).
+    """
+    if os.name != "nt":
+        return
+    try:
+        os.system("")
+    except Exception:
+        pass  # never block startup over cosmetics
+
+
 def main():
     """Main entry point"""
+    _enable_windows_console_vt()
     _check_openai_version()
     parser = argparse.ArgumentParser(description="AI-Commander - a ralph-loop AI agent")
     parser.add_argument("--version", action="version",
@@ -2225,7 +2459,7 @@ def main():
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug mode (dump conversation history on truncation)")
     parser.add_argument("--nogui", action="store_true",
-                        help="Run in direct CLI mode without TUI (original behaviour)")
+                        help="Run in direct CLI mode without TUI. By default no session file is read or written; pass --session to enable persistence")
     parser.add_argument("--disable-sandbox", action="store_true",
                         help="Disable the OS-level Landlock sandbox (Linux only)")
     parser.add_argument("--compress-alg", default="context-compressor-llm",
@@ -2278,6 +2512,14 @@ def main():
         args.session_file = ""
         args.instance_number = 1
         args.session_msg = "[SESSION] Persistence disabled (--no-session)"
+    elif args.nogui and not args.session:
+        # --nogui is a one-shot runner: by default it must not touch the
+        # session file at all (no restore, no save, not even a lock file), so
+        # scripted runs never clobber an interactive session in this
+        # directory. An explicit --session path opts back in.
+        args.session_file = ""
+        args.instance_number = 1
+        args.session_msg = "[SESSION] Persistence disabled (--nogui without --session)"
     else:
         args.session_file, args.instance_number = acquire_session_file(args.session)
         if not args.session_file:
@@ -2628,6 +2870,12 @@ def main():
 
         def _spawn(self) -> None:
             """Fork a shell in a pty and set up the pyte emulator."""
+            if _IS_WINDOWS:
+                # No pty/fork on Windows: the interactive shell tab stays
+                # disabled (the agent's execute_bash still works).
+                self._history = ["Interactive shell is not available on Windows."]
+                self.refresh()
+                return
             shell = os.environ.get("SHELL", "") or "/bin/sh"
             if not shell or not os.path.exists(shell):
                 shell = "/bin/sh"
@@ -3514,8 +3762,7 @@ def main():
                     self._start_agent(prompt)
             except Exception as exc:
                 self._write_agent(f"[ERROR] Failed to auto-start from CLI request: {exc}")
-            finally:
-                return False
+            return False
 
         def _make_agent(self) -> AICommander:
             """Build the AICommander for this app, wired to the session file."""

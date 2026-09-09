@@ -168,7 +168,7 @@ panel. In `--nogui` mode a request is required on the command line.
 | `--max-output-bytes` | Maximum output bytes returned from commands (default: `10240`). |
 | `--max-steps` | Maximum number of agent loop steps before stopping (default: `500`). |
 | `--debug` | Enable debug mode (dump conversation history on truncation). |
-| `--nogui` | Run in direct CLI mode without TUI (original behaviour). |
+| `--nogui` | Run in direct CLI mode without TUI (original behaviour). No session file is read or written unless `--session` is given. |
 | `--session` | Session file mirroring the conversation history (default: `./.aicsession`). |
 | `--no-session` | Disable session persistence (nothing is written or loaded). |
 | `--disable-sandbox` | Disable the OS-level Landlock sandbox (Linux only). |

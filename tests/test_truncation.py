@@ -199,6 +199,12 @@ class TestRunner:
         c = self.make_commander(**overrides)
         fake = fake_openai.FakeOpenAIClient(script)
         c.client = fake
+        # The background task-title summarizer issues its own LLM call from a
+        # daemon thread and would race the agent loop for the scripted
+        # responses, nondeterministically replacing the first scripted turn
+        # with the fake client's default "pong". Disable it: a scripted
+        # client has exactly one consumer.
+        c.task_summary_enabled = False
         return c, fake
 
     # ------------------------------------------------------------------ #
@@ -870,6 +876,54 @@ class TestRunner:
                                            "cached_tokens": 3, "billable_tokens": 30},
                        repr(c2.usage_totals))
 
+    def test_session_final_answer_survives_resume(self):
+        """Regression: a session that ended with the agent's final answer must
+        restore that answer verbatim instead of silently dropping it."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            c, path = self._session_commander(tmp)
+            c.conversation_history = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "what is 2+2?"},
+                {"role": "assistant", "content": "2+2 equals 4."},
+            ]
+            c.save_session("final_answer")
+            c2, _ = self._session_commander(tmp)
+            self.check("session final answer: reload succeeds", c2.load_session(notify=False))
+            roles = [m.get("role") for m in c2.conversation_history]
+            self.check("session final answer: all three messages restored",
+                       roles == ["system", "user", "assistant"], str(roles))
+            self.check("session final answer: last message intact",
+                       c2.conversation_history[-1].get("content") == "2+2 equals 4.",
+                       repr(c2.conversation_history[-1])[:200])
+
+    def test_session_final_answer_with_marker_saved(self):
+        """Regression: a short real final answer ending with the completion
+        marker must be stored in the session file. The early-break for the
+        synthesized terminal response used to swallow it by content shape."""
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".aicsession")
+            c, _fake = self.make_fake_commander(
+                script=[[
+                    fake_openai.content_chunk("All done. TASKCOMPLETE"),
+                    fake_openai.usage_chunk(10, 5),
+                ]],
+                session_file=path,
+            )
+            c.run("finish it")
+            data = json.load(open(path))
+            saved = data["messages"]
+            last = saved[-1] if saved else {}
+            self.check("marker answer: assistant turn stored",
+                       last.get("role") == "assistant", repr(saved)[:250])
+            self.check("marker answer: content intact",
+                       "TASKCOMPLETE" in (last.get("content") or ""),
+                       repr(last)[:250])
+            self.check("marker answer: internal tag not persisted",
+                       "synthesized_terminal" not in last, repr(last)[:250])
+
     def test_session_picks_up_external_edits(self):
         """The messages array is re-read from disk, so hand edits take effect."""
         import json
@@ -920,8 +974,11 @@ class TestRunner:
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, ".aicsession")
-            # A bare messages array, a tool message with no matching call, and a
-            # trailing assistant message: all repaired on load.
+            # A bare messages array and a tool message with no matching call
+            # are repaired on load. The trailing assistant message is KEPT: it
+            # is the previous run's final answer and must survive a resume
+            # (API safety for a prompt ending on an assistant turn is handled
+            # at call time, not by deleting history).
             with open(path, "w", encoding="utf-8") as f:
                 json.dump([
                     {"role": "user", "content": "hello"},
@@ -933,8 +990,9 @@ class TestRunner:
             roles = [m.get("role") for m in c.conversation_history]
             self.check("session repair: system prompt prepended", roles[0] == "system", str(roles))
             self.check("session repair: orphan tool message dropped", "tool" not in roles, str(roles))
-            self.check("session repair: dangling assistant turn dropped",
-                       roles[-1] != "assistant", str(roles))
+            self.check("session repair: trailing assistant answer kept",
+                       roles[-1] == "assistant"
+                       and c.conversation_history[-1].get("content") == "dangling", str(roles))
 
     def test_session_closes_unanswered_tool_call(self):
         """A crash right after an assistant tool call still reloads cleanly."""
@@ -1217,6 +1275,8 @@ def main():
     runner.test_context_counter_after_full_loop()
     runner.test_session_save_writes_json()
     runner.test_session_round_trip()
+    runner.test_session_final_answer_survives_resume()
+    runner.test_session_final_answer_with_marker_saved()
     runner.test_session_picks_up_external_edits()
     runner.test_session_bare_array_and_repair()
     runner.test_session_closes_unanswered_tool_call()
