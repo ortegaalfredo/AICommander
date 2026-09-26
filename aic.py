@@ -521,7 +521,7 @@ class AICommander:
         # of resetting it, so a fresh prompt keeps prior chat context.
         self.persist_history = persist_history
         self.max_steps = max_steps
-        self.max_tokens = 8000
+        self.max_tokens = 32000
         self.command_timeout = command_timeout
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.show_thinking = show_thinking
@@ -1661,6 +1661,66 @@ Rules:
         else:
             return False, response_input
 
+    def _sanitize_tool_pairing(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Enforce assistant-tool_calls / tool-result pairing in a message list.
+
+        Strict OpenAI-compatible endpoints (DeepSeek among them) reject the
+        request with a 400 when a ``tool`` message is not preceded by the
+        assistant message that issued its ``tool_call_id``. Context compression
+        can split such pairs: truncation pops the assistant turn while keeping
+        its tool results, and the anchored-summary compressor's eviction
+        boundary can fall between the two. This sweep drops orphaned ``tool``
+        messages and, in the inverse case, closes assistant tool calls left
+        unanswered by removing their ``tool_calls`` (turning them into plain
+        text-only assistant turns) so the array always satisfies the pairing
+        invariant.
+        """
+        cleaned: List[Dict[str, Any]] = []
+        # tool_call_id -> True while its tool result has not been seen yet.
+        pending: Dict[str, bool] = {}
+        for msg in messages:
+            role = msg.get("role")
+            if role == "assistant":
+                tcs = msg.get("tool_calls") or []
+                if tcs:
+                    msg = dict(msg)
+                    answered = []
+                    for tc in tcs:
+                        tcid = tc.get("id") if isinstance(tc, dict) else None
+                        if tcid and pending.get(tcid):
+                            # Duplicate of an id this same list already
+                            # answered; keep the result, drop the extra call.
+                            continue
+                        answered.append(tc)
+                        if tcid:
+                            pending[tcid] = True
+                    msg["tool_calls"] = answered if answered else None
+                cleaned.append(msg)
+                continue
+            if role == "tool":
+                tcid = msg.get("tool_call_id")
+                if not tcid or not pending.pop(tcid, False):
+                    # Orphan: the assistant message carrying this id was
+                    # evicted/condensed. Drop it -- the API would reject it.
+                    continue
+                cleaned.append(msg)
+                continue
+            cleaned.append(msg)
+
+        # Tool calls still pending here lost their result message (dropped as
+        # an orphan by an earlier pass, or never recorded). Strip them so no
+        # assistant turn carries unanswered tool_calls, which strict
+        # endpoints also reject.
+        if pending:
+            for msg in cleaned:
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    kept = [
+                        tc for tc in msg["tool_calls"]
+                        if not (isinstance(tc, dict) and tc.get("id") in pending)
+                    ]
+                    msg["tool_calls"] = kept if kept else None
+        return cleaned
+
     def _validate_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Sanitize messages before sending: no None content, valid roles, tool
         messages need tool_call_id, and no trailing assistant message without
@@ -1681,6 +1741,13 @@ Rules:
         # APIs reject consecutive assistant messages; drop the older one.
         while len(validated) >= 2 and validated[-1].get("role") == "assistant" and validated[-2].get("role") == "assistant":
             validated.pop(-2)
+
+        # Strict endpoints (DeepSeek) 400 when a `tool` message's
+        # tool_call_id has no preceding assistant tool_calls, or when an
+        # assistant turn carries tool_calls that were never answered. Context
+        # compression can produce both shapes; repair them here, at the last
+        # gate before the request goes out.
+        validated = self._sanitize_tool_pairing(validated)
 
         if validated and validated[-1].get("role") == "assistant" and not validated[-1].get("tool_calls"):
             return []
@@ -2100,6 +2167,16 @@ Rules:
 
                 self._drain_suggestions()
                 self._context_compress()
+                # Compression can split an assistant/tool_calls + tool-result
+                # pair (truncate pops blindly; the anchored-summary
+                # compressor's eviction boundary can fall between the two).
+                # Strict endpoints (DeepSeek) reject the request with a 400
+                # when a `tool` message's tool_call_id has no preceding
+                # assistant tool_calls, or when an assistant turn carries
+                # unanswered tool_calls. Repair the pairing right after
+                # compression, before the state is persisted or sent.
+                self.conversation_history = self._sanitize_tool_pairing(
+                    self.conversation_history)
                 # Persist the exact prompt state (suggestions + compression
                 # applied) before the request goes out.
                 self.save_session("before_llm_call")
