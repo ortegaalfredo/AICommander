@@ -6,7 +6,7 @@ through an EventSink (ConsoleSink or TUISink) so the same agent code drives
 either presentation.
 """
 
-__version__ = "1.0.2"
+__version__ = "1.0.4"
 
 import argparse
 import atexit
@@ -521,7 +521,7 @@ class AICommander:
         # of resetting it, so a fresh prompt keeps prior chat context.
         self.persist_history = persist_history
         self.max_steps = max_steps
-        self.max_tokens = 32000
+        self.max_tokens = 16000
         self.command_timeout = command_timeout
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.show_thinking = show_thinking

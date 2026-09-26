@@ -178,7 +178,12 @@ class TestRunner:
             auto_approve=True,
             show_thinking=False,
             command_timeout=30,
-            max_prompt_len=20000,
+            # Matches the production default (80000). The prompt budget is
+            # max_prompt_len - max_tokens, and max_tokens defaults to 32000,
+            # so this leaves ~48k of real headroom -- the same relationship
+            # the old 20000/8000 pair had. Tests that exercise compression
+            # override both values explicitly.
+            max_prompt_len=80000,
             max_output_bytes=10240,
             debug=False,
             sink=RecordingSink(),
@@ -564,6 +569,8 @@ class TestRunner:
             {"role": "function", "content": "x"},           # function without name dropped
             {"role": "assistant", "content": "a1", "tool_calls": [{"id": "c1"}]},
             {"role": "assistant", "content": "a2", "tool_calls": [{"id": "c2"}]},  # consecutive
+            {"role": "tool", "tool_call_id": "c2", "content": "result"},  # answers c2
+            {"role": "user", "content": "go on"},           # keep the prompt non-terminal
         ]
         out = c._validate_messages(msgs)
         self.check("validate: None content replaced", out[1]["content"] == "", repr(out))
@@ -572,11 +579,82 @@ class TestRunner:
             all(m["role"] in ("system", "user", "assistant", "tool", "function", "developer") for m in out),
             repr(out),
         )
-        self.check("validate: tool without id dropped", all(m["role"] != "tool" for m in out), repr(out))
+        self.check("validate: tool without id dropped",
+                   all(m.get("tool_call_id") for m in out if m["role"] == "tool"), repr(out))
         self.check("validate: function without name dropped", all(m["role"] != "function" for m in out), repr(out))
+        # The consecutive-assistant collapse only fires for a trailing pair;
+        # here a tool result follows, so both assistants survive, each with
+        # its pairing state intact: a1's unanswered call was stripped by the
+        # pairing sanitizer, a2's answered call kept.
         assistants = [m for m in out if m["role"] == "assistant"]
-        self.check("validate: consecutive assistant collapsed", len(assistants) == 1,
-                   f"assistants={len(assistants)}")
+        self.check("validate: unanswered tool_calls stripped",
+                   all(not m.get("tool_calls") for m in assistants if m["content"] == "a1"), repr(out))
+        self.check("validate: answered tool_calls kept",
+                   any(m.get("tool_calls") == [{"id": "c2"}] for m in assistants), repr(out))
+        self.check("validate: answered tool result kept",
+                   any(m.get("role") == "tool" and m.get("tool_call_id") == "c2" for m in out), repr(out))
+        # A trailing consecutive pair IS collapsed: the older assistant goes.
+        # The survivor is text-only, so the prompt would end on a plain
+        # assistant turn -- the terminal state, reported as an empty list.
+        msgs2 = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "old"},
+            {"role": "assistant", "content": "new"},
+        ]
+        out2 = c._validate_messages(msgs2)
+        self.check("validate: trailing consecutive assistant collapsed",
+                   out2 == [], repr(out2))
+        # Same shape but ending on an answered tool result: the collapse does
+        # not fire (it only applies to a trailing pair), and the intact
+        # assistant/tool pair must survive untouched.
+        msgs3 = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "old"},
+            {"role": "assistant", "content": "new", "tool_calls": [{"id": "c9"}]},
+            {"role": "tool", "tool_call_id": "c9", "content": "result"},
+        ]
+        out3 = c._validate_messages(msgs3)
+        self.check("validate: answered pair kept before tool result",
+                   any(m.get("role") == "tool" and m.get("tool_call_id") == "c9" for m in out3), repr(out3))
+        self.check("validate: answered tool_calls kept",
+                   any(m.get("tool_calls") == [{"id": "c9"}] for m in out3), repr(out3))
+
+    def test_sanitize_tool_pairing(self):
+        c = self.make_commander()
+        # Orphan tool result (assistant evicted by compression) is dropped.
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "orphan"},
+            {"role": "user", "content": "go on"},
+        ]
+        out = c._sanitize_tool_pairing(msgs)
+        self.check("pairing: orphan tool dropped", all(m["role"] != "tool" for m in out), repr(out))
+        # Intact pair survives untouched.
+        msgs = [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "call_2", "type": "function",
+                             "function": {"name": "execute_bash", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "result"},
+        ]
+        out = c._sanitize_tool_pairing(msgs)
+        self.check("pairing: intact pair kept",
+                   [m["role"] for m in out] == ["assistant", "tool"], repr(out))
+        # Assistant whose result was lost gets tool_calls stripped.
+        msgs = [
+            {"role": "assistant", "content": "doing stuff",
+             "tool_calls": [{"id": "call_3", "type": "function",
+                             "function": {"name": "execute_bash", "arguments": "{}"}}]},
+        ]
+        out = c._sanitize_tool_pairing(msgs)
+        self.check("pairing: unanswered tool_calls stripped",
+                   all(not m.get("tool_calls") for m in out), repr(out))
+        # Input list is not mutated.
+        snapshot = [dict(m) for m in msgs]
+        c._sanitize_tool_pairing(msgs)
+        self.check("pairing: input not mutated", msgs == snapshot, repr(msgs))
 
     def test_validate_terminal(self):
         c = self.make_commander()
@@ -1263,6 +1341,7 @@ def main():
     runner.test_history_truncate_respects_output_reservation()
     runner.test_estimate_tokens()
     runner.test_validate_messages()
+    runner.test_sanitize_tool_pairing()
     runner.test_validate_terminal()
     runner.test_process_response()
     runner.test_process_response_malformed()
