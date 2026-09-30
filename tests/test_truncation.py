@@ -1072,6 +1072,49 @@ class TestRunner:
                        roles[-1] == "assistant"
                        and c.conversation_history[-1].get("content") == "dangling", str(roles))
 
+    def test_session_list_content_survives_reload(self):
+        """Multi-part (list) content must not abort the session restore.
+
+        _repair_loaded_history used to call .strip() on message content, which
+        raised AttributeError for list-of-parts content and aborted the whole
+        restore -- the agent panel then came up empty (or partial) instead of
+        showing the restored conversation.
+        """
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".aicsession")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "messages": [
+                        {"role": "system", "content": "sys"},
+                        {"role": "user", "content": "hello"},
+                        {"role": "assistant", "content": [
+                            {"type": "text", "text": "part one"},
+                            {"type": "text", "text": "part two"},
+                        ]},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": "second prompt"},
+                        ]},
+                        {"role": "assistant", "content": "final answer"},
+                    ],
+                    "task_summary": "list content",
+                }, f)
+            c, _ = self._session_commander(tmp)
+            self.check("session list-content: reload succeeds",
+                       c.load_session(notify=False))
+            roles = [m.get("role") for m in c.conversation_history]
+            self.check("session list-content: all messages kept",
+                       roles == ["system", "user", "assistant", "user", "assistant"],
+                       str(roles))
+            self.check("session list-content: assistant list content preserved",
+                       isinstance(c.conversation_history[2].get("content"), list)
+                       and c.conversation_history[2]["content"][0]["text"] == "part one",
+                       repr(c.conversation_history[2])[:200])
+            self.check("session list-content: user list content preserved",
+                       c.conversation_history[3]["content"][0]["text"] == "second prompt",
+                       repr(c.conversation_history[3])[:200])
+
     def test_session_closes_unanswered_tool_call(self):
         """A crash right after an assistant tool call still reloads cleanly."""
         import tempfile
@@ -1358,6 +1401,7 @@ def main():
     runner.test_session_final_answer_with_marker_saved()
     runner.test_session_picks_up_external_edits()
     runner.test_session_bare_array_and_repair()
+    runner.test_session_list_content_survives_reload()
     runner.test_session_closes_unanswered_tool_call()
     runner.test_session_corrupt_file()
     runner.test_session_missing_file_is_quiet()

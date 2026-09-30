@@ -348,6 +348,31 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub('', text)
 
 
+def _content_text(content) -> str:
+    """Return message content as displayable text ('' when there is none).
+
+    Message content is normally a string, but hand-edited sessions or
+    multi-part API payloads can carry a list of content parts
+    (``[{"type": "text", "text": ...}, ...]``). Callers must never crash on
+    that (an AttributeError here used to abort the whole session restore,
+    leaving the agent panel empty), so non-string content is flattened to its
+    text parts and anything else becomes ''.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
 class EventSink:
     """Abstract presentation-layer I/O for AICommander.
 
@@ -654,6 +679,45 @@ class AICommander:
         """Rough input-token estimate for the live "context" counter."""
         return sum(self._estimate_message_tokens(msg) for msg in messages)
 
+    def _emit_token_usage(self, input_tokens: int, output_tokens: int,
+                          cached: int = 0, estimate: bool = False,
+                          tokens_per_sec: Optional[float] = None) -> None:
+        """Emit a TOKEN_USAGE event and accumulate the persisted session totals.
+
+        The pre-call estimate (``estimate=True``) only feeds the live status
+        bar; exact server-reported numbers (``estimate=False``) also update
+        ``usage_totals``, which is what the session file persists.
+        """
+        self.sink.emit("TOKEN_USAGE", {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_tokens": cached,
+            "estimate": estimate,
+            "tokens_per_sec": tokens_per_sec,
+        })
+        if estimate:
+            return
+        # Prompt-cached tokens are served from cache (not re-processed) and
+        # are typically not billed, so only the non-cached tokens count.
+        self.usage_totals["input_tokens"] += input_tokens
+        self.usage_totals["output_tokens"] += output_tokens
+        self.usage_totals["cached_tokens"] += cached
+        self.usage_totals["billable_tokens"] += max(0, input_tokens - cached) + output_tokens
+
+    @staticmethod
+    def _extract_cached_tokens(usage) -> int:
+        """Read prompt-cached input tokens from a usage object.
+
+        Cached-token field names differ per provider:
+          - OpenAI:    usage.prompt_tokens_details.cached_tokens
+          - DeepSeek:  usage.prompt_cache_hit_tokens
+          - Anthropic: usage.cache_read_input_tokens
+        """
+        details = getattr(usage, "prompt_tokens_details", None)
+        return (getattr(details, "cached_tokens", 0) or 0
+                or getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+                or getattr(usage, "cache_read_input_tokens", 0) or 0)
+
     # --- Session persistence ----------------------------------------------
 
     def session_snapshot(self, reason: str = "") -> Dict[str, Any]:
@@ -765,18 +829,20 @@ class AICommander:
         # pairs into a single continuation prompt followed by nothing, so the
         # restored history matches what the fixed loop would have produced.
         continuation_prefix = "Continue working on the task. You previously responded without using any tools."
+
+        def _is_continuation(m):
+            return (isinstance(m, dict) and m.get("role") == "user"
+                    and isinstance(m.get("content"), str)
+                    and m["content"].startswith(continuation_prefix))
+
         collapsed: List[Dict[str, Any]] = []
         for msg in cleaned:
-            is_cont = (msg.get("role") == "user"
-                       and isinstance(msg.get("content"), str)
-                       and msg["content"].startswith(continuation_prefix))
+            is_cont = _is_continuation(msg)
             prev = collapsed[-1] if collapsed else None
-            prev_cont = (prev is not None and prev.get("role") == "user"
-                         and isinstance(prev.get("content"), str)
-                         and prev["content"].startswith(continuation_prefix))
+            prev_cont = _is_continuation(prev)
             prev_empty_asst = (prev is not None and prev.get("role") == "assistant"
                                and not prev.get("tool_calls")
-                               and not (prev.get("content") or "").strip())
+                               and not _content_text(prev.get("content")).strip())
             if is_cont and prev_empty_asst:
                 # The pair [old continuation, empty assistant] collapses into
                 # just this continuation prompt.
@@ -787,8 +853,8 @@ class AICommander:
                 notes.append("collapsed a duplicate continuation prompt")
                 continue
             if (msg.get("role") == "assistant" and not msg.get("tool_calls")
-                    and not (msg.get("content") or "").strip()):
-                # Empty assistant turns carry no information for the model.
+                    and not _content_text(msg.get("content")).strip()):
+                # Empty assistant turns without tool calls carry no information.
                 notes.append("dropped an empty assistant message")
                 continue
             collapsed.append(msg)
@@ -804,14 +870,12 @@ class AICommander:
                 if not tcid or tcid in answered:
                     continue
                 fn = (tc.get("function") or {}).get("name") if isinstance(tc, dict) else None
-                cleaned.append({
-                    "role": "tool",
-                    "tool_call_id": tcid,
-                    "content": (f"[SESSION RECOVERED] This tool call ({fn or 'unknown function'}) was "
-                                f"issued in a previous AI-Commander session that ended before its "
-                                f"result was recorded, so it was NOT re-executed. Do not assume it "
-                                f"had any effect; verify the current state before retrying it."),
-                })
+                cleaned.append(self._tool_result(
+                    tcid,
+                    f"[SESSION RECOVERED] This tool call ({fn or 'unknown function'}) was "
+                    f"issued in a previous AI-Commander session that ended before its "
+                    f"result was recorded, so it was NOT re-executed. Do not assume it "
+                    f"had any effect; verify the current state before retrying it."))
                 notes.append(f"closed an unanswered tool call ({fn or 'unknown function'})")
         return cleaned, notes
 
@@ -879,13 +943,13 @@ class AICommander:
             # was interrupted) instead of a bare message count.
             last = restored[-1]
             if last.get("role") == "assistant":
-                text = (last.get("content") or "").strip()
+                text = _content_text(last.get("content")).strip()
                 if last.get("tool_calls"):
-                    names = []
-                    for tc in last["tool_calls"]:
-                        fn = (tc.get("function") or {}).get("name") if isinstance(tc, dict) else None
-                        names.append(fn or "unknown function")
-                    text = "tool call: " + ", ".join(names)
+                    names = [
+                        (tc.get("function") or {}).get("name") if isinstance(tc, dict) else None
+                        for tc in last["tool_calls"]
+                    ]
+                    text = "tool call: " + ", ".join(n or "unknown function" for n in names)
                 if text:
                     preview = text if len(text) <= 200 else text[:197] + "..."
                     self._log(f"[SESSION] Last assistant message: {preview}", style="cyan")
@@ -908,7 +972,7 @@ class AICommander:
         with open("commander-debug.txt", "w", encoding="utf-8") as f:
             f.write(f"Conversation history dump at {datetime.now().isoformat()}\n")
             f.write(f"Total messages: {len(self.conversation_history)}\n")
-            total_tokens = sum(self._estimate_message_tokens(msg) for msg in self.conversation_history)
+            total_tokens = self._estimate_input_tokens(self.conversation_history)
             f.write(f"Total content length: {total_tokens} tokens (est)\n")
             f.write(f"Max prompt length: {self.max_prompt_len} tokens\n")
             f.write("=" * 80 + "\n\n")
@@ -952,7 +1016,7 @@ class AICommander:
         line. Unknown algorithms fall back to the default, "truncate".
         """
         budget = self._prompt_budget()
-        total_tokens = sum(self._estimate_message_tokens(msg) for msg in self.conversation_history)
+        total_tokens = self._estimate_input_tokens(self.conversation_history)
 
         if total_tokens <= budget:
             return
@@ -972,12 +1036,12 @@ class AICommander:
         Keeps the system prompt (index 0) and first user instruction (index 1).
         Pass 1 condenses oversized tool outputs in-place, but only as many as
         needed; pass 2 drops the oldest messages from index 2 onwards. Both
-        stop once the retained history fits within ~{int(self.compress_target * 100)}% of the
-        budget, leaving headroom so several new turns fit before the next
-        compression.
+        stop once the retained history fits within the compress-target
+        fraction of the budget, leaving headroom so several new turns fit
+        before the next compression.
         """
-        # Leave ~{int(self.compress_target * 100)}% headroom (matching the context-compressor-llm
-        # algorithm) so the agent can run several more steps before re-triggering
+        # Leave headroom (matching the context-compressor-llm algorithm) so
+        # the agent can run several more steps before re-triggering
         # compression. Truncating down to the FULL budget makes every following
         # prompt exceed the limit again and re-compress on each step, slowly
         # losing more history than necessary. Conversely, condensing EVERY tool
@@ -985,7 +1049,7 @@ class AICommander:
         # (e.g. 22505 -> 1476 tokens) when tool outputs dominate, so pass 1
         # must condense only as many as needed to reach the target.
         retained_target = max(1, int(budget * self.compress_target))
-        self._log(f"[COMPRESS] Using 'truncate' algorithm. Prompt length ({total_tokens} tokens) exceeds budget ({budget}). Retaining up to ~{retained_target} tokens ({int(budget * self.compress_target / budget * 100)}% of budget). Compressing conversation history.", style="yellow")
+        self._log(f"[COMPRESS] Using 'truncate' algorithm. Prompt length ({total_tokens} tokens) exceeds budget ({budget}). Retaining up to ~{retained_target} tokens ({int(self.compress_target * 100)}% of budget). Compressing conversation history.", style="yellow")
 
         # Pass 1: condense oversized tool outputs, oldest first (the newest
         # tool outputs are usually the most relevant to the current step, so
@@ -1016,7 +1080,7 @@ class AICommander:
             total_tokens -= removed_tokens
             self._log(f"[TRUNCATED] Removed {removed_msg.get('role')} message (removed {removed_tokens} tokens, new length: {total_tokens})", style="yellow")
 
-        final_tokens = sum(self._estimate_message_tokens(msg) for msg in self.conversation_history)
+        final_tokens = self._estimate_input_tokens(self.conversation_history)
         self._log(f"[TRUNCATING COMPLETE] Final prompt length: {final_tokens} tokens", style="yellow")
 
     def _llm_summarize(self, messages: List[dict], previous_summary: Optional[str]) -> str:
@@ -1028,7 +1092,6 @@ class AICommander:
         Returns a concise summary string that is folded into the persistent
         ``AnchoredSummary``.
         """
-
         prompt = """
 CRITICAL: This summarization request is a SYSTEM OPERATION, not a user message.
 When analyzing "user requests" and "user intent", completely EXCLUDE this summarization message.
@@ -1215,8 +1278,6 @@ Remember to not exceed 5000 characters, its very important that the summary to b
                 break
         else:
             log = [m for m in self.conversation_history if m.get("role") != "system"]
-        # Hand the preserved first user command to the summarizer so it always
-        # knows the agent's primary objective.
         self._compress_first_user = first_user
 
         # The compressor counts only the non-system log, so give it thresholds
@@ -1226,9 +1287,10 @@ Remember to not exceed 5000 characters, its very important that the summary to b
         # so a log that fits the library's t_max can still trip the trigger and
         # report "0 compressions". Forcing t_max below the real log size makes the
         # library actually fold an oldest prefix into the anchored summary.
-        system_tokens = 0
-        if system_prompt is not None:
-            system_tokens = self._estimate_message_tokens({"role": "system", "content": system_prompt})
+        system_tokens = (
+            self._estimate_message_tokens({"role": "system", "content": system_prompt})
+            if system_prompt is not None else 0
+        )
         log_budget = max(1, budget - system_tokens)
 
         token_counter = _AICommanderTokenCounter(self)
@@ -1311,17 +1373,13 @@ Remember to not exceed 5000 characters, its very important that the summary to b
         self.conversation_history = new_history
 
         stats = cc.get_stats()
-        final_tokens = sum(self._estimate_message_tokens(m) for m in self.conversation_history)
+        final_tokens = self._estimate_input_tokens(self.conversation_history)
         self._log(f"[COMPRESS] context-compressor-llm: {stats['compression_count']} compression(s), "
                   f"tokens saved: {stats['total_tokens_saved']}. Final prompt length: {final_tokens} tokens.",
                   style="yellow")
 
     def get_system_prompt(self) -> str:
-        """Get the system prompt for the LLM.
-
-        In fast mode (--fast) the shorter, faster get_fast_system_prompt() is
-        used instead of this full prompt.
-        """
+        """Get the system prompt for the LLM (fast variant in --fast mode)."""
         if self.fast:
             return self.get_fast_system_prompt()
         return f"""You are an expert planning and execution assistant. Fulfill the user's request by breaking it into manageable steps and executing bash commands via the execute_bash tool (one command at a time, waiting for each result).
@@ -1357,13 +1415,7 @@ Remember to not exceed 5000 characters, its very important that the summary to b
 Think carefully; response quality is the highest priority. You have unlimited thinking tokens."""
 
     def get_fast_system_prompt(self) -> str:
-        """A smaller, faster system prompt for --fast mode.
-
-        Keeps only the essential instructions needed for the agent to function:
-        the tool workflow, the completion marker, and the output-limit sentinel.
-        Removes the verbose persistence policy, PTY notes, and the "think carefully" 
-        guidance to save tokens and latency.
-        """
+        """A smaller, faster system prompt for --fast mode."""
         return f"""You are an expert bash assistant. Complete the user's task by running commands via execute_bash, one at a time, and acting on each result.
 
 Workflow:
@@ -1472,7 +1524,10 @@ Rules:
                                 os.killpg(pid, signal.SIGTERM)
                                 time.sleep(0.3)
                                 try:
-                                    os.waitpid(pid, os.WNOHANG)
+                                    wpid, status = os.waitpid(pid, os.WNOHANG)
+                                    if wpid == pid:
+                                        exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else \
+                                                    (os.WTERMSIG(status) + 128)
                                 except OSError:
                                     pass
                                 break
@@ -1523,19 +1578,31 @@ Rules:
                 except OSError:
                     pass  # ESRCH/ECHILD: already reaped or not our child
 
+        return self._finish_command(output_buffer, command, exit_code, timed_out)
+
+    def _finalize_command_output(self, output_buffer: bytearray) -> str:
+        """Decode, normalize line endings, and truncate command output.
+
+        Shared by the POSIX PTY and Windows subprocess paths so both return
+        output in the same shape (and honor max_output_bytes identically).
+        """
         final_output = output_buffer.decode('utf-8', errors='replace')
-
-        # Normalize line endings (strips ^M from PTY output).
+        # Normalize line endings (strips ^M from PTY output; Windows tools
+        # emit \r\n).
         final_output = final_output.replace('\r\n', '\n').replace('\r', '\n')
-
         if len(final_output.encode('utf-8')) > self.max_output_bytes:
             final_output = final_output[:self.max_output_bytes] + "\n" + self.OUTPUT_TRUNCATION_SENTINEL
+        return final_output
 
-        self.sink.emit("CMD_COMPLETE", {"command": command, "exit_code": exit_code, "output": final_output})
-
+    def _finish_command(self, output_buffer: bytearray, command: str,
+                        exit_code: int, timed_out: bool) -> Tuple[str, int]:
+        """Shared tail of both command-execution paths: finalize the output,
+        emit CMD_COMPLETE, and raise on timeout."""
+        final_output = self._finalize_command_output(output_buffer)
+        self.sink.emit("CMD_COMPLETE", {"command": command, "exit_code": exit_code,
+                                        "output": final_output})
         if timed_out:
             raise CommandTimeoutError(f"Command timed out after {self.command_timeout} seconds")
-
         return final_output, exit_code
 
     def _execute_bash_command_windows(self, command: str) -> Tuple[str, int]:
@@ -1629,18 +1696,7 @@ Rules:
         if proc.returncode is not None:
             exit_code = proc.returncode
 
-        final_output = output_buffer.decode('utf-8', errors='replace')
-        # Normalize line endings (Windows tools emit \r\n).
-        final_output = final_output.replace('\r\n', '\n').replace('\r', '\n')
-        if len(final_output.encode('utf-8')) > self.max_output_bytes:
-            final_output = final_output[:self.max_output_bytes] + "\n" + self.OUTPUT_TRUNCATION_SENTINEL
-
-        self.sink.emit("CMD_COMPLETE", {"command": command, "exit_code": exit_code, "output": final_output})
-
-        if timed_out:
-            raise CommandTimeoutError(f"Command timed out after {self.command_timeout} seconds")
-
-        return final_output, exit_code
+        return self._finish_command(output_buffer, command, exit_code, timed_out)
 
     def get_user_confirmation(self, command: str) -> Tuple[bool, Optional[str]]:
         """Get user confirmation for command execution via the sink.
@@ -1754,6 +1810,21 @@ Rules:
 
         return validated
 
+    def _assistant_response(self, content, tool_calls=None, reasoning=None, terminal=False):
+        """Build a synthesized OpenAI-style assistant response dict.
+
+        Used for the safety-stop / user-stop paths (and as the final assembly
+        shape in call_llm_api) so every synthesized turn carries the same
+        fields the agent loop expects.
+        """
+        return {"choices": [{"message": {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": tool_calls,
+            "reasoning_content": reasoning,
+            **({"synthesized_terminal": True} if terminal else {}),
+        }}]}
+
     def call_llm_api(self, messages: List[Dict[str, str]], use_tools: bool = True,
                      stream_display: bool = True,
                      stream_label: Optional[str] = None,
@@ -1790,21 +1861,13 @@ Rules:
         # calling the API would produce consecutive assistant messages.
         if not messages:
             self._log(f"\n[SAFETY STOP] Conversation history validation returned empty - terminal assistant state detected. Ending interaction.")
-            return {
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": f"I have completed my response. No further actions are needed.\n\n{self.COMPLETION_MARKER}",
-                        "tool_calls": None,
-                        "reasoning_content": None,
-                        "synthesized_terminal": True
-                    }
-                }]
-            }
+            return self._assistant_response(
+                f"I have completed my response. No further actions are needed.\n\n{self.COMPLETION_MARKER}",
+                terminal=True)
 
         # Low temperature for tool use: high randomness yields malformed JSON
         # tool arguments. Creative text-only turns keep the high temperature.
-        temperature = 0.2 if use_tools else 1.0
+        temperature = 0.7 if use_tools else 1.0
 
         request_params = {
             "model": self.model,
@@ -1827,14 +1890,12 @@ Rules:
 
         # Live input-token estimate before the call starts; the TUI shows it in
         # the status bar until the exact usage arrives with the final chunk.
-        self.sink.emit("TOKEN_USAGE", {
-            "input_tokens": self._estimate_input_tokens(messages),
-            "output_tokens": 0,
-            "estimate": True,
-        })
+        self._emit_token_usage(self._estimate_input_tokens(messages), 0, estimate=True)
 
         max_retries = 5
         wait_seconds = 60
+        stream_started = 0.0
+        stream_elapsed = 0.0
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -1846,6 +1907,7 @@ Rules:
                 usage = None
                 label_sent = False
 
+                stream_started = time.monotonic()
                 stream = self.client.chat.completions.create(**request_params)
 
                 for chunk in stream:
@@ -1854,16 +1916,8 @@ Rules:
                         usage = chunk.usage
                     if self.stop_event.is_set():
                         self._log("\n[STOP] Agent shutdown requested. Aborting LLM stream.")
-                        return {
-                            "choices": [{
-                                "message": {
-                                    "role": "assistant",
-                                    "content": f"Agent stopped by user.\n\n{self.COMPLETION_MARKER}",
-                                    "tool_calls": None,
-                                    "reasoning_content": None
-                                }
-                            }]
-                        }
+                        return self._assistant_response(
+                            f"Agent stopped by user.\n\n{self.COMPLETION_MARKER}")
                     delta = chunk.choices[0].delta if chunk.choices else None
 
                     if delta:
@@ -1917,6 +1971,8 @@ Rules:
                                         current_tool_call["function"]["name"] += tool_call_chunk.function.name
                                     if tool_call_chunk.function.arguments:
                                         current_tool_call["function"]["arguments"] += tool_call_chunk.function.arguments
+
+                stream_elapsed = time.monotonic() - stream_started
                 break
             except Exception as e:
                 if attempt < max_retries:
@@ -1929,46 +1985,30 @@ Rules:
         final_tool_calls = [tc for tc in collected_tool_calls if tc.get("id")]
 
         # The API call finished: report the exact token counts so the TUI can
-        # replace the live estimate in the "context" status-bar counter.
+        # replace the live estimate in the "context" status-bar counter, and
+        # pass the server's real generation rate for the tok/s readout.
         if usage is not None:
-            # Prompt-cached tokens are served from cache (not re-processed) and
-            # are typically not billed, so report them separately so the total
-            # can reflect only the tokens actually processed/charged.
-            #
-            # Cached-token field names differ per provider:
-            #   - OpenAI:      usage.prompt_tokens_details.cached_tokens
-            #   - DeepSeek:    usage.prompt_cache_hit_tokens
-            #   - Anthropic:   usage.cache_read_input_tokens
-            cached = 0
-            details = getattr(usage, "prompt_tokens_details", None)
-            if details is not None:
-                cached = getattr(details, "cached_tokens", 0) or 0
-            # Accumulate the session totals persisted in the session file.
-            inp = getattr(usage, "prompt_tokens", 0) or 0
-            out = getattr(usage, "completion_tokens", 0) or 0
-            self.usage_totals["input_tokens"] += inp
-            self.usage_totals["output_tokens"] += out
-            self.usage_totals["cached_tokens"] += cached
-            self.usage_totals["billable_tokens"] += max(0, inp - cached) + out
-            self.sink.emit("TOKEN_USAGE", {
-                "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                "cached_tokens": cached,
-                "estimate": False,
-            })
+            completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+            tps = getattr(usage, "completion_tokens_per_sec", None)
+            if not tps and completion_tokens and stream_elapsed > 0:
+                tps = completion_tokens / stream_elapsed
+            self._emit_token_usage(
+                getattr(usage, "prompt_tokens", 0) or 0,
+                completion_tokens,
+                cached=self._extract_cached_tokens(usage),
+                tokens_per_sec=tps)
 
-        return {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": collected_content if collected_content else None,
-                    "tool_calls": final_tool_calls if final_tool_calls else None,
-                    # Sent back as reasoning_content so reasoning models receive
-                    # their prior reasoning on the next request.
-                    "reasoning_content": collected_thinking if collected_thinking else None
-                }
-            }]
-        }
+        # reasoning_content is sent back so reasoning models receive their
+        # prior reasoning on the next request.
+        return self._assistant_response(
+            collected_content or None,
+            final_tool_calls or None,
+            collected_thinking or None)
+
+    @staticmethod
+    def _tool_result(tool_call_id, content: str) -> Dict[str, str]:
+        """Build a tool result message for the conversation history."""
+        return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
     def process_llm_response(self, response: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str], List[Dict[str, Any]]]:
         """Extract content, tool calls, thinking, and malformed tool calls from
@@ -2026,7 +2066,10 @@ Rules:
                     "command": command,
                 })
 
-        return content or "", tool_calls_info, first_tool_call_id, thinking, malformed_tool_calls
+        # Some providers return structured (non-string) content parts; the
+        # agent loop only ever consumes plain text, so coerce anything else.
+        content = content if isinstance(content, str) else ""
+        return content, tool_calls_info, first_tool_call_id, thinking, malformed_tool_calls
 
     def handle_function_call(self, function_info: Dict[str, Any]) -> str:
         """Produce a tool result for tool calls that carry no bash command."""
@@ -2060,10 +2103,7 @@ Rules:
                 s = self.suggestion_queue.get_nowait()
             except queue.Empty:
                 break
-            self.conversation_history.append({
-                "role": "user",
-                "content": f"[Suggestion from user] {s}"
-            })
+            self.conversation_history.append({"role": "user", "content": f"[Suggestion from user] {s}"})
             self._log(f"[USER SUGGESTION] {s}", style="bold bright_yellow")
 
     def generate_task_summary(self, user_request: str, generation: int = 0):
@@ -2136,14 +2176,8 @@ Rules:
         # With persist_history, refresh the system prompt in place and append
         # the new request so prior chat context carries over; otherwise reset.
         if self.persist_history and self.conversation_history:
-            self.conversation_history[0] = {
-                "role": "system",
-                "content": self.get_system_prompt()
-            }
-            self.conversation_history.append({
-                "role": "user",
-                "content": user_request
-            })
+            self.conversation_history[0] = {"role": "system", "content": self.get_system_prompt()}
+            self.conversation_history.append({"role": "user", "content": user_request})
         else:
             self.conversation_history = [
                 {"role": "system", "content": self.get_system_prompt()},
@@ -2189,7 +2223,6 @@ Rules:
 
                 assistant_message = response["choices"][0]["message"]
 
-                # Terminal safety response synthesized by call_llm_api.
                 # Terminal safety response synthesized by call_llm_api when
                 # the history already ends on an assistant turn. Detected by
                 # its explicit tag: a content-shape heuristic would also
@@ -2237,11 +2270,8 @@ Rules:
                             f"Please re-issue the tool call with corrected, valid JSON arguments. "
                             f"If you cannot produce valid JSON for this tool call, respond with a normal text message instead."
                         )
-                        self.conversation_history.append({
-                            "role": "tool",
-                            "tool_call_id": mal["tool_call_id"],
-                            "content": err_msg,
-                        })
+                        self.conversation_history.append(
+                            self._tool_result(mal["tool_call_id"], err_msg))
                     self.save_session("malformed_tool_calls")
                     self._log(f"[INFO] Correction messages appended. Continuing to next step for LLM to fix the tool calls.")
                     continue
@@ -2258,11 +2288,8 @@ Rules:
                         if not command:
                             if tool_call_id and function_name:
                                 result = self.handle_function_call({"name": function_name, "arguments": tc_info["function_arguments"]})
-                                self.conversation_history.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": result
-                                })
+                                self.conversation_history.append(
+                                    self._tool_result(tool_call_id, result))
                                 self.save_session("tool_result")
                             continue
 
@@ -2276,41 +2303,30 @@ Rules:
                                 output, exit_code = self.execute_bash_command(command)
 
                                 if tool_call_id:
-                                    self.conversation_history.append({
-                                        "role": "tool",
-                                        "tool_call_id": tool_call_id,
-                                        "content": f"Command executed with exit code {exit_code}.\nOutput:\n{output}"
-                                    })
+                                    self.conversation_history.append(self._tool_result(
+                                        tool_call_id,
+                                        f"Command executed with exit code {exit_code}.\nOutput:\n{output}"))
 
                             except CommandTimeoutError as e:
                                 error_msg = str(e)
                                 self._log_error(f"[TIMEOUT] {error_msg}")
 
                                 if tool_call_id:
-                                    self.conversation_history.append({
-                                        "role": "tool",
-                                        "tool_call_id": tool_call_id,
-                                        "content": error_msg
-                                    })
+                                    self.conversation_history.append(
+                                        self._tool_result(tool_call_id, error_msg))
                             except Exception as e:
                                 error_msg = f"Command execution failed: {str(e)}"
                                 self._log_error(error_msg)
 
                                 if tool_call_id:
-                                    self.conversation_history.append({
-                                        "role": "tool",
-                                        "tool_call_id": tool_call_id,
-                                        "content": error_msg
-                                    })
+                                    self.conversation_history.append(
+                                        self._tool_result(tool_call_id, error_msg))
                         else:
                             self._log(f"[INFO] Command not approved by user.")
 
                             if tool_call_id:
-                                self.conversation_history.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": "Command execution skipped by user."
-                                })
+                                self.conversation_history.append(self._tool_result(
+                                    tool_call_id, "Command execution skipped by user."))
 
                                 if user_suggestion:
                                     self.conversation_history.append({
@@ -2370,7 +2386,30 @@ Rules:
 
 
 if _TEXTUAL_AVAILABLE:
-    class ApprovalScreen(ModalScreen):
+    class _SafeUIMixin:
+        """Shared UI helpers that swallow widget-not-mounted races.
+
+        Textual widgets can disappear (or never have mounted) while a timer,
+        poller or agent event still targets them; these helpers keep those
+        paths from crashing the app.
+        """
+
+        @staticmethod
+        def _safe_call(fn, *args, **kwargs):
+            try:
+                fn(*args, **kwargs)
+            except Exception:
+                pass
+
+        def _safe_query(self, selector, expect_type=None):
+            """query_one() that yields None instead of raising."""
+            try:
+                return (self.query_one(selector, expect_type) if expect_type
+                        else self.query_one(selector))
+            except Exception:
+                return None
+
+    class ApprovalScreen(_SafeUIMixin, ModalScreen):
         """Blocking modal that asks the user to approve or reject a command.
 
         The agent thread is blocked in TUISink.input(); the decision callback
@@ -2505,9 +2544,9 @@ def _enable_windows_console_vt() -> None:
     if os.name != "nt":
         return
     try:
-        os.system("")
+        os.system("")  # never block startup over cosmetics
     except Exception:
-        pass  # never block startup over cosmetics
+        pass
 
 
 def main():
@@ -2564,7 +2603,7 @@ def main():
                              f"directory). The history is written after every "
                              f"step and reloaded on startup, so a crash loses at "
                              f"most the in-flight turn. Plain JSON: the "
-                             f"\"messages\" array can be edited by hand to shape "
+                             f'"messages" array can be edited by hand to shape '
                              f"a session. When another AI-Commander instance "
                              f"already holds the default file, .aicsession2, "
                              f".aicsession3, ... are used instead.")
@@ -2709,7 +2748,7 @@ def main():
     from rich.text import Text as RichText
     import pyte
 
-    class PromptInput(Input):
+    class PromptInput(_SafeUIMixin, Input):
         """Textual Input with readline-style history navigation.
 
         Up/Down (and Ctrl+P/Ctrl+N) walk the shared readline history while
@@ -2775,16 +2814,10 @@ def main():
                 if match is not None:
                     self.value = match
                     self.cursor_position = len(match)
-                try:
-                    self.focus()
-                except Exception:
-                    pass
-            try:
-                self.app.push_screen(ReverseSearchScreen(on_result))
-            except Exception:
-                pass
+                self._safe_call(self.focus)
+            self._safe_call(self.app.push_screen, ReverseSearchScreen(on_result))
 
-    class ReverseSearchScreen(ModalScreen):
+    class ReverseSearchScreen(_SafeUIMixin, ModalScreen):
         """Modal incremental reverse search over the readline history.
 
         Typing filters history (newest-first) for a case-insensitive substring;
@@ -2839,10 +2872,7 @@ def main():
                 yield Static("", id="reverse-search-status", markup=False)
 
         def on_mount(self):
-            try:
-                self.query_one("#reverse-search-input").focus()
-            except Exception:
-                pass
+            self._safe_call(self.query_one("#reverse-search-input").focus)
             self._refresh()
 
         def on_input_changed(self, event):
@@ -2854,17 +2884,11 @@ def main():
             # and never reaches the screen-level "enter" binding. Accept (or
             # cancel when empty) here so Enter closes the modal.
             if getattr(event.input, "id", None) == "reverse-search-input":
-                if self._matches:
-                    self.action_accept()
-                else:
-                    self.action_cancel()
+                (self.action_accept if self._matches else self.action_cancel)()
 
         def _refresh(self):
-            query = ""
-            try:
-                query = self.query_one("#reverse-search-input").value
-            except Exception:
-                pass
+            input_widget = self._safe_query("#reverse-search-input")
+            query = input_widget.value if input_widget else ""
             self._matches = []
             self._match_pos = 0
             length = _rl_history_length()
@@ -2877,16 +2901,12 @@ def main():
             label = f"(reverse-i-search)`{query}': "
             if query and not self._matches:
                 label += "failing"
-            try:
-                self.query_one("#reverse-search-label", Static).update(label)
-            except Exception:
-                pass
+            self._safe_call(self.query_one("#reverse-search-label", Static).update, label)
             self._update_status()
 
         def _update_status(self):
-            try:
-                status = self.query_one("#reverse-search-status", Static)
-            except Exception:
+            status = self._safe_query("#reverse-search-status", Static)
+            if status is None:
                 return
             if self._matches:
                 _, text = self._matches[self._match_pos]
@@ -2904,18 +2924,14 @@ def main():
                 self._update_status()
 
         def action_accept(self):
-            if self._matches:
-                _, text = self._matches[self._match_pos]
-                self._on_result(text)
-            else:
-                self._on_result(None)
+            self._on_result(self._matches[self._match_pos][1] if self._matches else None)
             self.dismiss()
 
         def action_cancel(self):
             self._on_result(None)
             self.dismiss()
 
-    class ShellWidget(Widget, can_focus=True):
+    class ShellWidget(_SafeUIMixin, Widget, can_focus=True):
         """An interactive shell embedded in a Textual widget.
 
         Spawns the user's shell in a pty, emulates VT100 output with pyte,
@@ -2935,9 +2951,8 @@ def main():
             self._last_render = ""
             # The shell's current working directory, kept in sync with the
             # process-wide cwd (and therefore the agent thread) so commands the
-            # agent runs via execute_bash land in the same directory the user
-            # navigated the interactive shell to. Mirrors the shell's /proc
-            # cwd; None until the shell spawns.
+            # agent runs via execute_bash land in the directory the user
+            # navigated to. None until the shell spawns.
             self._cwd: Optional[str] = None
 
         def check_consume_key(self, key: str, character: Optional[str]) -> bool:
@@ -2954,7 +2969,7 @@ def main():
                 self.refresh()
                 return
             shell = os.environ.get("SHELL", "") or "/bin/sh"
-            if not shell or not os.path.exists(shell):
+            if not os.path.exists(shell):
                 shell = "/bin/sh"
             try:
                 pid, master_fd = pty.fork()
@@ -2987,11 +3002,9 @@ def main():
             """Tell the kernel the pty window size (so full-screen apps work)."""
             if self._master_fd is None:
                 return
-            try:
-                winsize = struct.pack("HHHH", self._rows, self._cols, 0, 0)
-                fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
-            except OSError:
-                pass
+            self._safe_call(lambda: fcntl.ioctl(
+                self._master_fd, termios.TIOCSWINSZ,
+                struct.pack("HHHH", self._rows, self._cols, 0, 0)))
 
         def on_mount(self) -> None:
             # Don't spawn here: the widget starts hidden inside the
@@ -3067,8 +3080,6 @@ def main():
                 shell_cwd = os.readlink(f"/proc/{self._pid}/cwd")
             except (OSError, ProcessLookupError):
                 return
-            if not shell_cwd:
-                return
             if shell_cwd == self._cwd:
                 return
             # Only change the process cwd, never the shell's own (it is
@@ -3094,9 +3105,7 @@ def main():
             the pyte cursor position."""
             if not self._history:
                 return RichText("")
-            height = self.size.height
-            if height <= 0:
-                height = 24
+            height = self.size.height or 24
             visible = self._history[-height:] if height else []
             # Pad short buffers so the prompt sits at the bottom.
             if len(visible) < height:
@@ -3145,10 +3154,8 @@ def main():
         def _key_to_bytes(self, event: events.Key) -> bytes:
             """Convert a Textual Key event into the byte sequence for the pty."""
             key = event.key
-            if key.startswith("ctrl+"):
-                ch = key[5:]
-                if len(ch) == 1 and ch.isalpha():
-                    return bytes([ord(ch.lower()) & 0x1f])
+            if key.startswith("ctrl+") and len(key) == 6 and key[5].isalpha():
+                return bytes([ord(key[5].lower()) & 0x1f])
             if event.is_printable and event.character:
                 return event.character.encode("utf-8")
             special = {
@@ -3176,7 +3183,7 @@ def main():
                     return b"\x1b[" + str(n + 9).encode() + b"~"
             return b""
 
-    class RightPanel(Vertical):
+    class RightPanel(_SafeUIMixin, Vertical):
         """Right-hand tab panel (Console Output + Shell) built from a button
         strip and a ContentSwitcher (TabbedContent breaks this layout)."""
 
@@ -3204,25 +3211,15 @@ def main():
             """Reflect the active pane on the tab buttons via the active-tab
             class. Callers that just switched panes pass *active* explicitly
             because ContentSwitcher applies `current` asynchronously."""
-            if active is None:
-                active = self._switcher.current
-            console_active = active == "console-log"
+            console_active = (active or self._switcher.current) == "console-log"
 
             def _apply():
-                try:
-                    bc = self.query_one("#btn-console", Button)
-                    bs = self.query_one("#btn-shell", Button)
-                    if console_active:
-                        bc.add_class("active-tab")
-                        bs.remove_class("active-tab")
-                    else:
-                        bs.add_class("active-tab")
-                        bc.remove_class("active-tab")
-                except Exception:
-                    pass
-            # Defer so the class change isn't clobbered by the switcher/focus
-            # updates that immediately follow a tab switch.
-            self.call_after_refresh(_apply)
+                bc = self.query_one("#btn-console", Button)
+                bs = self.query_one("#btn-shell", Button)
+                active_btn, inactive_btn = ((bc, bs) if console_active else (bs, bc))
+                active_btn.add_class("active-tab")
+                inactive_btn.remove_class("active-tab")
+            self._safe_call(_apply)
 
         def action_switch_tab(self) -> None:
             """Cycle between the Console Output and Shell tabs."""
@@ -3240,14 +3237,9 @@ def main():
                 self._switcher.current = "shell-widget"
                 self._update_tab_buttons("shell-widget")
                 # Focus the shell after Textual's own click->focus logic runs.
-                def _focus_shell():
-                    try:
-                        self.query_one("#shell-widget").focus()
-                    except Exception:
-                        pass
-                self.set_timer(0.01, _focus_shell)
+                self.set_timer(0.01, lambda: self._safe_call(self.query_one("#shell-widget").focus))
 
-    class CommanderApp(App):
+    class CommanderApp(_SafeUIMixin, App):
         """Textual TUI for AI-Commander.
 
         Norton-Commander style layout: agent output (left), console/shell tabs
@@ -3393,9 +3385,6 @@ def main():
             self.step_count = 0
             self.max_steps = 500
             self.tokens_per_second = 0.0
-            # Rolling ~1s window for the live tok/s display in the status bar.
-            self._tok_window_start = time.monotonic()
-            self._tok_window_tokens = 0
             # Cumulative session token total. Only exact server-reported usage
             # is added (see _apply_token_usage), so it never over-counts.
             self.context_tokens = 0
@@ -3456,14 +3445,8 @@ def main():
             # It is hidden by default in CSS so a remount never flashes it.
             self._show_warning_banner()
             self.set_timer(20.0, self._auto_hide_warning_banner)
-            try:
-                self.query_one("#right-panel ContentSwitcher").current = "console-log"
-            except Exception:
-                pass
-            try:
-                self.query_one("#prompt-input").focus()
-            except Exception:
-                pass
+            self._safe_call(setattr, self.query_one("#right-panel ContentSwitcher"), "current", "console-log")
+            self._safe_call(self.query_one("#prompt-input").focus)
             self.set_interval(0.25, self._drain_queue)
 
             # Auto-start the agent with a CLI-supplied request, mirroring
@@ -3478,31 +3461,24 @@ def main():
         def on_button_pressed(self, event: Button.Pressed) -> None:
             """Focus the shell when its tab button is clicked."""
             if event.button.id == "btn-shell":
-                try:
+                def _focus_shell():
                     switcher = self.query_one("#right-panel ContentSwitcher")
                     if switcher.current == "shell-widget":
                         self.query_one("#shell-widget").focus()
-                except Exception:
-                    pass
+                self._safe_call(_focus_shell)
 
         def update_status_bar(self):
             sb = self.query_one("#status-bar")
             ap_status = "ON" if self.auto_approve else "OFF"
             sandbox_on = getattr(self.args, "sandbox_enabled", False)
-            sandbox_txt = (
-                "[green]Sandbox: on[/green]"
-                if sandbox_on
-                else "[red]Sandbox: off[/red]"
-            )
+            sandbox_txt = "[green]Sandbox: on[/green]" if sandbox_on else "[red]Sandbox: off[/red]"
             # "Context" = the current context window: the token estimate of the
             # live conversation history (the prompt currently being sent). The
             # cumulative session total (sum of every call's input+output) is
             # shown separately as "Total Tokens".
-            history = self.agent.conversation_history if self.agent else []
             context_window = (
-                sum(self.agent._estimate_message_tokens(m) for m in history)
-                if self.agent
-                else 0
+                self.agent._estimate_input_tokens(self.agent.conversation_history)
+                if self.agent else 0
             )
             session_txt = (
                 os.path.basename(self.args.session_file)
@@ -3562,10 +3538,8 @@ def main():
                 self._write_agent(f"[ERROR] {payload.get('text', '')}", style="bold red")
             elif kind == "LLM_STREAM":
                 self._write_agent(payload.get("text", ""), streaming=True, style="cyan")
-                self._track_token()
             elif kind == "THINKING_STREAM":
                 self._write_agent(payload.get("text", ""), streaming=True, prefix="[THINKING] ", style="yellow")
-                self._track_token()
             elif kind == "CONSOLE_STREAM":
                 self._write_console(payload.get("text", ""), style="yellow", streaming=True)
             elif kind == "CMD_EXEC":
@@ -3597,7 +3571,6 @@ def main():
             elif kind == "STATUS_UPDATE":
                 self.step_count = payload.get("step", 0)
                 self.max_steps = payload.get("max_steps", 500)
-                self._decay_token_rate()
             elif kind == "TOKEN_USAGE":
                 self._apply_token_usage(payload)
             elif kind == "TASK_TITLE":
@@ -3617,41 +3590,27 @@ def main():
             total; the estimates and live-streamed chunks are ignored so the
             counter never over-counts.
             """
-            inp = payload.get("input_tokens", 0) or 0
-            out = payload.get("output_tokens", 0) or 0
             if payload.get("estimate"):
                 return
             # Prompt-cached tokens are served from cache and typically not
             # billed, so exclude them from the cumulative total: only the
             # non-cached (newly processed) tokens count.
+            inp = payload.get("input_tokens", 0) or 0
+            out = payload.get("output_tokens", 0) or 0
             cached = payload.get("cached_tokens", 0) or 0
             self.context_tokens += max(0, inp - cached) + out
-
-        def _track_token(self):
-            """Update the rolling tok/s rate for a streamed chunk (does not
-            affect the cumulative token total, which comes from exact usage)."""
-            now = time.monotonic()
-            self._tok_window_tokens += 1
-            if now - self._tok_window_start >= 1.0:
-                elapsed = now - self._tok_window_start
-                if elapsed > 0:
-                    self.tokens_per_second = self._tok_window_tokens / elapsed
-                self._tok_window_start = now
-                self._tok_window_tokens = 0
-
-        def _decay_token_rate(self):
-            """Reset the rate to 0 once streaming has been idle for 2s."""
-            if self._tok_window_tokens == 0 and time.monotonic() - self._tok_window_start >= 2.0:
-                self.tokens_per_second = 0.0
+            # Real tok/s: the server reports its own generation rate with the
+            # final usage chunk, so show that instead of counting chunks.
+            tps = payload.get("tokens_per_sec")
+            if tps:
+                self.tokens_per_second = float(tps)
 
         def _sync_autoscroll(self, widget):
             """Pin the view to the bottom only when the user is already there,
             so new messages don't yank the scroll bar away from history being
             read. If the user has scrolled up, auto-scroll is disabled."""
-            try:
-                widget.auto_scroll = widget.scroll_y >= widget.max_scroll_y
-            except Exception:
-                pass
+            self._safe_call(
+                lambda: setattr(widget, "auto_scroll", widget.scroll_y >= widget.max_scroll_y))
 
         def _anchor_scroll(self, widget, start_line_before):
             """Keep the viewport anchored to the same content after a write.
@@ -3663,15 +3622,11 @@ def main():
             compensates by scrolling up by the same number of trimmed lines so
             the lines being read stay put.
             """
-            try:
+            def _apply():
                 trimmed = widget._start_line - start_line_before
                 if trimmed > 0 and not widget.auto_scroll:
-                    widget.scroll_to(
-                        y=max(0, widget.scroll_y - trimmed),
-                        animate=False,
-                    )
-            except Exception:
-                pass
+                    widget.scroll_to(y=max(0, widget.scroll_y - trimmed), animate=False)
+            self._safe_call(_apply)
 
         def _set_agent_task_title(self, summary: str = ""):
             """Title the agent panel with the session's task.
@@ -3680,12 +3635,51 @@ def main():
             the initial prompt, or restored from the session file), otherwise
             the plain "Agent Output".
             """
-            try:
+            def _apply():
                 agent = self.query_one("#agent-log")
-                # Plain string: the bold bright-yellow look comes from the
-                # border-title-color/border-title-style CSS on #agent-log
-                # (Textual 8.x ignores span styles on border titles).
                 agent.border_title = f"Agent task: {summary}" if summary else "Agent Output"
+            self._safe_call(_apply)
+
+        def _write_log(self, widget_id: str, text: str, style: str = "",
+                       streaming: bool = False, prefix: str = "", transform=None):
+            """Write text to a RichLog panel (shared by both output panes).
+
+            Streaming text is buffered and flushed as complete lines so tokens
+            flow inline. *prefix* is shown once per stream, not per chunk. A
+            non-streaming write ends any active stream: the partial line is
+            flushed and the stream-tracking state is reset. *transform*, when
+            given, maps the cleaned text before it is buffered.
+            """
+            try:
+                from rich.text import Text
+                widget = self.query_one(widget_id)
+                self._sync_autoscroll(widget)
+                clean = _strip_ansi(text)
+                if transform:
+                    clean = transform(clean)
+                if not clean:
+                    return
+                start_line_before = widget._start_line
+                if streaming:
+                    if prefix and widget_id not in self._stream_prefix_done:
+                        self._stream_prefix_done.add(widget_id)
+                        widget.write(Text(_strip_ansi(prefix).strip(), style=style or "yellow"))
+                    # Flush complete lines; keep the partial line buffered.
+                    buf = self._stream_buffer.get(widget_id, "") + clean
+                    parts = buf.split("\n")
+                    self._stream_buffer[widget_id] = parts[-1]
+                    for part in parts[:-1]:
+                        widget.write(Text(part, style=style) if style else Text(part))
+                else:
+                    pending = self._stream_buffer.pop(widget_id, "")
+                    if pending:
+                        widget.write(Text(pending, style=style) if style else Text(pending))
+                    self._stream_prefix_done.discard(widget_id)
+                    full = _strip_ansi(prefix) + clean
+                    widget.write(Text(full, style=style) if style else Text(full))
+                # If the log hit its max_lines cap and trimmed old lines off the
+                # top, re-anchor the viewport so the lines being read stay put.
+                self._anchor_scroll(widget, start_line_before)
             except Exception:
                 pass
 
@@ -3696,44 +3690,11 @@ def main():
             flow inline. The prefix label is shown once per stream, not per
             chunk. *style* is a Rich style string.
             """
-            try:
-                from rich.text import Text
-                widget = self.query_one("#agent-log")
-                self._sync_autoscroll(widget)
-                clean = _strip_ansi(text)
-                # Hide the internal completion marker from the panel; the
-                # agent loop still uses it to detect task completion.
-                clean = clean.replace("TASKCOMPLETE", "")
-                if not clean:
-                    return
-                start_line_before = widget._start_line
-                buf_key = "#agent-log"
-                if streaming:
-                    if prefix and buf_key not in self._stream_prefix_done:
-                        self._stream_prefix_done.add(buf_key)
-                        widget.write(Text(_strip_ansi(prefix).strip(), style=style or "yellow"))
-
-                    # Flush complete lines; keep the partial line buffered.
-                    buf = self._stream_buffer.get(buf_key, "") + clean
-                    parts = buf.split("\n")
-                    self._stream_buffer[buf_key] = parts[-1]
-                    for part in parts[:-1]:
-                        widget.write(Text(part, style=style) if style else Text(part))
-                else:
-                    # A non-streaming write ends any active stream: flush the
-                    # buffer and reset stream-tracking state.
-                    pending = self._stream_buffer.pop(buf_key, "")
-                    if pending:
-                        widget.write(Text(pending, style=style) if style else Text(pending))
-                    self._stream_prefix_done.discard(buf_key)
-
-                    full = _strip_ansi(prefix) + clean
-                    widget.write(Text(full, style=style) if style else Text(full))
-                # If the log hit its max_lines cap and trimmed old lines off the
-                # top, re-anchor the viewport so the lines being read stay put.
-                self._anchor_scroll(widget, start_line_before)
-            except Exception:
-                pass
+            # Hide the internal completion marker from the panel; the agent
+            # loop still uses it to detect task completion.
+            self._write_log("#agent-log", text, style=style, streaming=streaming,
+                            prefix=prefix,
+                            transform=lambda clean: clean.replace("TASKCOMPLETE", ""))
 
         def _write_console(self, text: str, style: str = "", streaming: bool = False):
             """Write text to the console output RichLog.
@@ -3741,31 +3702,7 @@ def main():
             When *streaming* is True, tokens are buffered and flushed as complete
             lines so the partial line stays inline (used by CONSOLE_STREAM).
             """
-            try:
-                from rich.text import Text
-                widget = self.query_one("#console-log")
-                self._sync_autoscroll(widget)
-                clean = _strip_ansi(text)
-                if not clean:
-                    return
-                start_line_before = widget._start_line
-                buf_key = "#console-log"
-                if streaming:
-                    buf = self._stream_buffer.get(buf_key, "") + clean
-                    parts = buf.split("\n")
-                    self._stream_buffer[buf_key] = parts[-1]
-                    for part in parts[:-1]:
-                        widget.write(Text(part, style=style) if style else Text(part))
-                else:
-                    pending = self._stream_buffer.pop(buf_key, "")
-                    if pending:
-                        widget.write(Text(pending, style=style) if style else Text(pending))
-                    widget.write(Text(clean, style=style) if style else Text(clean))
-                # If the log hit its max_lines cap and trimmed old lines off the
-                # top, re-anchor the viewport so the lines being read stay put.
-                self._anchor_scroll(widget, start_line_before)
-            except Exception:
-                pass
+            self._write_log("#console-log", text, style=style, streaming=streaming)
 
         def _auto_hide_warning_banner(self):
             """Hide the banner after the grace period unless an approval is
@@ -3774,20 +3711,14 @@ def main():
                 self._hide_warning_banner()
 
         def _hide_warning_banner(self):
-            try:
-                self.query_one("#warning-banner").display = False
-            except Exception:
-                pass
+            self._safe_call(lambda: setattr(self.query_one("#warning-banner"), "display", False))
 
         def _show_warning_banner(self):
             # With auto-approve on, commands never require approval, so the
             # banner is irrelevant; keep it hidden entirely.
             if self.auto_approve:
                 return
-            try:
-                self.query_one("#warning-banner").display = True
-            except Exception:
-                pass
+            self._safe_call(lambda: setattr(self.query_one("#warning-banner"), "display", True))
 
         def _refresh_approval_prompt(self):
             """Update the warning banner to show pending approval status."""
@@ -3914,12 +3845,12 @@ def main():
                 if role == "system":
                     continue
                 if role == "user":
-                    content = msg.get("content") or ""
-                    if isinstance(content, str) and content.strip():
+                    content = _content_text(msg.get("content")).strip()
+                    if content:
                         self._write_agent(f"[USER REQUEST] {content}", style="bold bright_yellow")
                 elif role == "assistant":
-                    content = msg.get("content") or ""
-                    if isinstance(content, str) and content.strip():
+                    content = _content_text(msg.get("content")).strip()
+                    if content:
                         self._write_agent(content, style="cyan")
                     for tc in msg.get("tool_calls") or []:
                         try:
@@ -3934,7 +3865,10 @@ def main():
                     tcid = msg.get("tool_call_id")
                     cmd = pending_tool_calls.pop(tcid, None)
                     if cmd:
-                        self._write_console(f"[Executing] {cmd}", style="yellow")
+                        # The live run writes this line to the agent panel once
+                        # the command runs; keep the restored view on the same
+                        # panel so tool calls show up on the left too.
+                        self._write_agent(f"[Executing] {cmd}")
                     output = msg.get("content")
                     if isinstance(output, str) and output.strip():
                         # Keep the console excerpt bounded like a live run: the
@@ -4020,6 +3954,21 @@ def main():
 
             self._start_agent(text)
 
+        def _resolve_pending_approval(self, approved: bool, console_msg: str,
+                                      suggestion: str = "", error_noun: str = "approve"):
+            """Resolve the pending approval gate (shared by /approve, /reject
+            and /suggest); clears the pending state either way."""
+            if not self.pending_approval:
+                self._write_agent(f"[ERROR] No pending approval to {error_noun}.")
+                return
+            if self.sink and self.sink._approval_event:
+                self.sink.resolve_approval(approved=approved, suggestion=suggestion)
+                self._write_console(f"{console_msg} {self.pending_approval.get('command','')}")
+            else:
+                self._write_agent("[ERROR] No active approval gate to resolve.")
+            self.pending_approval = None
+            self._refresh_approval_prompt()
+
         def _handle_slash_command(self, cmd: str):
             """Handle slash commands typed in the prompt panel."""
             parts = cmd.lower().split(" ", 1)
@@ -4046,40 +3995,14 @@ def main():
                 self.update_status_bar()
 
             elif command == "/approve":
-                if not self.pending_approval:
-                    self._write_agent("[ERROR] No pending approval to approve.")
-                    return
-                if self.sink and self.sink._approval_event:
-                    self.sink.resolve_approval(approved=True)
-                    self._write_console(f"[APPROVED] {self.pending_approval.get('command','')}")
-                else:
-                    self._write_agent("[ERROR] No active approval gate to resolve.")
-                self.pending_approval = None
-                self._refresh_approval_prompt()
+                self._resolve_pending_approval(True, "[APPROVED]")
 
             elif command == "/reject":
-                if not self.pending_approval:
-                    self._write_agent("[ERROR] No pending approval to reject.")
-                    return
-                if self.sink and self.sink._approval_event:
-                    self.sink.resolve_approval(approved=False)
-                    self._write_console(f"[REJECTED] {self.pending_approval.get('command','')}")
-                else:
-                    self._write_agent("[ERROR] No active approval gate to resolve.")
-                self.pending_approval = None
-                self._refresh_approval_prompt()
+                self._resolve_pending_approval(False, "[REJECTED]", error_noun="reject")
 
             elif command == "/suggest":
-                if not self.pending_approval:
-                    self._write_agent("[ERROR] No pending approval to suggest for.")
-                    return
-                if self.sink and self.sink._approval_event:
-                    self.sink.resolve_approval(approved=False, suggestion=arg)
-                    self._write_console(f"[REJECTED WITH SUGGESTION] {self.pending_approval.get('command','')}")
-                else:
-                    self._write_agent("[ERROR] No active approval gate to resolve.")
-                self.pending_approval = None
-                self._refresh_approval_prompt()
+                self._resolve_pending_approval(False, "[REJECTED WITH SUGGESTION]",
+                                               suggestion=arg, error_noun="suggest for")
 
             elif command in ("/clear", "/new"):
                 # Clear the conversation history and start a fresh session,
@@ -4126,6 +4049,11 @@ def main():
                     self.session_id = self.agent.session_id
                     self.step_count = self.agent.step_count
                     self.context_tokens = self.agent.usage_totals.get("billable_tokens", 0)
+                    # The replay appends to the panels; clear them first so a
+                    # reload shows exactly the reloaded session instead of the
+                    # old transcript with the new one appended below it.
+                    for widget_id in ("#agent-log", "#console-log"):
+                        self._safe_call(self.query_one(widget_id).clear)
                     self._render_restored_history()
                     self._write_agent("[RELOAD] Session reloaded from disk.", style="bold green")
                 else:
