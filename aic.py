@@ -1391,6 +1391,9 @@ Remember to not exceed 5000 characters, its very important that the summary to b
 4. If a step fails, adjust your approach and explain. If all steps are done and the goal is met, emit the exact phrase '{self.COMPLETION_MARKER}'.
 5. Only emit '{self.COMPLETION_MARKER}' once you are certain every necessary action is complete and verified. Never say it prematurely.
 
+**Working Directory:**
+- Create a working directory named after the task (e.g. `work/<short-task-slug>/`, under the current directory or /tmp — wherever writes are allowed) and keep ALL temporary files there: scripts, patches, downloads, test output, generated artifacts. Never scatter temporary files in the project root; only the task's real deliverables belong outside the working directory.
+
 **Runtime Constraints (execute_bash):**
 - Output is capped at {self.max_output_bytes} bytes. If truncated, the literal sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}` is appended. If you see it, you are missing data — do NOT assume success or failure. Re-run with output redirected to a file and read in chunks via `sed -n 'start,end p' file`, or use `head -c N`/`tail -c N`. Prefer targeted commands (grep, wc, stat) over dumping large outputs.
 - Commands are killed after {self.command_timeout}s. For long operations use `nohup ... &` and check later, split into smaller steps, or set your own `timeout`.
@@ -1424,6 +1427,7 @@ Workflow:
 - When the task is fully done and verified, emit '{self.COMPLETION_MARKER}' and stop.
 
 Rules:
+- Create a working directory named after the task (e.g. `work/<short-task-slug>/`) and keep temporary files there, not in the project root.
 - Output is capped at {self.max_output_bytes} bytes; if truncated the sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}` is appended. If you see it, you are missing data — do not assume success or failure; re-run a more targeted command.
 - Commands are killed after {self.command_timeout}s.
 - Only report conclusions from real tool output; never fabricate results.
