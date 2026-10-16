@@ -88,6 +88,8 @@ class FakeCompletions:
             chunks = self._script.pop(0)
         else:
             chunks = self._default_response()
+        if isinstance(chunks, Exception):  # scripted API failure
+            raise chunks
         return iter(chunks)
 
     @staticmethod

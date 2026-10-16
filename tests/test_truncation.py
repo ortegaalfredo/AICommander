@@ -1307,6 +1307,348 @@ class TestRunner:
                        custom == os.path.join(tmp, "my-session.json") and nc == 1, custom)
 
     # ------------------------------------------------------------------ #
+    # 4c. Regression tests for agent-loop fixes                          #
+    # ------------------------------------------------------------------ #
+
+    def test_validate_merges_consecutive_assistants(self):
+        # Mid-list consecutive assistants are merged, not dropped: both texts
+        # and every answered tool call survive.
+        c = self.make_commander()
+        out = c._validate_messages([
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "first"},
+            {"role": "assistant", "content": "second", "tool_calls": [{"id": "t1"}]},
+            {"role": "tool", "tool_call_id": "t1", "content": "r"},
+        ])
+        merged = [m for m in out if m["role"] == "assistant"]
+        self.check("merge: one assistant turn", len(merged) == 1, repr(out))
+        self.check("merge: both texts kept", merged and "first" in merged[0]["content"]
+                   and "second" in merged[0]["content"], repr(merged))
+        self.check("merge: tool call kept", merged and merged[0].get("tool_calls") == [{"id": "t1"}], repr(merged))
+        # An assistant turn left empty by the pairing repair is dropped.
+        out = c._validate_messages([
+            {"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "lost"}]},
+            {"role": "user", "content": "again"},
+        ])
+        self.check("validate: emptied assistant turn dropped",
+                   [m["role"] for m in out] == ["system", "user", "user"], repr(out))
+
+    def test_command_output_cleaning(self):
+        clean = aic._clean_command_output
+        self.check("clean: ANSI colors stripped", clean("a\x1b[31mb\x1b[0m\x1b[?25l") == "ab")
+        self.check("clean: progress bar keeps final state",
+                   clean("10%\r50%\r100%\ndone\n") == "100%\ndone\n", repr(clean("10%\r50%\r100%\ndone\n")))
+        self.check("clean: CRLF normalized", clean("x\r\ny\r\n") == "x\ny\n")
+        self.check("clean: overstrike removed", clean("b\x08bo\x08ol\x08ld") == "bold")
+        c = self.make_commander()
+        out, code = c.execute_bash_command("printf 'a\\033[32mgreen\\033[0m\\n'; printf '1\\r2\\r3\\n'")
+        self.check("execute: output is model-friendly", out == "agreen\n3\n", repr(out))
+
+    def test_output_truncation_multibyte(self):
+        c = self.make_commander(max_output_bytes=100)
+        out, _ = c.execute_bash_command("python3 -c \"print('é' * 400)\"")
+        body = out[:-len(c.OUTPUT_TRUNCATION_SENTINEL)]
+        self.check("truncation: capped in bytes, not characters", len(body.encode("utf-8")) <= 101,
+                   f"{len(body.encode('utf-8'))} bytes")
+
+    def test_command_timeout_keeps_partial_output(self):
+        c = self.make_commander(command_timeout=1)
+        try:
+            c.execute_bash_command("echo before-timeout; sleep 30")
+            self.check("timeout: raises CommandTimeoutError", False)
+        except aic.CommandTimeoutError as exc:
+            self.check("timeout: partial output kept", "before-timeout" in exc.output, repr(exc.output))
+
+    def test_process_response_argument_shapes(self):
+        c = self.make_commander()
+
+        def first_command(arguments):
+            resp = {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "execute_bash", "arguments": arguments}}]}}]}
+            return c.process_llm_response(resp)[1][0]["command"]
+        self.check("args: dict accepted", first_command({"command": "ls"}) == "ls")
+        self.check("args: bare JSON string accepted", first_command('"pwd"') == "pwd")
+        self.check("args: JSON list does not crash", first_command("[1, 2]") is None)
+
+    def test_stream_tool_call_without_index(self):
+        # Providers that omit "index" stream one call over several chunks.
+        chunk = fake_openai.tool_call_chunk(0, id="call_x", name="execute_bash", arguments='{"comm')
+        chunk.choices[0].delta.tool_calls[0].index = None
+        rest = fake_openai.tool_call_chunk(0, arguments='and": "ls"}')
+        rest.choices[0].delta.tool_calls[0].index = None
+        rest.choices[0].delta.tool_calls[0].id = ""
+        c, _ = self.make_fake_commander([[chunk, rest, fake_openai.usage_chunk(1, 1)]])
+        calls = c.call_llm_api([{"role": "user", "content": "hi"}])["choices"][0]["message"]["tool_calls"] or []
+        self.check("no index: one call assembled",
+                   len(calls) == 1 and calls[0]["function"]["arguments"] == '{"command": "ls"}', repr(calls))
+
+    def test_empty_responses_end_the_run(self):
+        empty = [fake_openai.usage_chunk(1, 0)]
+        c, fake = self.make_fake_commander([empty] * 5, max_steps=10)
+        c.run("say something")
+        self.check("empty: run stops after three empty turns", len(fake.calls) == 3, f"calls={len(fake.calls)}")
+        self.check("empty: no empty assistant turn stored",
+                   all(m.get("role") != "assistant" for m in c.conversation_history), repr(c.conversation_history))
+
+    def test_stop_answers_remaining_tool_calls(self):
+        script = [[fake_openai.tool_call_chunk(0, id="a", name="execute_bash", arguments='{"command": "true"}'),
+                   fake_openai.tool_call_chunk(1, id="b", name="execute_bash", arguments='{"command": "true"}'),
+                   fake_openai.usage_chunk(1, 1)]]
+        c, _ = self.make_fake_commander(script)
+
+        def stop_while_running(command):
+            c.stop_event.set()  # the user stops the agent during the first command
+            return "ok", 0
+        c.execute_bash_command = stop_while_running
+        c.run("two commands")
+        results = {m["tool_call_id"]: m["content"] for m in c.conversation_history if m.get("role") == "tool"}
+        self.check("stop: every tool call answered", set(results) == {"a", "b"}, repr(results))
+        self.check("stop: unexecuted call says so", "Not executed" in results.get("b", ""), repr(results))
+
+    def test_suggestion_follows_all_tool_results(self):
+        script = [[fake_openai.tool_call_chunk(0, id="a", name="execute_bash", arguments='{"command": "rm x"}'),
+                   fake_openai.tool_call_chunk(1, id="b", name="execute_bash", arguments='{"command": "true"}'),
+                   fake_openai.usage_chunk(1, 1)],
+                  [fake_openai.content_chunk("ok TASKCOMPLETE"), fake_openai.usage_chunk(1, 1)]]
+        c, _ = self.make_fake_commander(script, auto_approve=False)
+        answers = iter(["Use trash instead", "y"])
+        c.sink.confirm = lambda command: next(answers)
+        c.execute_bash_command = lambda command: ("ok", 0)
+        c.run("clean up")
+        roles = [m["role"] for m in c.conversation_history]
+        i = roles.index("tool")
+        self.check("suggestion: tool results stay adjacent", roles[i:i + 3] == ["tool", "tool", "user"], str(roles))
+        self.check("suggestion: original case kept",
+                   c.conversation_history[i + 2]["content"] == "I suggest you Use trash instead",
+                   repr(c.conversation_history[i + 2]))
+
+    def test_truncate_keeps_current_request(self):
+        # In a long session the request that started the current run must
+        # survive compression, not just the very first instruction.
+        c = self.make_commander(max_prompt_len=200, model="gpt-test", compress_algorithm="truncate")
+        c.conversation_history = [{"role": "system", "content": "sys"}, {"role": "user", "content": "old task"}]
+        c.conversation_history += [{"role": "assistant", "content": "x" * 300} for _ in range(3)]
+        request = {"role": "user", "content": "the current task"}
+        c.conversation_history.append(request)
+        c.conversation_history += [{"role": "assistant", "content": "y" * 300}]
+        c._current_request = request
+        c._context_compress()
+        self.check("truncate: current request kept",
+                   any(m is request for m in c.conversation_history), repr(c.conversation_history))
+
+    def test_ccllm_summary_is_folded_not_stacked(self):
+        if not aic._CONTEXT_COMPRESSOR_LLM_AVAILABLE:
+            self.check("summary folding: skipped (library missing)", True)
+            return
+        c = self.make_commander(max_prompt_len=300, model="gpt-test")
+        seen = []
+
+        def summarize(messages, previous):
+            seen.append(previous)
+            return f"summary-{len(seen)}"
+        c._llm_summarize = summarize
+        c.conversation_history = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+        for round_ in range(2):
+            c.conversation_history += [{"role": "assistant", "content": "z" * 600} for _ in range(4)]
+            c._context_compress()
+        system = c.conversation_history[0]["content"]
+        self.check("summary folding: one summary block", system.count("[Prior conversation summary]") == 1, system)
+        self.check("summary folding: previous summary handed over", seen[-1] == "summary-1", repr(seen))
+
+    def test_context_overflow_is_retried(self):
+        class ContextError(Exception):
+            status_code = 400
+        script = [ContextError("This model's maximum context length is 8192 tokens"),
+                  [fake_openai.content_chunk("done TASKCOMPLETE"), fake_openai.usage_chunk(1, 1)]]
+        c, fake = self.make_fake_commander(script)
+        c.stop_event.wait = lambda timeout=None: False  # a regression must not sleep through backoff
+        c.run("hello")
+        self.check("overflow: retried after compressing", len(fake.calls) == 2
+                   and c.conversation_history[-1].get("content") == "done TASKCOMPLETE",
+                   f"calls={len(fake.calls)}")
+        self.check("overflow: compression ran before the retry",
+                   any(k == "LOG" and "[COMPRESS]" in p.get("text", "") for k, p in c.sink.events))
+
+    def test_transient_error_is_retried(self):
+        script = [ConnectionError("connection reset"),
+                  [fake_openai.content_chunk("pong"), fake_openai.usage_chunk(1, 1)]]
+        c, fake = self.make_fake_commander(script)
+        c.stop_event.wait = lambda timeout=None: False  # no real backoff sleep in tests
+        resp = c.call_llm_api([{"role": "user", "content": "ping"}], use_tools=False)
+        self.check("retry: transient error retried", resp["choices"][0]["message"]["content"] == "pong")
+
+    def test_prompt_history_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hist")
+            h = aic.PromptHistory(path)
+            h.load()
+            for item in ("first", "multi\nline \\ prompt", "multi\nline \\ prompt", "last"):
+                h.add(item)
+            h.close()
+            h2 = aic.PromptHistory(path)
+            h2.load()
+            h2.close()
+            self.check("history: round trip with newlines and dedupe",
+                       h2.items == ["first", "multi\nline \\ prompt", "last"], repr(h2.items))
+
+    def test_tui_log_wraps_and_copies(self):
+        if not aic._TEXTUAL_AVAILABLE:
+            self.check("tui log: skipped (textual missing)", True)
+            return
+        import asyncio
+        spans = aic._wrap_spans("alpha beta gamma delta", 11)
+        self.check("wrap: words kept whole", spans == [(0, 11), (11, 22)], repr(spans))
+        self.check("wrap: long words folded", aic._wrap_spans("x" * 25, 10) == [(0, 10), (10, 20), (20, 25)])
+
+        class LogApp(aic.App):
+            def compose(self):
+                yield aic.OutputLog(id="log")
+
+        async def scenario():
+            app = LogApp()
+            async with app.run_test(size=(40, 10)) as pilot:
+                log = app.query_one(aic.OutputLog)
+                log.write("streamed ")
+                log.write("text that is long enough to wrap across rows\nsecond line")
+                log.write_line("third", "bold")
+                await pilot.pause(0.1)
+                rows = len(log._rows)
+                text, _ = log.get_selection(aic.Selection(None, None))
+                return rows, text
+        rows, text = asyncio.run(scenario())
+        self.check("tui log: soft wraps", rows > 3, f"rows={rows}")
+        self.check("tui log: copy re-joins soft-wrapped rows",
+                   text == "streamed text that is long enough to wrap across rows\nsecond line\nthird", repr(text))
+
+    def test_preserved_thinking(self):
+        # The model's reasoning goes back with its turns for the rest of the
+        # run (models shown empty thinking blocks stop thinking), is cleared
+        # by the next request, and is dropped when an endpoint refuses it.
+        step1 = [fake_openai.thinking_chunk("I should list files."),
+                 fake_openai.tool_call_chunk(0, id="r1", name="execute_bash", arguments='{"command": "true"}'),
+                 fake_openai.usage_chunk(1, 1)]
+        done = [fake_openai.content_chunk("done TASKCOMPLETE"), fake_openai.usage_chunk(1, 1)]
+        c, fake = self.make_fake_commander([step1, done, done], show_thinking=True, persist_history=True)
+        c.execute_bash_command = lambda command: ("ok", 0)
+        c.run("first task")
+        sent = [m for m in fake.calls[1]["messages"] if m.get("role") == "assistant"]
+        self.check("thinking: reasoning sent back within the run",
+                   sent and sent[0].get("reasoning_content") == "I should list files.", repr(sent))
+        c.run("second task")
+        self.check("thinking: a new request clears old reasoning",
+                   not any("reasoning_content" in m for m in fake.calls[2]["messages"]))
+
+        class Refused(Exception):
+            status_code = 400
+        c2, fake2 = self.make_fake_commander(
+            [step1, Refused("reasoning_content is not allowed in input messages"), done], show_thinking=True)
+        c2.execute_bash_command = lambda command: ("ok", 0)
+        c2.run("task")
+        self.check("thinking: refused reasoning is dropped and the call retried",
+                   len(fake2.calls) == 3 and not c2._send_reasoning
+                   and not any("reasoning_content" in m for m in fake2.calls[2]["messages"]),
+                   f"calls={len(fake2.calls)}")
+
+    def test_x11_clipboard(self):
+        """Copy/paste through libX11, on a private selection so the user's
+        clipboard is never touched. Skipped without an X display."""
+        import ctypes.util
+        import subprocess
+        if not os.environ.get("DISPLAY") or not ctypes.util.find_library("X11"):
+            self.check("x11 clipboard: skipped (no X display)", True)
+            return
+        selection = f"AIC_TEST_SELECTION_{os.getpid()}"
+        text = "héllo — line 1\nline 2 界"
+        self.check("x11 clipboard: copy owns the selection", aic._x11_copy(text, (selection,)))
+        self.check("x11 clipboard: text reads back intact", aic._x11_paste(selection) == text)
+        self.check("x11 clipboard: a new copy replaces the old one",
+                   aic._x11_copy("second", (selection,)) and aic._x11_paste(selection) == "second")
+        self.check("x11 clipboard: unowned selection reads as None",
+                   aic._x11_paste(f"{selection}_NOBODY") is None)
+        # the helper serving the private selection is no longer needed
+        subprocess.run(["pkill", "-f", selection], capture_output=True)
+
+    def test_tui_end_to_end(self):
+        """Drive the real TUI headless (Textual pilot) against the fake client:
+        streaming, approval dialog, console output, clipboard, keys."""
+        if not aic._TEXTUAL_AVAILABLE:
+            self.check("tui: skipped (textual missing)", True)
+            return
+        import asyncio
+        import time
+        args = argparse.Namespace(
+            api_base="http://localhost:1/v1", model="test-model", api_key="test-key", auto_approve=False,
+            no_thinking=False, timeout=30, max_prompt_len=80000, max_output_bytes=10240, max_steps=10,
+            debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
+            request=[], session_file="", instance_number=1, session_msg="[SESSION] off",
+            sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd())
+        script = [
+            [fake_openai.content_chunk("Hello there. TASK"), fake_openai.content_chunk("COMPLETE"),
+             fake_openai.usage_chunk(10, 3)],
+            [fake_openai.tool_call_chunk(0, id="c1", name="execute_bash",
+                                         arguments='{"command": "echo tui-output"}'),
+             fake_openai.usage_chunk(10, 3)],
+            [fake_openai.content_chunk("Done. TASKCOMPLETE"), fake_openai.usage_chunk(10, 3)],
+        ]
+
+        async def until(pilot, condition, timeout=10):
+            end = time.monotonic() + timeout
+            while not condition() and time.monotonic() < end:
+                await pilot.pause(0.05)
+            return condition()
+
+        async def scenario():
+            app = aic.CommanderApp(args, aic.PromptHistory(None))
+            results = {}
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause(0.2)
+                app.agent.client = fake_openai.FakeOpenAIClient(script)
+                app.agent.task_summary_enabled = False
+                await pilot.press(*"hi", "enter")
+                await until(pilot, lambda: not app._agent_busy())
+                await pilot.pause(0.2)
+                log = app.agent_log.plain_text
+                results["answer streamed"] = "Hello there." in log
+                results["split marker hidden"] = "TASKCOMPLETE" not in log and "TASK" not in log.split("Hello there.")[1]
+                await pilot.press(*"run it", "enter")
+                results["approval dialog"] = await until(
+                    pilot, lambda: type(app.screen).__name__ == "ApprovalScreen")
+                await pilot.pause(0.5)  # keys are ignored right after the dialog opens
+                await pilot.press("y")
+                await until(pilot, lambda: not app._agent_busy())
+                await pilot.pause(0.2)
+                results["command output shown"] = "tui-output" in app.console_log.plain_text
+                results["exit summary"] = "✓ exit 0" in app.console_log.plain_text
+                app.copy_to_clipboard("pasted text")
+                await pilot.click("#prompt-input", offset=(4, 1), button=3)
+                results["right-click paste"] = await until(pilot, lambda: app.prompt.text == "pasted text", 3)
+                app.prompt.clear()
+                await pilot.press("f3")
+                await pilot.pause(0.2)
+                results["F3 shows the shell"] = app.query_one("#switcher").current == "shell-widget"
+                await pilot.press("f6")
+                await pilot.press("ctrl+c")
+                await pilot.pause(0.1)
+                results["first ctrl+c keeps running"] = app.is_running
+                await pilot.press("ctrl+c")
+                await pilot.pause(0.3)
+            results["second ctrl+c quits"] = not app.is_running
+            return results
+
+        # Never touch the desktop clipboard of whoever runs the tests.
+        native = aic.clipboard_write_native, aic.clipboard_read_native
+        aic.clipboard_write_native, aic.clipboard_read_native = (lambda text: False), (lambda: None)
+        try:
+            results = asyncio.run(scenario())
+        finally:
+            aic.clipboard_write_native, aic.clipboard_read_native = native
+        for name, ok in results.items():
+            self.check(f"tui: {name}", ok)
+
+    # ------------------------------------------------------------------ #
     # 5. Live integration tests (network)                                #
     # ------------------------------------------------------------------ #
 
@@ -1409,6 +1751,24 @@ def main():
     runner.test_session_written_during_run()
     runner.test_session_discard()
     runner.test_session_instance_locking()
+    runner.test_validate_merges_consecutive_assistants()
+    runner.test_command_output_cleaning()
+    runner.test_output_truncation_multibyte()
+    runner.test_command_timeout_keeps_partial_output()
+    runner.test_process_response_argument_shapes()
+    runner.test_stream_tool_call_without_index()
+    runner.test_empty_responses_end_the_run()
+    runner.test_stop_answers_remaining_tool_calls()
+    runner.test_suggestion_follows_all_tool_results()
+    runner.test_truncate_keeps_current_request()
+    runner.test_ccllm_summary_is_folded_not_stacked()
+    runner.test_context_overflow_is_retried()
+    runner.test_transient_error_is_retried()
+    runner.test_prompt_history_file()
+    runner.test_tui_log_wraps_and_copies()
+    runner.test_preserved_thinking()
+    runner.test_x11_clipboard()
+    runner.test_tui_end_to_end()
 
     if not args.skip_live:
         print("\n=== Live integration tests (network) ===")

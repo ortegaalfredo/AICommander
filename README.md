@@ -10,9 +10,10 @@ in control through an approval gate.
 
 It supports two presentation modes:
 
-- **Default (TUI)** — a [Textual](https://textual.textualize.io/)-based terminal
-  UI with split panels (prompt, console, agent output, status footer) and an
-  `/autoapprove` toggle for the approval gate.
+- **Default (TUI)** — a [Textual](https://textual.textualize.io/)-based,
+  Norton-Commander-style terminal UI: agent output and console/shell panes, a
+  multi-line prompt, a status line and a function-key bar, with full mouse
+  support (select to copy, right/middle-click to paste).
 - **`--nogui`** — the original direct-CLI behaviour (stdout/stderr, no TUI).
 
 ![AI-Commander TUI](aic.png)
@@ -31,6 +32,7 @@ It supports two presentation modes:
   - [Layout](#layout)
   - [Slash commands](#slash-commands)
   - [Keyboard shortcuts](#keyboard-shortcuts)
+  - [Mouse, copy and paste](#mouse-copy-and-paste)
   - [Prompt history](#prompt-history)
 - [The approval gate](#the-approval-gate)
 - [Context compression](#context-compression)
@@ -45,6 +47,7 @@ It supports two presentation modes:
   - [Crash recovery semantics](#crash-recovery-semantics)
 - [Sandboxing (Linux)](#sandboxing-linux)
 - [Fast mode](#fast-mode)
+- [Environment variables](#environment-variables)
 - [Debugging](#debugging)
 - [Project structure](#project-structure)
 - [License](#license)
@@ -67,8 +70,14 @@ It supports two presentation modes:
   Linux to restrict writes to the working directory, `/tmp`, `/dev`, and
   `/dev/pts`.
 - **Two presentation modes** — full TUI or plain CLI (`--nogui`).
-- **Prompt history** — readline-style history with reverse incremental search
-  (Ctrl+R) in the TUI.
+- **Mouse copy & paste** — drag to select text in any pane (copied
+  automatically, re-joining soft-wrapped lines), double-click a word,
+  triple-click a line, right/middle-click to paste.
+- **Multi-line prompt with history** — Enter sends, Ctrl+J/Shift+Enter adds a
+  line, Up/Down and Ctrl+R search persistent history; multi-line pastes stay
+  intact.
+- **Embedded shell** — a colored interactive shell tab with scrollback whose
+  `cd` is followed by the agent.
 - **Session persistence** — the complete conversation history is mirrored to a
   hand-editable JSON file (`.aicsession`) after every step and reloaded on every
   startup, so a crash or Ctrl+C loses nothing already produced.
@@ -167,8 +176,9 @@ panel. In `--nogui` mode a request is required on the command line.
 | `--max-prompt-len` | Maximum prompt length in tokens (default: `80000`). |
 | `--max-output-bytes` | Maximum output bytes returned from commands (default: `10240`). |
 | `--max-steps` | Maximum number of agent loop steps before stopping (default: `500`). |
-| `--debug` | Enable debug mode (dump conversation history on truncation). |
+| `--debug` | Dump the full conversation history before every LLM call (see [Debugging](#debugging)). |
 | `--nogui` | Run in direct CLI mode without TUI (original behaviour). No session file is read or written unless `--session` is given. |
+| `--no-mouse` | TUI without mouse capture, leaving selection and paste to the terminal itself. |
 | `--session` | Session file mirroring the conversation history (default: `./.aicsession`). |
 | `--no-session` | Disable session persistence (nothing is written or loaded). |
 | `--disable-sandbox` | Disable the OS-level Landlock sandbox (Linux only). |
@@ -212,6 +222,13 @@ python3 aic.py --fast --api-base https://api.example.com/v1 \
 All I/O is routed through the `EventSink` abstraction, so the same agent logic
 runs unchanged in both the TUI and `--nogui` modes.
 
+The model's thinking (`reasoning_content`) is sent back with its turns for the
+rest of the current task ("preserved thinking"), as interleaved-thinking models
+such as GLM and DeepSeek expect; without it they see their earlier turns with
+empty thinking and progressively stop thinking. It is cleared when you send a
+new request, and if an endpoint refuses it, AI-Commander retries without it
+and stops sending it for the session.
+
 The agent exposes a single tool, `execute_bash(command)`, which runs the
 command in a pseudo-terminal (PTY). The PTY gives the command a real terminal
 environment (so interactive tools and `tput`-style programs work) and lets the
@@ -228,77 +245,129 @@ truncated to `--max-output-bytes` with the literal sentinel
 
 The default Textual interface is a Norton-Commander-style split screen:
 
-- **Left panel — Agent Output**: the model's streamed responses, thinking
-  tokens, and status messages.
-- **Right panel — Console Output / Shell**: two tabs. *Console Output* shows
-  the commands the agent runs and their live output; *Shell* is an embedded
-  interactive shell you can use yourself.
-- **Bottom — Prompt input**: type a task or a slash command.
-- **Status footer**: model, current step, live context-window estimate,
-  cumulative token total, tokens/second, session id, auto-approve state,
-  pending-approval indicator, and sandbox status.
+- **Left pane — Agent**: the model's streamed answer (live, word-wrapped and
+  re-wrapped when the terminal is resized), its thinking in dim italics, each
+  command it runs (`$ command`) with an exit/duration summary, and status
+  messages. The pane title shows an LLM-generated summary of the task.
+- **Right pane — Console / Shell**: two tabs (click them or press `F3`).
+  *Console* shows every command the agent runs with its live output and exit
+  code; *Shell* is an embedded, colored interactive shell with scrollback. When
+  you `cd` in the shell, the agent's commands follow you there.
+- **Prompt**: a multi-line input box (it grows with its content).
+- **Status line**: what the agent is doing (thinking, writing, running a
+  command, waiting for approval, retrying) with elapsed time, step count,
+  context usage against the prompt budget, cumulative tokens, tokens/second,
+  the approval mode, sandbox state, model, working directory and session file.
+- **Function-key bar**: `1 Help · 2 Auto · 3 Shell · 4 Copy · 5 Paste ·
+  6 Focus · 7 Zoom · 8 Clear · 9 Stop · 10 Quit`; the labels are clickable.
 
 The agent runs in a background thread and communicates with the UI through a
-queue; the UI never blocks on the agent.
+queue; the UI never blocks on the agent. Typing while the agent works queues a
+steering message that is delivered at its next step.
 
 ### Slash commands
 
-Type any of the following in the prompt panel (they are UI controls, so they
-are **not** added to prompt history):
+Type any of the following in the prompt (Tab completes them). They are UI
+controls, so they are **not** added to prompt history:
 
 | Command | Aliases | Description |
 | ------- | ------- | ----------- |
-| `/autoapprove` | `/aa` | Toggle auto-approve on/off for this session. When ON, commands run without asking. |
-| `/approve` | — | Approve the currently pending command. |
-| `/reject` | — | Reject the currently pending command. |
-| `/suggest <text>` | — | Reject the pending command **with a steering suggestion** that is fed back to the agent (e.g. `/suggest use a different approach`). |
-| `/clear` | `/new` | Clear the conversation history and start a fresh session (resets tokens, step count, and session id). The session file is emptied too, so nothing is resurrected on the next startup. |
+| `/help` | — | Show keys, mouse actions and commands (same as `F1`). |
+| `/autoapprove` | `/aa` | Toggle auto-approve on/off (same as `F2`). When ON, commands run without asking. |
+| `/clear` | `/new` | Clear the conversation history and start a fresh session (resets tokens, step count, and session id). The session file is emptied too, so nothing is resurrected on the next startup. A running agent is stopped first. |
 | `/session` | — | Show the session file, session id, instance number, and what is currently saved on disk. |
 | `/reload` | — | Re-read the session file, picking up edits made to its `messages` array outside AI-Commander (requires a stopped agent). |
-| `/stop` | — | Stop the running agent. |
+| `/copy` | — | Copy the agent's last answer to the clipboard. |
+| `/stop` | — | Stop the running agent (same as `F9`). |
 | `/quit` | `/exit` | Stop the agent and exit the application. |
-
-> **Note:** When a command is pending approval, you can also approve/reject it
-> with the modal dialog (Y/N keys) or the on-screen buttons. The `/approve`,
-> `/reject`, and `/suggest` commands are an alternative to the dialog.
+| `/approve`, `/reject`, `/suggest <text>` | — | Answer a pending approval (normally done in the approval dialog). |
 
 ### Keyboard shortcuts
 
 | Key | Action |
 | --- | ------ |
-| `Up` / `Ctrl+P` | Previous prompt in history (readline-style). |
-| `Down` / `Ctrl+N` | Next prompt in history. |
-| `Ctrl+R` | Open reverse incremental search over prompt history. |
-| `Tab` | Switch between the Console Output and Shell tabs. |
-| `Ctrl+C` / `Escape` | Stop the agent and quit. |
-| `Y` / `Enter` | Approve a pending command (in the approval dialog). |
-| `N` / `Escape` | Reject a pending command (in the approval dialog). |
+| `Enter` | Send the prompt. |
+| `Ctrl+J` / `Shift+Enter` | Insert a new line in the prompt. |
+| `Up` / `Ctrl+P`, `Down` / `Ctrl+N` | Previous / next prompt in history (when the cursor is on the first / last line). |
+| `Ctrl+R` | Reverse incremental search over prompt history. |
+| `Tab` | Complete a `/command`; otherwise move to the next pane. |
+| `F1` | Help. |
+| `F2` | Toggle auto-approve. |
+| `F3` | Switch the right pane between Console and Shell. |
+| `F4` / `F5` | Copy (the selection, or the last answer) / paste. |
+| `F6` | Move the focus to the next pane (also the way out of the Shell). |
+| `F7` | Zoom the focused pane to full screen; `Escape` restores it. |
+| `F8` (twice) | Clear the conversation. |
+| `F9` | Stop the agent (a pending LLM response is cut off immediately). |
+| `Ctrl+C` | Copy the selection; otherwise stop a running agent; press twice while idle to quit. |
+| `F10` / `Ctrl+Q` | Quit (the session and history are saved). |
+| `Y` / `N` / `A` | In the approval dialog: approve / reject / always approve. |
+
+While the **Shell** tab has the focus, every key except the function keys goes
+to the shell (so `Ctrl+C`, `Escape`, `Tab` and arrows work as in a terminal);
+use `F6` or the mouse to leave it.
+
+### Mouse, copy and paste
+
+- **Select** text by dragging in any pane: the selection is copied to the
+  clipboard as soon as you release the button (a notice confirms it). Lines
+  that were only wrapped to fit the pane are copied as the original single
+  line. Double-click selects a word (paths and URLs included), triple-click a
+  whole line.
+- **Right-click** copies the selection of the pane you click; with no
+  selection it pastes. **Middle-click** pastes. Pasting into an output pane
+  goes to the prompt; pasting into the shell honours bracketed-paste mode.
+- **Keyboard**: `Ctrl+C` copies a selection, `Ctrl+V` pastes in the prompt,
+  `F4` copies the selection or the last answer, `F5` pastes. Your terminal's
+  own paste (e.g. `Ctrl+Shift+V`) works too, including multi-line text.
+- Copies go to the desktop clipboard: on X11 (and Wayland desktops with
+  Xwayland, such as GNOME) AI-Commander sets it directly through `libX11`, so
+  no extra tools are needed — the text stays available after AI-Commander exits,
+  until something else is copied, and middle-click pastes it in other apps too.
+  `wl-copy`, `xclip`, `xsel`, `pbcopy` or `clip.exe` are used when installed,
+  and OSC 52 covers terminals that support it (also over SSH and in tmux).
+  Mouse pastes read the desktop clipboard the same way, falling back to
+  AI-Commander's own clipboard.
+- The mouse wheel scrolls every pane, including the shell's scrollback
+  (`Shift+PgUp` / `Shift+PgDn` too). Start with `--no-mouse` to leave the
+  mouse entirely to your terminal.
 
 ### Prompt history
 
-Prompt history is persisted to `~/.aic_history` (up to 1000 entries) and
-loaded at startup. Up/Down navigation preserves your in-progress line
-(readline semantics), and `Ctrl+R` opens a modal reverse search that filters
-history newest-first; `Ctrl+R` cycles to the next older match, `Enter` accepts
-a match back into the prompt, and `Escape`/`Ctrl+G` cancels.
+Prompt history is persisted to `~/.aic_history` (up to 1000 entries, one per
+line with newlines escaped, so multi-line prompts survive) and loaded at
+startup. The file is opened before the Landlock sandbox is applied, so new
+prompts are saved even though the sandbox blocks other writes to `$HOME`.
+Up/Down navigation preserves your in-progress text, and `Ctrl+R` opens a
+reverse search that filters history newest-first; `Ctrl+R` cycles to the next
+older match, `Enter` accepts a match back into the prompt, and
+`Escape`/`Ctrl+G` cancels.
 
 ---
 
 ## The approval gate
 
 By default every command the agent proposes must be approved before it runs.
-This keeps you in control of what executes on your system.
+This keeps you in control of what executes on your system. The TUI shows the
+command (syntax highlighted) in a dialog:
 
-- **Approve** — the command runs.
-- **Reject** — the command is skipped and the agent is told it was skipped.
-- **Reject with a suggestion** — the command is skipped and your suggestion is
-  injected into the conversation as a user message steering the agent
-  (e.g. `/suggest use a different approach`).
+- **Yes** (`Y`) — the command runs.
+- **No** (`N`, `Escape`) — the command is skipped and the agent is told it was
+  skipped.
+- **Always** (`A`) — the command runs and auto-approve is switched on.
+- **Suggestion** — type text in the dialog's input and press `Enter`: the
+  command is skipped and your suggestion is fed back to the agent as a user
+  message steering it.
 
-You can toggle auto-approve at any time with `/autoapprove` (or `/aa`), or
+For a moment after the dialog opens its keys are ignored, so typing that was
+meant for the prompt can never approve a command by accident. In `--nogui`
+mode the same choices are asked on the terminal; a blank answer, end of input
+or `Ctrl+C` never approves.
+
+You can toggle auto-approve at any time with `F2` or `/autoapprove` (`/aa`), or
 start with `--auto-approve`. When auto-approve is ON, all commands run without
-asking — useful for testing and scripting, but be ready to `/stop` if a command
-misbehaves.
+asking (the status line shows **AUTO-APPROVE**) — useful for testing and
+scripting, but be ready to stop the agent (`F9`) if a command misbehaves.
 
 ---
 
@@ -314,7 +383,7 @@ is under budget.
 
 The prompt budget is `--max-prompt-len` (default 80,000 tokens). For models
 that accept a `max_tokens` request parameter (all non-`gpt` models), the budget
-is reduced by the output reservation (`max_tokens`, 8,000) so the prompt leaves
+is reduced by the output reservation (`max_tokens`, 16,000) so the prompt leaves
 room for the completion inside the context window:
 
 ```
@@ -324,19 +393,20 @@ prompt_budget = max_prompt_len                (for gpt models)
 
 Token counts are estimated locally with a conservative heuristic (~3 characters
 per token plus per-message overhead). Exact numbers come from the API's usage
-stats once each call finishes and are shown in the status bar.
+stats once each call finishes and are shown in the status bar. If the server
+still rejects a prompt as too long (tokenizers differ, e.g. for CJK text), the
+history is compressed harder and the request retried.
 
 ### The `truncate` algorithm
 
 `--compress-alg truncate` (or `--fast`) is the simpler, cheaper algorithm. It
-always preserves the **system prompt** (index 0) and the **first user
-instruction** (index 1) so the agent never forgets its primary objective. It
-works in two passes:
+always preserves the **system prompt**, the **first user instruction** and the
+**request that started the current run**, so the agent never forgets either its
+primary objective or what it is working on now. It works in two passes:
 
 1. **Condense oversized tool outputs** in place (oldest first), replacing
    verbose command results with `<condensed tool output>`.
-2. **Drop the oldest messages** (from index 2 onward) if condensation alone
-   isn't enough.
+2. **Drop the oldest other messages** if condensation alone isn't enough.
 
 Both passes stop once the retained history fits within
 `--compress-target` (default 40%) of the budget, leaving headroom so several
@@ -359,9 +429,14 @@ compressor**. When the non-system log exceeds the budget it:
 
 The system prompt is kept **byte-identical** at the front of the retained
 context so unchanged prefixes are never re-prefilled (important on systems with
-slow prompt processing / prefix caching). The first user instruction is also
-preserved verbatim, and a fallback user message is appended if aggressive
-compression would leave no user query at all (some endpoints reject that).
+slow prompt processing / prefix caching); the summary is appended to it after a
+`[Prior conversation summary]` marker. Each new compression folds the previous
+summary into the new one, so summaries never pile up, and only the summary
+itself is kept (not the model's `<analysis>` scratchpad). The first user
+instruction and the current request are preserved verbatim, and a fallback user
+message is appended if aggressive compression would leave no user query at all
+(some endpoints reject that). When nothing can be summarized, the `truncate`
+algorithm is applied instead.
 
 If the `context-compressor-llm` package is not installed, this algorithm falls
 back to `truncate`.
@@ -465,9 +540,10 @@ python3 aic.py --api-base ... "continue from here"
 - A **bare JSON array** of messages is accepted in place of the full object, so
   you can paste a transcript straight into the file.
 - Invalid content is repaired rather than rejected: a missing system prompt is
-  prepended, orphan `tool` messages are dropped, and a trailing assistant turn
-  with no tool calls is removed (the API rejects prompts ending on an assistant
-  turn). Each repair is reported so nothing changes silently.
+  prepended, orphan `tool` messages and empty assistant turns are dropped, and
+  consecutive assistant turns are merged (keeping the text and tool calls of
+  both). A trailing assistant answer is kept — it is the previous run's final
+  reply. Each repair is reported so nothing changes silently.
 - If the file ended on an assistant turn that **did** issue tool calls (the
   process died mid-command), the tool calls are answered with a
   `[SESSION RECOVERED]` notice stating the command was **not** re-executed — the
@@ -559,17 +635,41 @@ instructions for the model.
 
 ---
 
+## Environment variables
+
+| Variable | Effect |
+| -------- | ------ |
+| `AIC_TEMPERATURE_TOOL` | Sampling temperature for agent turns (default `0.7`). |
+| `AIC_TEMPERATURE_TEXT` | Temperature for internal text-only calls such as summaries (default `1.0`). |
+| `AIC_STREAM_OPTIONS=0` | Do not send `stream_options` (usage reporting) to the endpoint. |
+| `AIC_EXTRA_BODY=0` | Do not send `chat_template_kwargs.enable_thinking` to the endpoint. |
+| `AIC_DEBUG_DUMP_DIR` | Directory for `--debug` dumps (default `~/.aic`). |
+| `NO_COLOR` | Disable colors in `--nogui` mode (they are also off when output is piped). |
+
+Endpoints that reject `stream_options` or `extra_body` are detected and the
+request is retried without them automatically; the variables just skip the
+first attempt.
+
+Agent commands run with `PAGER=cat` and `GIT_PAGER=cat` (a pager would wait for
+a keypress forever), and the output returned to the model has escape codes
+removed and progress-bar redraws collapsed to their final state.
+
+---
+
 ## Debugging
 
-- `--debug` dumps the full conversation history to `commander-debug.txt` at
-  each step (before the LLM call), including per-message roles, tool calls,
-  and estimated token counts. Useful for diagnosing context-compression or
-  prompt-format issues.
+- `--debug` dumps the full conversation history before every LLM call to
+  `~/.aic/commander-debug-<session>-<timestamp>.txt` (or `AIC_DEBUG_DUMP_DIR`;
+  next to the session file, or `/tmp`, when the sandbox forbids `~/.aic`),
+  including per-message roles, tool calls, and estimated token counts. Useful
+  for diagnosing context-compression or prompt-format issues. With `--debug`,
+  a crash of the agent thread also shows its traceback in the agent pane.
 - The status bar shows a live estimate of the current context window and the
   cumulative session token total (excluding prompt-cached tokens, which are
   typically not billed).
-- The `tests/` directory contains a test suite for truncation and core
-  functionality. See `tests/test_truncation.py` for usage.
+- The `tests/` directory contains a test suite for truncation, sessions, the
+  agent loop and the TUI (driven headless with a fake LLM client). Run it with
+  `python3 tests/test_truncation.py --skip-live`.
 
 ---
 
@@ -579,6 +679,7 @@ instructions for the model.
 ├── aic.py            # The entire agent (single-file implementation)
 ├── requirements.txt  # Python dependencies
 ├── README.md         # This file
+├── changelog.txt     # Release notes, newest first
 ├── tests/            # Test suite (truncation + core helpers)
 └── LICENSE           # Apache 2.0
 ```

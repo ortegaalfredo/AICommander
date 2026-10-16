@@ -1,0 +1,73 @@
+AI-Commander changelog
+======================
+
+2.0.0
+-----
+
+Main bugs fixed
+
+- Escape and Ctrl+C quit the whole app, even from the approval dialog or the
+  shell tab. Ctrl+C in the shell now interrupts the shell.
+- Approval dialog: it showed "Approve command? (y/n/suggestion):" as part of
+  the command, and a command containing [/] could crash it. You also had no way
+  to reject with a suggestion, and suggestions were lowercased.
+- Silent failures: if the API went down, the agent thread died and nothing
+  showed in the TUI. Errors now appear in the agent pane, and only transient
+  errors are retried.
+- Stopping: stop and quit froze the UI for up to 5 seconds and couldn't
+  interrupt a long model prefill. Stopping also wrote a fake "Agent stopped...
+  TASKCOMPLETE" reply into the history. Stop is now immediate and records
+  nothing fake.
+- Prompt history was never saved while the Linux sandbox was on, which is the
+  default.
+- Thinking sometimes didn't show: the model's reasoning was stripped from the
+  history, so models such as GLM saw their earlier turns with empty thinking
+  and progressively stopped thinking. It is now sent back for the rest of the
+  current task, cleared on the next request, and dropped automatically if an
+  endpoint refuses it.
+- Context compression:
+  - Truncation could drop the current request in long sessions.
+  - Summaries piled up in the system prompt and included the model's scratch
+    analysis.
+  - Hitting the context limit is now handled by compressing harder and
+    retrying.
+- What the model sees from commands:
+  - Colour codes and every progress-bar redraw are removed.
+  - Pagers such as git log no longer hang until the timeout.
+  - A timeout no longer throws away the partial output.
+- Pasting more than one line into the prompt kept only the first line.
+- Agent loop:
+  - A model returning empty replies could loop up to the step limit; it now
+    stops after three.
+  - A rejection suggestion was inserted between tool results, which strict
+    APIs reject.
+  - When one tool call in a turn had bad JSON, the valid ones were silently
+    dropped.
+- --nogui: it printed stray blank lines and broke command output at chunk
+  boundaries. Piped output now has no colour codes or ^M.
+
+Mouse copy/paste
+
+- Select: drag to select in any pane, including the shell. The text is copied
+  when you release, and lines that were only wrapped to fit the pane come back
+  as one line. Double-click selects a word, triple-click a line.
+- Paste: right-click copies the selection if there is one, otherwise it
+  pastes. Middle-click pastes. Ctrl+C / Ctrl+V and F4 / F5 also work.
+- Clipboard: copying sets the desktop clipboard directly through libX11 on X11
+  and Xwayland desktops such as GNOME (no extra tools needed, and the text
+  stays available after AI-Commander exits), and also uses the terminal's
+  clipboard support (OSC 52) plus xclip/xsel/wl-copy/pbcopy when they're
+  installed. --no-mouse hands the mouse back to your terminal.
+
+Interface
+
+- Layout: a Norton-style function-key bar (F1 to F10, clickable), a compact
+  status line, and a multi-line prompt. Ctrl+J or Shift+Enter adds a line,
+  history search works, and Tab completes slash commands.
+- Agent pane: answers stream live, re-wrap when you resize, and every command
+  shows its exit code and duration.
+- Shell tab: now has colours and scrollback.
+- Approval dialog: offers Yes / No / Always or a typed suggestion. It ignores
+  keys for a moment after opening, so typing meant for the prompt can't
+  approve a command.
+- Also new: a help screen and zoom for the focused pane.
