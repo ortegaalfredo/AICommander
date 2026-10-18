@@ -37,6 +37,7 @@ Exits with a non-zero status if any test fails.
 """
 
 import argparse
+import json
 import os
 import queue
 import sys
@@ -1457,6 +1458,55 @@ class TestRunner:
         self.check("summary folding: one summary block", system.count("[Prior conversation summary]") == 1, system)
         self.check("summary folding: previous summary handed over", seen[-1] == "summary-1", repr(seen))
 
+    def test_summarizer_failures_fall_back(self):
+        if not aic._CONTEXT_COMPRESSOR_LLM_AVAILABLE:
+            self.check("summarizer fallback: skipped (library missing)", True)
+            return
+
+        def compress(summarize):
+            c = self.make_commander(max_prompt_len=300, model="gpt-test")
+            c._llm_summarize = summarize
+            c.conversation_history = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+            c.conversation_history += [{"role": "assistant", "content": f"step {i} " + "z" * 600} for i in range(4)]
+            c._context_compress()
+            return c
+
+        def broken(messages, previous):
+            raise RuntimeError("server down")
+        c = compress(broken)
+        self.check("summarizer fallback: a failed summary truncates instead",
+                   "[Prior conversation summary]" not in c.conversation_history[0]["content"]
+                   and any("falling back to 'truncate'" in p.get("text", "") for k, p in c.sink.events),
+                   repr([p.get("text") for k, p in c.sink.events][-3:]))
+        # A reply cut off inside the <analysis> scratchpad is not a summary.
+        c2 = self.make_commander()
+        c2.call_llm_api = lambda *a, **k: {"choices": [{"message": {"content": "<analysis>\\nstill thinking"}}]}
+        try:
+            c2._llm_summarize([{"role": "user", "content": "hi"}], None)
+            self.check("summarizer fallback: cut-off analysis rejected", False)
+        except RuntimeError:
+            self.check("summarizer fallback: cut-off analysis rejected", True)
+
+    def test_internal_calls_use_low_effort(self):
+        done = [fake_openai.content_chunk("<summary>ok</summary>"), fake_openai.usage_chunk(1, 1)]
+        c, fake = self.make_fake_commander([done])
+        self.check("effort: summarizer returns the summary only",
+                   c._llm_summarize([{"role": "user", "content": "x"}], None) == "ok")
+        params = fake.calls[0]
+        self.check("effort: summarizer asks for low reasoning effort and caps its output",
+                   params.get("reasoning_effort") == "low" and params.get("max_tokens") == 8192
+                   and params["extra_body"]["chat_template_kwargs"].get("reasoning_effort") == "low", repr(params))
+
+        class Rejected(Exception):
+            status_code = 400
+        c2, fake2 = self.make_fake_commander([Rejected("Unrecognized request argument supplied: reasoning_effort"),
+                                              done, done])
+        c2._llm_summarize([{"role": "user", "content": "x"}], None)
+        c2._llm_summarize([{"role": "user", "content": "x"}], None)
+        self.check("effort: a rejected reasoning_effort is dropped for good",
+                   len(fake2.calls) == 3 and "reasoning_effort" not in fake2.calls[1]
+                   and "reasoning_effort" not in fake2.calls[2], f"calls={len(fake2.calls)}")
+
     def test_context_overflow_is_retried(self):
         class ContextError(Exception):
             status_code = 400
@@ -1584,7 +1634,8 @@ class TestRunner:
             no_thinking=False, timeout=30, max_prompt_len=80000, max_output_bytes=10240, max_steps=10,
             debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
             request=[], session_file="", instance_number=1, session_msg="[SESSION] off",
-            sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd())
+            sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd(),
+            loop="", max_iterations=10, verify="")
         script = [
             [fake_openai.content_chunk("Hello there. TASK"), fake_openai.content_chunk("COMPLETE"),
              fake_openai.usage_chunk(10, 3)],
@@ -1629,6 +1680,14 @@ class TestRunner:
                 await pilot.press("f3")
                 await pilot.pause(0.2)
                 results["F3 shows the shell"] = app.query_one("#switcher").current == "shell-widget"
+                shell = app.query_one("#shell-widget")
+                if await until(pilot, lambda: shell._pid is not None, 5) and os.path.exists("/proc/self/cwd"):
+                    # A cd in the shell must never move the agent's working directory.
+                    before = os.getcwd()
+                    await pilot.press("c", "d", "space", "slash", "enter")
+                    moved = await until(pilot, lambda: os.readlink(f"/proc/{shell._pid}/cwd") == "/", 5)
+                    await pilot.pause(1.0)
+                    results["shell cd leaves the agent's directory alone"] = moved and os.getcwd() == before
                 await pilot.press("f6")
                 await pilot.press("ctrl+c")
                 await pilot.pause(0.1)
@@ -1680,6 +1739,219 @@ class TestRunner:
             self.check("run() agent loop completed", False, f"exception: {e}")
             return
         self.check("run() agent loop completed", True)
+
+
+    # ------------------------------------------------------------------ #
+    # Ralph loop, verify gate, project instructions, file tools, headless  #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _done(text="done\nTASKCOMPLETE"):
+        return [fake_openai.content_chunk(text), fake_openai.usage_chunk(1, 1)]
+
+    @staticmethod
+    def _call(tool, args, id="c1"):
+        return [fake_openai.tool_call_chunk(0, id=id, name=tool, arguments=json.dumps(args)),
+                fake_openai.usage_chunk(1, 1)]
+
+    def test_completion_marker(self):
+        has = aic._has_marker
+        self.check("marker: own line", has("All good.\nTASKCOMPLETE\n", "TASKCOMPLETE"))
+        self.check("marker: end of message", has("All done. TASKCOMPLETE", "TASKCOMPLETE"))
+        self.check("marker: markup and promise tag", has("**TASKCOMPLETE**", "TASKCOMPLETE")
+                   and has("<promise>TASKCOMPLETE</promise>", "TASKCOMPLETE"))
+        self.check("marker: a mention does not count",
+                   not has("I will emit TASKCOMPLETE once the tests pass.", "TASKCOMPLETE")
+                   and not has("NOTTASKCOMPLETE", "TASKCOMPLETE"))
+        c, fake = self.make_fake_commander([self._done("I'll say TASKCOMPLETE when the tests pass."), self._done()])
+        status = c.run("task")
+        self.check("marker: a mention keeps the run going", status == "complete" and len(fake.calls) == 2,
+                   f"status={status} calls={len(fake.calls)}")
+
+    def test_file_tools(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            c = self.make_commander()
+            path = os.path.join(tmp, "sub", "a.py")
+
+            def call(name, **args):
+                return c._run_file_tool(name, args, [])
+            r = call("write_file", path=path, content="one\ntwo\nthree\n")
+            self.check("files: write_file creates parents", r.startswith("OK: created") and os.path.isfile(path), r)
+            r = call("read_file", path=path)
+            self.check("files: read_file numbers lines", r == "1\tone\n2\ttwo\n3\tthree\n", repr(r))
+            r = call("read_file", path=path, offset=2, limit=1)
+            self.check("files: read_file offset/limit", r.startswith("2\ttwo\n") and "offset=3" in r, repr(r))
+            r = call("edit_file", path=path, old_string="two", new_string="TWO")
+            self.check("files: edit_file replaces a unique string",
+                       r.startswith("OK") and open(path).read() == "one\nTWO\nthree\n", r)
+            r = call("edit_file", path=path, old_string="missing", new_string="x")
+            self.check("files: edit_file reports a missing string", r.startswith("ERROR") and "not found" in r, r)
+            call("write_file", path=path, content="x\nx\n")
+            r = call("edit_file", path=path, old_string="x", new_string="y")
+            self.check("files: edit_file refuses an ambiguous string", "occurs 2 times" in r, r)
+            r = call("edit_file", path=path, old_string="x", new_string="y", replace_all=True)
+            self.check("files: edit_file replace_all", open(path).read() == "y\ny\n", r)
+            with open(path, "w", newline="") as f:
+                f.write("a\r\nb\r\n")
+            call("edit_file", path=path, old_string="a\nb", new_string="a\nc")
+            self.check("files: edit_file keeps CRLF line endings", open(path, newline="").read() == "a\r\nc\r\n")
+            r = call("edit_file", path=os.path.join(tmp, "nope.py"), old_string="a", new_string="b")
+            self.check("files: edit_file on a missing file", "does not exist" in r, r)
+            c.max_output_bytes = 30
+            call("write_file", path=path, content="".join(f"line {i}\n" for i in range(1, 21)))
+            r = call("read_file", path=path)
+            self.check("files: read_file cut at whole lines", r.startswith("1\tline 1\n") and "of 20" in r, repr(r))
+            c.max_output_bytes = 10240
+            # Models often send a JSON file's data as an object instead of text.
+            data_path = os.path.join(tmp, "data.json")
+            data = {"name": 'He said "hi"', "path": "C:\\Users", "tags": ["a b", 'e"f']}
+            r = call("write_file", path=data_path, content=data)
+            self.check("files: write_file accepts JSON object content",
+                       r.startswith("OK") and json.load(open(data_path)) == data, r)
+            r = call("write_file", path=data_path, content=5)
+            self.check("files: write_file says what content it got", "it was a JSON int" in r, r)
+
+            c2 = self.make_commander(auto_approve=False)
+            c2.sink.auto_approve = False
+            c2.sink.confirm = lambda command: "keep it as is"
+            suggestions = []
+            r = c2._run_file_tool("write_file", {"path": path, "content": "changed"}, suggestions)
+            self.check("files: rejected edit leaves the file and keeps the suggestion",
+                       "skipped" in r and "changed" not in open(path).read() and suggestions == ["keep it as is"], r)
+
+            target = os.path.join(tmp, "b.txt")
+            c3, fake = self.make_fake_commander([self._call("write_file", {"path": target, "content": "hi\n"}),
+                                                 self._done()])
+            c3.run("write it")
+            tool = next(m for m in c3.conversation_history if m.get("role") == "tool")
+            self.check("files: the agent loop runs file tools",
+                       open(target).read() == "hi\n" and tool["content"].startswith("OK: created"), tool["content"])
+            self.check("files: tool schemas offered", {t["function"]["name"] for t in fake.calls[0]["tools"]}
+                       == {"execute_bash", "read_file", "edit_file", "write_file"})
+
+    def test_verify_gate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            flag = os.path.join(tmp, "flag")
+            c, fake = self.make_fake_commander([self._done(), self._done()],
+                                               verify_command=f"test -f {flag} || {{ touch {flag}; exit 1; }}")
+            status = c.run("task")
+            feedback = [m for m in c.conversation_history if "[VERIFY FAILED]" in str(m.get("content"))]
+            self.check("verify: a failing check sends the model back to work",
+                       status == "complete" and len(fake.calls) == 2 and len(feedback) == 1,
+                       f"status={status} calls={len(fake.calls)}")
+            self.check("verify: the system prompt mentions the check", "test -f" in c.get_system_prompt())
+
+    def test_ralph_loop(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt = os.path.join(tmp, "PROMPT.md")
+            with open(prompt, "w") as f:
+                f.write("Build the thing.\n")
+            c, fake = self.make_fake_commander([self._done("did item 1\nTASKCOMPLETE"),
+                                                self._done("everything done\nLOOPCOMPLETE")])
+            status = c.run_loop(prompt, 5)
+            second = fake.calls[1]["messages"] if len(fake.calls) > 1 else []
+            self.check("loop: LOOPCOMPLETE ends the loop", status == "loop_complete" and len(fake.calls) == 2,
+                       f"status={status} calls={len(fake.calls)}")
+            self.check("loop: each iteration starts from a fresh context",
+                       [m["role"] for m in second] == ["system", "user"]
+                       and second[1]["content"] == "Build the thing."
+                       and "Loop mode (iteration 2)" in second[0]["content"], repr(second)[:300])
+            self.check("loop: loop mode is off afterwards", c.loop_iteration == 0
+                       and "Loop mode" not in c.get_system_prompt())
+            c2, fake2 = self.make_fake_commander([self._done()] * 3)
+            status = c2.run_loop(prompt, 2)
+            self.check("loop: max_iterations", status == "max_iterations" and len(fake2.calls) == 2,
+                       f"status={status} calls={len(fake2.calls)}")
+            c3, _ = self.make_fake_commander()
+            self.check("loop: a missing prompt file is an error",
+                       c3.run_loop(os.path.join(tmp, "missing.md")) == "error")
+
+    def test_project_instructions(self):
+        import tempfile
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.chdir(tmp)
+                c = self.make_commander()
+                self.check("project: no file, no section", "Project instructions" not in c.get_system_prompt())
+                with open("CLAUDE.md", "w") as f:
+                    f.write("Use tabs.")
+                self.check("project: CLAUDE.md is a fallback", "Use tabs." in c.get_system_prompt())
+                with open("AGENTS.md", "w") as f:
+                    f.write("Run make test.")
+                prompt = c.get_system_prompt()
+                self.check("project: AGENTS.md wins", "Run make test." in prompt and "Use tabs." not in prompt)
+                c.fast = True
+                self.check("project: fast prompt too", "Run make test." in c.get_system_prompt())
+            finally:
+                os.chdir(cwd)
+
+    def test_headless_cli(self):
+        """aic.py --nogui --json against a local fake streaming server: env-var
+        configuration, a prompt piped on stdin, exit codes, AIC_API_KEY scrub."""
+        import http.server
+        import subprocess
+        import tempfile
+        requests = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append(body)
+                last = body["messages"][-1]
+                if "tools" not in body:
+                    delta = {"content": "a title"}
+                elif last["role"] == "tool":
+                    delta = {"content": "done\nTASKCOMPLETE"}
+                else:
+                    delta = {"tool_calls": [{"index": 0, "id": "t1", "type": "function", "function": {
+                        "name": "execute_bash", "arguments": json.dumps({"command": "env | grep -c AIC_API_KEY"})}}]}
+                chunk = {"id": "x", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode())
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("OPENAI_", "AIC_"))}
+        env.update(AIC_API_BASE=f"http://127.0.0.1:{server.server_port}/v1", AIC_MODEL="m", AIC_API_KEY="secret")
+        script = os.path.join(os.path.dirname(os.path.abspath(aic.__file__)), "aic.py")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                def run(*extra):
+                    return subprocess.run([sys.executable, script, "--nogui", "--auto-approve", "--disable-sandbox",
+                                           "--no-session", *extra], input="say hi", capture_output=True, text=True,
+                                          env=env, cwd=tmp, timeout=60)
+                proc = run("--json")
+                events = [json.loads(line) for line in proc.stdout.splitlines() if line.startswith("{")]
+                shutdown = [e for e in events if e["type"] == "SHUTDOWN"]
+                self.check("headless: exit 0 on completion", proc.returncode == 0,
+                           f"rc={proc.returncode} {proc.stderr[-300:]}")
+                self.check("headless: --json emits JSON lines",
+                           events and len(events) == len(proc.stdout.splitlines())
+                           and shutdown and shutdown[0].get("status") == "complete", proc.stdout[-300:])
+                tool_requests = [r for r in requests if "tools" in r]
+                self.check("headless: prompt read from stdin and env config used",
+                           tool_requests and tool_requests[0]["messages"][1]["content"] == "say hi")
+                result = [m for r in tool_requests for m in r["messages"] if m["role"] == "tool"]
+                self.check("headless: AIC_API_KEY hidden from commands",
+                           result and "Output:\n0" in result[0]["content"], repr(result)[:200])
+                proc = run("--max-steps", "1")
+                self.check("headless: exit 2 at the step limit", proc.returncode == 2, f"rc={proc.returncode}")
+                env.pop("AIC_MODEL")
+                proc = run()
+                self.check("headless: a missing model is a usage error",
+                           proc.returncode == 2 and "AIC_MODEL" in proc.stderr, proc.stderr[-200:])
+        finally:
+            server.shutdown()
 
 
 def main():
@@ -1762,6 +2034,8 @@ def main():
     runner.test_suggestion_follows_all_tool_results()
     runner.test_truncate_keeps_current_request()
     runner.test_ccllm_summary_is_folded_not_stacked()
+    runner.test_summarizer_failures_fall_back()
+    runner.test_internal_calls_use_low_effort()
     runner.test_context_overflow_is_retried()
     runner.test_transient_error_is_retried()
     runner.test_prompt_history_file()
@@ -1769,6 +2043,12 @@ def main():
     runner.test_preserved_thinking()
     runner.test_x11_clipboard()
     runner.test_tui_end_to_end()
+    runner.test_completion_marker()
+    runner.test_file_tools()
+    runner.test_verify_gate()
+    runner.test_ralph_loop()
+    runner.test_project_instructions()
+    runner.test_headless_cli()
 
     if not args.skip_live:
         print("\n=== Live integration tests (network) ===")

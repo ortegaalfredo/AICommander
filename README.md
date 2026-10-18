@@ -35,6 +35,9 @@ It supports two presentation modes:
   - [Mouse, copy and paste](#mouse-copy-and-paste)
   - [Prompt history](#prompt-history)
 - [The approval gate](#the-approval-gate)
+- [Ralph loop mode](#ralph-loop-mode)
+  - [Project instructions (`AGENTS.md`)](#project-instructions-agentsmd)
+  - [The verification gate](#the-verification-gate)
 - [Context compression](#context-compression)
   - [How the budget works](#how-the-budget-works)
   - [The `truncate` algorithm](#the-truncate-algorithm)
@@ -59,6 +62,13 @@ It supports two presentation modes:
 - **Ralph-loop agent** — repeatedly plans, executes, and observes until the
   task is done.
 - **Shell access** — runs arbitrary commands and captures their output.
+- **File tools** — `read_file`, `edit_file` and `write_file`, with edits shown
+  as a diff in the approval gate.
+- **Ralph loop mode** — `--loop PROMPT.md` re-runs a prompt file with a fresh
+  context per iteration; `AGENTS.md` is loaded into the system prompt and
+  `--verify "pytest -q"` gates every completion on your tests.
+- **Headless use** — exit codes, a prompt on stdin, configuration through
+  environment variables and JSON-lines events (`--json`).
 - **Web search** — using the duck-duck-go `ddgs` Python package (installed via requirements.txt).
 - **Approval gate** — review each command before it runs, or auto-approve.
 - **Command timeouts** — prevent runaway commands (configurable).
@@ -167,9 +177,9 @@ panel. In `--nogui` mode a request is required on the command line.
 
 | Option | Description |
 | ------ | ----------- |
-| `--api-base` | API base URL (required). |
-| `--model` | Model name (required). |
-| `--api-key` | API key (required). |
+| `--api-base` | API base URL (required; default `$AIC_API_BASE` or `$OPENAI_BASE_URL`). |
+| `--model` | Model name (required; default `$AIC_MODEL`). |
+| `--api-key` | API key (required; default `$AIC_API_KEY` or `$OPENAI_API_KEY`). Prefer the variables: a key on the command line is visible to every process, the agent's own commands included. |
 | `--auto-approve` | Auto-approve command execution (for testing). |
 | `--no-thinking` | Hide thinking tokens from output. |
 | `--timeout` | Command timeout in seconds (default: `120`). |
@@ -186,7 +196,14 @@ panel. In `--nogui` mode a request is required on the command line.
 | `--compress-target` | Fraction of the prompt budget retained as headroom (default: `0.4`). |
 | `--fast` | Fast mode: force `truncate` compression and a smaller system prompt, for slow inference systems. |
 | `--reasoning-effort` | Reasoning effort for the LLM (e.g. `low`, `medium`, `high`). |
-| `request` | The task request (positional, required in `--nogui` mode). |
+| `--loop FILE` | Ralph loop over a prompt file (see [Ralph loop mode](#ralph-loop-mode)). |
+| `--max-iterations` | Maximum `--loop` iterations (default: `10`; `0` = unlimited). |
+| `--verify CMD` | A command (e.g. `pytest -q`) that must exit 0 before a completion signal is accepted (see [The verification gate](#the-verification-gate)). |
+| `--json` | Emit every event as one JSON object per line on stdout (implies `--nogui`). |
+| `request` | The task request (positional). In `--nogui` mode it is required unless `--loop` is given; when stdin is piped it is read from there. |
+
+In `--nogui` mode the exit status tells scripts how the run ended: `0` task
+complete, `1` error, `2` step or iteration limit reached, `130` stopped.
 
 ### Example
 
@@ -206,6 +223,13 @@ python3 aic.py --auto-approve --api-base https://api.example.com/v1 \
 # Use the truncation algorithm and a smaller, faster prompt
 python3 aic.py --fast --api-base https://api.example.com/v1 \
   --model gpt-4o --api-key sk-... "List all files"
+
+# Headless: configuration from the environment, prompt on stdin, JSON events
+export AIC_API_BASE=https://api.example.com/v1 AIC_MODEL=gpt-4o AIC_API_KEY=sk-...
+cat task.md | aic --json --auto-approve --verify "pytest -q" > events.jsonl
+
+# Ralph loop: PROMPT.md re-run with a fresh context until the objective is done
+aic --nogui --auto-approve --loop PROMPT.md --max-iterations 20 --verify "make test"
 ```
 
 ---
@@ -229,8 +253,11 @@ empty thinking and progressively stop thinking. It is cleared when you send a
 new request, and if an endpoint refuses it, AI-Commander retries without it
 and stops sending it for the session.
 
-The agent exposes a single tool, `execute_bash(command)`, which runs the
-command in a pseudo-terminal (PTY). The PTY gives the command a real terminal
+The agent has four tools. `read_file`, `edit_file` (exact string
+replacement) and `write_file` view and change files without shell quoting, so
+weaker models stop breaking files with `sed` and heredocs; each goes through
+the approval gate, which shows edits as a diff. `execute_bash(command)` runs
+everything else in a pseudo-terminal (PTY). The PTY gives the command a real terminal
 environment (so interactive tools and `tput`-style programs work) and lets the
 agent capture output, enforce a timeout, and kill the whole process group when
 needed. Output is streamed live to the console panel and the final result is
@@ -251,8 +278,9 @@ The default Textual interface is a Norton-Commander-style split screen:
   messages. The pane title shows an LLM-generated summary of the task.
 - **Right pane — Console / Shell**: two tabs (click them or press `F3`).
   *Console* shows every command the agent runs with its live output and exit
-  code; *Shell* is an embedded, colored interactive shell with scrollback. When
-  you `cd` in the shell, the agent's commands follow you there.
+  code; *Shell* is an embedded, colored interactive shell with scrollback. It
+  is independent of the agent: a `cd` there never changes the directory the
+  agent works in, which stays the one AI-Commander was started in.
 - **Prompt**: a multi-line input box (it grows with its content).
 - **Status line**: what the agent is doing (thinking, writing, running a
   command, waiting for approval, retrying) with elapsed time, step count,
@@ -278,6 +306,7 @@ controls, so they are **not** added to prompt history:
 | `/session` | — | Show the session file, session id, instance number, and what is currently saved on disk. |
 | `/reload` | — | Re-read the session file, picking up edits made to its `messages` array outside AI-Commander (requires a stopped agent). |
 | `/copy` | — | Copy the agent's last answer to the clipboard. |
+| `/loop [file]` | — | Start a [ralph loop](#ralph-loop-mode) over a prompt file (default `PROMPT.md`), up to `--max-iterations`. |
 | `/stop` | — | Stop the running agent (same as `F9`). |
 | `/quit` | `/exit` | Stop the agent and exit the application. |
 | `/approve`, `/reject`, `/suggest <text>` | — | Answer a pending approval (normally done in the approval dialog). |
@@ -359,6 +388,11 @@ command (syntax highlighted) in a dialog:
   command is skipped and your suggestion is fed back to the agent as a user
   message steering it.
 
+The file tools go through the same gate: `edit_file` and `write_file` show
+the change as a unified diff (in `--nogui` mode the diff is printed before the
+question), and `read_file` asks too, like `cat` would. An edit whose
+`old_string` is missing or ambiguous is refused before you are asked.
+
 For a moment after the dialog opens its keys are ignored, so typing that was
 meant for the prompt can never approve a command by accident. In `--nogui`
 mode the same choices are asked on the terminal; a blank answer, end of input
@@ -368,6 +402,50 @@ You can toggle auto-approve at any time with `F2` or `/autoapprove` (`/aa`), or
 start with `--auto-approve`. When auto-approve is ON, all commands run without
 asking (the status line shows **AUTO-APPROVE**) — useful for testing and
 scripting, but be ready to stop the agent (`F9`) if a command misbehaves.
+
+---
+
+## Ralph loop mode
+
+`--loop PROMPT.md` (or `/loop` in the TUI) runs the
+[ralph loop](https://ghuntley.com/ralph/) pattern: the same prompt file is
+given to the agent again and again, and **every iteration starts with a fresh
+context**: the system prompt plus the file, re-read each time so you can edit
+it while the loop runs. Nothing is remembered between iterations except what is
+on disk, so the system prompt tells the agent to:
+
+- read the current state first (the plan or progress file, `AGENTS.md`, `git log`);
+- do the single most important unfinished item and verify it;
+- record what it did and what remains in the plan file (`IMPLEMENTATION_PLAN.md`
+  unless the prompt names one) and append build/test learnings to `AGENTS.md`;
+- end the iteration with `TASKCOMPLETE`, or with `LOOPCOMPLETE` once the whole
+  objective is done.
+
+The loop stops on `LOOPCOMPLETE`, when an iteration fails (API error), when you
+stop it, or after `--max-iterations` (default 10, `0` = unlimited). An
+iteration that hits `--max-steps` just ends, and the next one starts fresh.
+Combine it with `--verify` so "done" has to pass your tests.
+
+Because every iteration starts empty, `/loop` in the TUI replaces the current
+conversation (and the session file mirrors only the running iteration).
+AI-Commander does not commit for you: if you want a commit per iteration, say
+so in `PROMPT.md`.
+
+### Project instructions (`AGENTS.md`)
+
+If the working directory has an `AGENTS.md` (or, failing that, a `CLAUDE.md`),
+its contents (up to 16000 characters) are added to the system prompt of every
+run, so project conventions and build/test commands reach the model without
+being repeated in each request.
+
+### The verification gate
+
+The completion marker only counts on a line of its own or at the end of the
+reply, so "I'll say TASKCOMPLETE once the tests pass" does not end the run.
+With `--verify CMD`, a completion signal is checked by running `CMD` (with the
+normal timeout and output limits, no approval needed): exit 0 accepts it;
+anything else sends the output back to the model as `[VERIFY FAILED]` and the
+run continues.
 
 ---
 
@@ -645,6 +723,7 @@ instructions for the model.
 | `AIC_EXTRA_BODY=0` | Do not send `chat_template_kwargs.enable_thinking` to the endpoint. |
 | `AIC_DEBUG_DUMP_DIR` | Directory for `--debug` dumps (default `~/.aic`). |
 | `NO_COLOR` | Disable colors in `--nogui` mode (they are also off when output is piped). |
+| `AIC_API_BASE`, `AIC_MODEL`, `AIC_API_KEY` | Defaults for `--api-base`, `--model` and `--api-key` (`OPENAI_BASE_URL` and `OPENAI_API_KEY` are also read). `AIC_API_KEY` is removed from the environment, so the agent's commands cannot see it. |
 
 Endpoints that reject `stream_options` or `extra_body` are detected and the
 request is retried without them automatically; the variables just skip the

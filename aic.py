@@ -7,7 +7,7 @@ default Textual TUI (TUISink) and a plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import argparse
 import asyncio
@@ -16,6 +16,7 @@ import base64
 import bisect
 import codecs
 import contextlib
+import difflib
 import json
 import os
 import queue
@@ -190,6 +191,18 @@ def _content_text(content) -> str:
 def _is_continuation(msg) -> bool:
     return (isinstance(msg, dict) and msg.get("role") == "user"
             and isinstance(msg.get("content"), str) and msg["content"].startswith(_CONTINUATION_PREFIX))
+
+
+def _has_marker(text: str, marker: str) -> bool:
+    """True when *marker* (optionally <promise>-wrapped) stands on a line of its
+    own or ends the message, so merely mentioning it ("I will emit X once the
+    tests pass") does not count."""
+    tag = rf"(?:<promise>\s*)?{re.escape(marker)}(?:\s*</promise>)?"
+    return bool(re.search(rf"(?m)^[^\w\n]*{tag}[^\w\n]*$", text) or re.search(rf"(?<!\w){tag}\W*\Z", text))
+
+
+# Process exit status per run()/run_loop() outcome (--nogui).
+_EXIT_CODES = {"complete": 0, "loop_complete": 0, "error": 1, "max_steps": 2, "max_iterations": 2, "stopped": 130}
 
 
 def _is_empty_assistant(msg) -> bool:
@@ -632,7 +645,8 @@ class ConsoleSink(EventSink):
                 self._line(f"[USER REQUEST] {text}", colors.BOLD + colors.YELLOW)
                 self._line("=" * 60)
             elif kind == "CMD_EXEC":
-                self._line(f"$ {payload.get('command', '')}", colors.BOLD + colors.YELLOW)
+                prefix = "" if payload.get("function_name") in AICommander.FILE_TOOLS else "$ "
+                self._line(f"{prefix}{payload.get('command', '')}", colors.BOLD + colors.YELLOW)
             elif kind == "CMD_COMPLETE":
                 self._line(f"[exit {payload.get('exit_code')}]", colors.BOLD)
             elif kind == "SYSTEM":
@@ -657,6 +671,31 @@ class ConsoleSink(EventSink):
     def confirm(self, command: str) -> str:
         question = "Run it? [y]es / [n]o / or type a suggestion: "
         return self.input(f"{colors.BOLD}{colors.YELLOW}{question}{colors.END}" if self._color else question)
+
+
+class JsonSink(EventSink):
+    """--json: every event as one JSON object per line on stdout ({"type": KIND,
+    "ts": ..., **payload}); approval questions go to stderr, answers come from stdin."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def emit(self, kind: str, payload: dict):
+        line = json.dumps({"type": kind, "ts": round(time.time(), 3), **payload}, ensure_ascii=False, default=str)
+        with self._lock:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    def input(self, prompt: str) -> str:
+        sys.stderr.write(prompt)
+        sys.stderr.flush()
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError
+        return line.rstrip("\n")
+
+    def confirm(self, command: str) -> str:
+        return self.input(f"{command}\nRun it? [y]es / [n]o / or type a suggestion: ")
 
 
 class TUISink(EventSink):
@@ -732,7 +771,11 @@ class AICommander:
     context compression and session persistence. All I/O goes to ``self.sink``."""
 
     COMPLETION_MARKER = "TASKCOMPLETE"
+    LOOP_COMPLETE_MARKER = "LOOPCOMPLETE"  # --loop: the whole objective is done, stop iterating
     OUTPUT_TRUNCATION_SENTINEL = "output too long: truncated"
+    PROJECT_FILES = ("AGENTS.md", "CLAUDE.md")  # the first one found is added to the system prompt
+    MAX_PROJECT_FILE_CHARS = 16000
+    FILE_TOOLS = ("read_file", "edit_file", "write_file")
 
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
                  show_thinking: bool = True, command_timeout: int = 120,
@@ -741,7 +784,7 @@ class AICommander:
                  max_steps: int = 500, compress_algorithm: str = "context-compressor-llm",
                  compress_target: float = 0.4, fast: bool = False, reasoning_effort: str | None = None,
                  sandbox_enabled: bool = False, sandbox_write_dir: str = "",
-                 session_file: str = "", instance_number: int = 1):
+                 session_file: str = "", instance_number: int = 1, verify_command: str = ""):
         self.base_url = api_base.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -763,6 +806,8 @@ class AICommander:
         self.sandbox_write_dir = sandbox_write_dir
         self.session_file = session_file  # "" disables persistence
         self.instance_number = instance_number
+        self.verify_command = verify_command  # must exit 0 before a completion signal is accepted
+        self.loop_iteration = 0  # > 0 while run_loop() drives the runs
 
         self.conversation_history: list[dict[str, Any]] = []
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -782,21 +827,32 @@ class AICommander:
         self._started_banner_shown = False
         self._command_started = 0.0
         self._send_reasoning = True  # off once an endpoint rejects reasoning_content in requests
+        self._effort_rejected = False  # set once an endpoint rejects reasoning_effort
         # Retries are done here (stop-aware, with backoff), not inside the SDK.
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url,
                              default_headers={"User-Agent": USER_AGENT}, max_retries=0)
-        self.tool_schemas = [{
-            "type": "function",
-            "function": {
-                "name": "execute_bash",
-                "description": "Execute a shell command in the terminal (bash on Linux/macOS, PowerShell on Windows)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"command": {"type": "string", "description": "The bash command to execute"}},
-                    "required": ["command"],
-                },
-            },
-        }]
+        def tool(name, description, required, **props):
+            return {"type": "function", "function": {"name": name, "description": description, "parameters": {
+                "type": "object", "properties": props, "required": required}}}
+        path = {"type": "string", "description": "File path, relative to the working directory or absolute"}
+        self.tool_schemas = [
+            tool("execute_bash", "Execute a shell command in the terminal (bash on Linux/macOS, PowerShell on Windows)",
+                 ["command"], command={"type": "string", "description": "The bash command to execute"}),
+            tool("read_file", "Read a text file. Lines come back numbered as 'N<TAB>text'; the number prefix is "
+                              "not part of the file. Long files are cut: continue with offset.", ["path"], path=path,
+                 offset={"type": "integer", "description": "First line to return, 1-based (default 1)"},
+                 limit={"type": "integer", "description": "Maximum number of lines (default 2000)"}),
+            tool("edit_file", "Replace an exact string in a file. old_string must match the file exactly "
+                              "(whitespace and indentation included, no line-number prefixes) and occur exactly "
+                              "once unless replace_all is true: include enough surrounding lines to make it "
+                              "unique.", ["path", "old_string", "new_string"], path=path,
+                 old_string={"type": "string", "description": "The exact text to replace"},
+                 new_string={"type": "string", "description": "The replacement text"},
+                 replace_all={"type": "boolean", "description": "Replace every occurrence (default false)"}),
+            tool("write_file", "Create or overwrite a file with the given content (parent directories are "
+                               "created).", ["path", "content"], path=path,
+                 content={"type": "string", "description": "The complete new file content, as text (for a JSON file: the JSON text)"}),
+        ]
 
     def _log(self, message: str, style: str = ""):
         self.sink.emit("LOG", {"text": message, "style": style})
@@ -1153,9 +1209,7 @@ Your task is to create a detailed summary of the conversation so far, paying clo
 This summary should be thorough in capturing technical details, key patterns, and important decisions that would be essential for continuing the work without losing context.
 This summary should not be over 5000 characters in length.
 
-Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
-
-1. Chronologically analyze each message and section of the conversation. For each section thoroughly identify:
+Go through the conversation chronologically and make sure the summary captures, for each part of it:
    - The user's explicit requests and intents
    - Your approach to addressing the user's requests
    - Key decisions, technical concepts and code patterns
@@ -1166,7 +1220,8 @@ Before providing your final summary, wrap your analysis in <analysis> tags to or
      - file edits
    - Errors that you ran into and how you fixed them
    - Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
-2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.
+
+Write ONLY the summary, inside <summary></summary> tags: no analysis, notes or preamble before or after it.
 
 Your summary should include the following sections:
 
@@ -1185,10 +1240,6 @@ If there is a next step, include direct quotes from the most recent conversation
 Here's an example of how your output should be structured:
 
 <example>
-<analysis>
-[Your thought process, ensuring all points are covered thoroughly and accurately]
-</analysis>
-
 <summary>
 1. Primary Request and Intent:
    [Detailed description]
@@ -1237,13 +1288,12 @@ Here's an example of how your output should be structured:
 Please provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response.
 Remember to not exceed 5000 characters, its very important that the summary to be concise.
 """
-        # The system prompt and the original task anchor the summary even when
-        # the evicted segment contains no user message.
-        sys_prompt = getattr(self, "_compress_system_prompt", None)
+        # The original task anchors the summary even when the evicted segment
+        # contains no user message. (The agent's full system prompt is not
+        # needed for that and would only add prefill.)
         first_user = getattr(self, "_compress_first_user", None)
-        if sys_prompt:
-            prompt += ("\n\nSYSTEM PROMPT (the agent's operating instructions, kept verbatim and always "
-                       "present at the front of the context):\n" + sys_prompt)
+        prompt += ("\n\nCONTEXT: the conversation is an autonomous agent (AI-Commander) carrying out the "
+                   "user's task with shell and file tools.")
         if first_user is not None:
             prompt += ("\n\nORIGINAL FIRST USER COMMAND (the primary objective the agent was initially asked "
                        "to do; preserved verbatim outside the summarized log):\n[user] "
@@ -1252,22 +1302,20 @@ Remember to not exceed 5000 characters, its very important that the summary to b
             prompt += "\n\nPrior summary (fold new information into it):\n" + previous_summary
         prompt += "\n\nMessages to summarize:\n"
         prompt += "".join(f"\n[{m.get('role', 'unknown')}] {m.get('content', '')}" for m in messages)
-        try:
-            # Some endpoints reject a lone system message ("no user query found").
-            response = self.call_llm_api(
-                [{"role": "system", "content": "You are a precise conversation summarizer."},
-                 {"role": "user", "content": prompt}],
-                use_tools=False, stream_display=False, stream_label="[SESSION SUMMARY]",
-                enable_thinking=False, show_thinking=False)
-            summary = (response["choices"][0]["message"].get("content") or "").strip()
-            # Keep only the <summary> part: the <analysis> scratchpad would waste context.
-            match = re.search(r"<summary>(.*?)(?:</summary>|\Z)", summary, re.S)
-            summary = match.group(1).strip() if match else re.sub(r"<analysis>.*?</analysis>", "", summary,
-                                                                   flags=re.S).strip()
-            return summary or "[summary unavailable]"
-        except Exception as exc:
-            self._log_error(f"[COMPRESS] LLM summarizer failed: {exc}. Using a placeholder summary.")
-            return "[summary unavailable]"
+        # Some endpoints reject a lone system message ("no user query found").
+        response = self.call_llm_api(
+            [{"role": "system", "content": "You are a precise conversation summarizer."},
+             {"role": "user", "content": prompt}],
+            use_tools=False, stream_display=False, stream_label="[SESSION SUMMARY]",
+            enable_thinking=False, show_thinking=False, reasoning_effort="low", max_tokens=8192)
+        reply = (response["choices"][0]["message"].get("content") or "").strip()
+        # Keep only the summary; a model may still add an <analysis> scratchpad.
+        match = re.search(r"<summary>(.*?)(?:</summary>|\Z)", reply, re.S)
+        summary = match.group(1).strip() if match else re.sub(r"<analysis>.*?</analysis>", "", reply,
+                                                               flags=re.S).strip()
+        if not summary or "<analysis>" in summary:  # empty, or cut off inside the scratchpad
+            raise RuntimeError("the summarizer returned no usable summary")
+        return summary
 
     def _compress_context_compressor_llm(self, budget: int, total_tokens: int):
         """Anchored-summary compression (context-compressor-llm package): the
@@ -1292,7 +1340,6 @@ Remember to not exceed 5000 characters, its very important that the summary to b
             request = None
         log = [(i, m) for i, m in enumerate(hist)
                if m.get("role") != "system" and not any(m is p for p in protected)]
-        self._compress_system_prompt = base_prompt
         self._compress_first_user = first_user
 
         # Size everything in the trigger's units: content + tool-call arguments +
@@ -1317,10 +1364,19 @@ Remember to not exceed 5000 characters, its very important that the summary to b
                                      f"({str((tc.get('function') or {}).get('arguments') or '')[:200]})"
                                      for tc in calls[:4])
                 content = (content + f"\n[tool_calls: {previews}]").strip()
+            if len(content) > 2000:  # the gist of a long output is enough for a summary
+                content = (f"{content[:1500]}\n[... {len(content) - 2000} characters omitted ...]\n"
+                           f"{content[-500:]}")
             cc.add_message(content, role=msg.get("role", "user"), metadata={"original": msg, "index": index})
         for lib_msg in cc.state.messages:
             lib_msg.token_count = self._estimate_message_tokens(lib_msg.metadata["original"])
-        context = cc.get_current_context(auto_compress=True)
+        try:
+            context = cc.get_current_context(auto_compress=True)
+        except Exception as exc:  # never drop history behind a missing summary
+            if self.stop_event.is_set():
+                return None
+            self._log_error(f"[COMPRESS] The LLM summarizer failed ({exc}); falling back to 'truncate'.")
+            return self._compress_truncate(budget, self._estimate_input_tokens(hist))
         stats = cc.get_stats()
         if not stats["compression_count"]:
             self._log("[COMPRESS] Nothing could be summarized; falling back to 'truncate'.", style="yellow")
@@ -1365,14 +1421,14 @@ Remember to not exceed 5000 characters, its very important that the summary to b
                    if self.sandbox_enabled else
                    f"You are running inside an OS-level sandbox (currently disabled). When the sandbox is active, "
                    f"writes are restricted to {self.sandbox_write_dir}, /tmp and /dev.")
-        return f"""You are an expert planning and execution assistant. Fulfill the user's request by breaking it into manageable steps and executing bash commands via the execute_bash tool (one command at a time, waiting for each result).
+        return f"""You are an expert planning and execution assistant. Fulfill the user's request by breaking it into manageable steps and executing them with your tools, one call at a time, waiting for each result: execute_bash runs shell commands; read_file, edit_file and write_file view and change files (prefer them over cat/sed/heredocs for reading and editing files).
 
 **Workflow:**
 1. Analyze the request; if complex, break it into a numbered task list.
 2. Restate your plan every ~5 steps and update the task list as you progress.
-3. Execute one step with execute_bash, then evaluate the result.
-4. If a step fails, adjust your approach and explain. If all steps are done and the goal is met, emit the exact phrase '{self.COMPLETION_MARKER}'.
-5. Only emit '{self.COMPLETION_MARKER}' once you are certain every necessary action is complete and verified. Never say it prematurely.
+3. Execute one step with a tool, then evaluate the result.
+4. If a step fails, adjust your approach and explain. If all steps are done and the goal is met, emit the exact phrase '{self.COMPLETION_MARKER}' on its own line.
+5. Only emit '{self.COMPLETION_MARKER}' once you are certain every necessary action is complete and verified. Never say it prematurely, and do not write it when merely talking about it.{self._verify_note()}
 
 **Working Directory:**
 - Create a working directory named after the task (e.g. `work/<short-task-slug>/`, under the current directory or /tmp — wherever writes are allowed) and keep ALL temporary files there: scripts, patches, downloads, test output, generated artifacts. Never scatter temporary files in the project root; only the task's real deliverables belong outside the working directory.
@@ -1397,18 +1453,18 @@ Remember to not exceed 5000 characters, its very important that the summary to b
 - Troubleshoot errors and try alternative approaches until the objective is met.
 - The ONLY way to finish is to emit '{self.COMPLETION_MARKER}' AFTER verifying all objectives via actual command execution and result inspection. Partial completion is not completion.
 - Do not ask the user for clarification unless you have exhausted autonomous options.
-- Before emitting '{self.COMPLETION_MARKER}', verify your last actions (check file contents, run tests, confirm services).
+- Before emitting '{self.COMPLETION_MARKER}', verify your last actions (check file contents, run tests, confirm services).{self._loop_note()}
 
-Think carefully; response quality is the highest priority. You have unlimited thinking tokens."""
+Think carefully; response quality is the highest priority. You have unlimited thinking tokens.{self._project_instructions()}"""
 
     def get_fast_system_prompt(self) -> str:
         """A smaller, faster system prompt for --fast mode."""
-        return f"""You are an expert bash assistant. Complete the user's task by running commands via execute_bash, one at a time, and acting on each result.
+        return f"""You are an expert bash assistant. Complete the user's task with your tools, one call at a time, acting on each result: execute_bash for commands; read_file, edit_file and write_file for files.
 
 Workflow:
 - Break complex tasks into steps and track them.
 - If a step fails, fix it and retry.
-- When the task is fully done and verified, emit '{self.COMPLETION_MARKER}' and stop.
+- When the task is fully done and verified, emit '{self.COMPLETION_MARKER}' on its own line and stop.{self._verify_note()}
 
 Rules:
 - Create a working directory named after the task (e.g. `work/<short-task-slug>/`) and keep temporary files there, not in the project root.
@@ -1417,7 +1473,38 @@ Rules:
 - Only report conclusions from real tool output; never fabricate results.
 - Web search by printing JSON results to stdout: `python3 -c "import json; from ddgs import DDGS; print(json.dumps(list(DDGS().text('QUERY', max_results=10)), ensure_ascii=False, indent=2))"` (replace QUERY). Use wget/curl and the w3m browser to fetch page contents.
 {self._ddgs_note()}
-- Keep working until the task is genuinely complete; partial completion is not completion."""
+- Keep working until the task is genuinely complete; partial completion is not completion.{self._loop_note()}{self._project_instructions()}"""
+
+    def _verify_note(self) -> str:
+        if not self.verify_command:
+            return ""
+        return (f"\n   The completion signal is checked: `{self.verify_command}` runs automatically and must exit 0, "
+                f"otherwise its output comes back to you and the task continues.")
+
+    def _loop_note(self) -> str:
+        if not self.loop_iteration:
+            return ""
+        return f"""
+
+**Loop mode (iteration {self.loop_iteration}):** The same prompt is given to a fresh instance of you on every iteration, with NO memory of earlier iterations: only files on disk persist.
+- Start by reading the current state: the plan/progress files the prompt names (or IMPLEMENTATION_PLAN.md if present), AGENTS.md, and `git status` / `git log --oneline -10` in a git repository.
+- Pick the single most important unfinished item, implement it and verify it (tests, build).
+- Before finishing, update the plan/progress file (create IMPLEMENTATION_PLAN.md if the prompt names none) with what you did and what remains, and append short, non-obvious build/test learnings to AGENTS.md, so the next iteration can continue.
+- End the iteration with '{self.COMPLETION_MARKER}' on its own line. If, and only if, the ENTIRE objective of the prompt is complete and verified with nothing left to do, end with '{self.LOOP_COMPLETE_MARKER}' on its own line instead."""
+
+    def _project_instructions(self) -> str:
+        """The first PROJECT_FILES file in the working directory, for the system prompt."""
+        for name in self.PROJECT_FILES:
+            try:
+                with open(name, encoding="utf-8", errors="replace") as f:
+                    text = f.read(self.MAX_PROJECT_FILE_CHARS + 1).strip()
+            except OSError:
+                continue
+            if len(text) > self.MAX_PROJECT_FILE_CHARS:
+                text = text[:self.MAX_PROJECT_FILE_CHARS] + f"\n[... {name} truncated]"
+            if text:
+                return f"\n\n**Project instructions ({name} in the working directory; follow them):**\n{text}"
+        return ""
 
     @staticmethod
     def _ddgs_note() -> str:
@@ -1659,6 +1746,127 @@ Rules:
             return False, None
         return False, answer
 
+    # --- File tools ----------------------------------------------------------------
+
+    @staticmethod
+    def _read_text(path: str) -> str:
+        with open(path, encoding="utf-8", newline="") as f:  # line endings untouched
+            return f.read()
+
+    def _read_file(self, path: str, offset, limit) -> str:
+        """Numbered lines of a file, cut at whole lines to fit max_output_bytes."""
+        with open(path, "rb") as f:
+            data = f.read()
+        if b"\0" in data[:8192]:
+            return f"{path} looks binary ({len(data)} bytes); inspect it with execute_bash (e.g. xxd | head)."
+        lines = data.decode("utf-8", "replace").splitlines()
+        if not lines:
+            return "(empty file)"
+        with contextlib.suppress(TypeError, ValueError):
+            offset = int(offset)
+        with contextlib.suppress(TypeError, ValueError):
+            limit = int(limit)
+        start = max(1, offset if isinstance(offset, int) else 1)
+        stop = min(len(lines), start - 1 + max(1, limit if isinstance(limit, int) else 2000))
+        if start > len(lines):
+            return f"offset {start} is past the end of the file ({len(lines)} lines)."
+        out, size, end = [], 0, start - 1
+        for n in range(start, stop + 1):
+            row = f"{n}\t{lines[n - 1]}\n"
+            size += len(row.encode("utf-8"))
+            if size > self.max_output_bytes:
+                if not out:  # a single line longer than the cap
+                    out.append(row.encode("utf-8")[:self.max_output_bytes].decode("utf-8", "ignore")
+                               + f"\n{self.OUTPUT_TRUNCATION_SENTINEL}\n")
+                    end = n
+                break
+            out.append(row)
+            end = n
+        more = f"\n[lines {start}-{end} of {len(lines)}; call read_file with offset={end + 1} to continue]"
+        return "".join(out) + (more if end < len(lines) else "")
+
+    def _prepare_file_tool(self, name: str, args: dict) -> tuple[str, str, Any]:
+        """Check a file tool call before it is approved. Returns (summary, preview,
+        action): action() performs the call and returns its result; when the
+        call is invalid, action is None and preview holds the error."""
+        path = args.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return name, f"ERROR: {name} requires a 'path' string argument.", None
+        full, summary = os.path.abspath(os.path.expanduser(path)), f"{name} {path}"
+        if name == "read_file":
+            return summary, "", lambda: self._read_file(full, args.get("offset"), args.get("limit"))
+        exists = os.path.isfile(full)
+        try:
+            before = self._read_text(full) if exists else ""
+        except (OSError, UnicodeDecodeError) as exc:
+            return summary, f"ERROR: cannot read {path} as UTF-8 text ({exc}); use execute_bash for it.", None
+        replace_all = args.get("replace_all") is True
+        if name == "write_file":
+            after = args.get("content")
+            if isinstance(after, (dict, list)):  # models send a JSON file's data as an object
+                after = json.dumps(after, indent=2, ensure_ascii=False) + "\n"
+            elif not isinstance(after, str):
+                got = "missing" if after is None else f"a JSON {type(after).__name__}"
+                return summary, (f"ERROR: write_file needs 'content' as a string with the complete file text "
+                                 f"(it was {got}). Send the text itself, escaped as a JSON string."), None
+            done = f"{'overwrote' if exists else 'created'} {path}"
+        else:
+            old, new = args.get("old_string"), args.get("new_string")
+            if not exists:
+                return summary, f"ERROR: {path} does not exist (use write_file to create it).", None
+            if not isinstance(old, str) or not old or not isinstance(new, str):
+                return summary, "ERROR: edit_file requires a non-empty 'old_string' and a 'new_string' string.", None
+            if old not in before and "\r\n" in before:  # models write \n line endings
+                old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
+            count = before.count(old)
+            if not count:
+                return summary, (f"ERROR: old_string was not found in {path}. Re-read the file with read_file and "
+                                 f"copy the text exactly (indentation included, without line-number prefixes)."), None
+            if count > 1 and not replace_all:
+                return summary, (f"ERROR: old_string occurs {count} times in {path}. Include more surrounding "
+                                 f"lines to make it unique, or set replace_all to true."), None
+            after = before.replace(old, new, -1 if replace_all else 1)
+            done = f"replaced {count if replace_all else 1} occurrence(s) in {path}"
+        diff = [ln if ln.endswith("\n") else ln + "\n" for ln in
+                difflib.unified_diff(before.splitlines(True), after.splitlines(True), f"a/{path}", f"b/{path}", n=2)]
+        added = sum(ln.startswith("+") for ln in diff[2:])
+        removed = sum(ln.startswith("-") for ln in diff[2:])
+        preview = "".join(diff[:400]) + (f"… ({len(diff) - 400} more diff lines)\n" if len(diff) > 400 else "")
+
+        def apply() -> str:
+            if (self._read_text(full) if os.path.isfile(full) else "") != before:
+                raise RuntimeError(f"{path} changed after this call was prepared; re-read it and retry")
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8", newline="") as f:
+                f.write(after)
+            return f"OK: {done} (+{added} -{removed} lines)."
+        return f"{summary} (+{added} -{removed})", preview or "(no changes)\n", apply
+
+    def _run_file_tool(self, name: str, args: dict, suggestions: list) -> str:
+        """A file tool call through the approval gate; returns the tool result."""
+        summary, preview, action = self._prepare_file_tool(name, args)
+        if action is None:
+            self._log(f"[{name}] {preview}", style="yellow")
+            return preview
+        self._command_started = time.monotonic()
+        self.sink.emit("CMD_EXEC", {"command": summary, "function_name": name})
+        if preview:
+            self.sink.emit("CMD_OUTPUT", {"text": preview, "command": summary})
+        approved, suggestion = self.get_user_confirmation(summary + ("\n\n" + preview if preview else ""))
+        if not approved:
+            self._log("[INFO] Not approved by user.")
+            if suggestion:
+                suggestions.append(suggestion)
+            return f"{name} skipped by user."
+        try:
+            result, code = action(), 0
+        except Exception as exc:
+            result, code = f"ERROR: {exc}", 1
+        self.sink.emit("CMD_OUTPUT", {"text": result.rstrip("\n") + "\n", "command": summary})
+        self.sink.emit("CMD_COMPLETE", {"command": summary, "exit_code": code, "output": result,
+                                        "duration": time.monotonic() - self._command_started})
+        return result
+
     # --- Messages and the LLM call -----------------------------------------------
 
     def _sanitize_tool_pairing(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1741,7 +1949,8 @@ Rules:
 
     def call_llm_api(self, messages: list[dict[str, Any]], use_tools: bool = True,
                      stream_display: bool = True, stream_label: str | None = None,
-                     enable_thinking: bool = True, show_thinking: bool | None = None) -> dict[str, Any]:
+                     enable_thinking: bool = True, show_thinking: bool | None = None,
+                     reasoning_effort: str | None = None, max_tokens: int | None = None) -> dict[str, Any]:
         """Call the chat-completions API with streaming and return the assembled
         response.
 
@@ -1768,16 +1977,18 @@ Rules:
                             else _env_float("AIC_TEMPERATURE_TEXT", 1.0)),
             "stream": True,
         }
-        if self.reasoning_effort:
-            params["reasoning_effort"] = self.reasoning_effort
+        effort = None if self._effort_rejected else (reasoning_effort or self.reasoning_effort)
+        if effort:
+            params["reasoning_effort"] = effort
         # vLLM/SGLang extensions; servers that reject them get a retry without
         # (or disable them up front with AIC_STREAM_OPTIONS=0 / AIC_EXTRA_BODY=0).
         if _env_bool("AIC_STREAM_OPTIONS", True):
             params["stream_options"] = {"include_usage": True}
         if "gpt" not in self.model:  # OpenAI rejects these
-            params["max_tokens"] = self.max_tokens
-            if _env_bool("AIC_EXTRA_BODY", True):
-                params["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
+            params["max_tokens"] = max_tokens or self.max_tokens
+            if _env_bool("AIC_EXTRA_BODY", True):  # some servers pass the effort to the template only this way
+                params["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking,
+                                                                 **({"reasoning_effort": effort} if effort else {})}}
         if use_tools:
             params["tools"] = self.tool_schemas
             params["tool_choice"] = "auto"
@@ -1799,6 +2010,12 @@ Rules:
                                           for m in params["messages"]]
                     self._log("[API] The endpoint rejected earlier reasoning in the request; "
                               "continuing without sending it back.", style="yellow")
+                    continue
+                if "reasoning_effort" in params and "reasoning_effort" in str(exc).lower() \
+                        and getattr(exc, "status_code", None) in (400, 422):
+                    self._effort_rejected = True  # e.g. a non-reasoning model
+                    params.pop("reasoning_effort")
+                    self._log("[API] The endpoint rejected reasoning_effort; continuing without it.", style="yellow")
                     continue
                 if not extras_dropped and ("stream_options" in params or "extra_body" in params) \
                         and _is_param_rejection(exc):
@@ -1926,7 +2143,7 @@ Rules:
                 command = parsed.get("command") if isinstance(parsed, dict) else parsed
                 command = command if isinstance(command, str) else None
             tool_calls_info.append({"tool_call_id": tool_call.get("id"), "function_name": name,
-                                    "function_arguments": raw, "command": command})
+                                    "function_arguments": raw, "command": command, "arguments": parsed})
         first_id = tool_calls_info[0]["tool_call_id"] if tool_calls_info else None
         return (content if isinstance(content, str) else ""), tool_calls_info, first_id, thinking, malformed
 
@@ -1973,7 +2190,8 @@ Rules:
                 [{"role": "system", "content": "You are a precise summarizer."},
                  {"role": "user", "content": "Summarize the following task in 10 to 15 words. Reply with the "
                                              "summary only, no quotes, no punctuation at the end.\n\n" + prompt}],
-                use_tools=False, stream_display=False, enable_thinking=False, show_thinking=False)
+                use_tools=False, stream_display=False, enable_thinking=False, show_thinking=False,
+                reasoning_effort="low", max_tokens=2048)
             summary = " ".join((response["choices"][0]["message"].get("content") or "").split())
         except Exception as exc:
             if self.debug:
@@ -1988,7 +2206,7 @@ Rules:
 
     def _continuation_prompt(self) -> str:
         return (f"{_CONTINUATION_PREFIX} If the task is truly complete, you MUST emit the completion signal "
-                f"\"{self.COMPLETION_MARKER}\" on its own. Otherwise, continue by using the appropriate tools to "
+                f"\"{self.COMPLETION_MARKER}\" on its own line. Otherwise, continue by using the appropriate tools to "
                 f"make progress. Do NOT simply describe what needs to be done - take the next concrete step "
                 f"using execute_bash or other available tools. Remember: you must keep going until the task is "
                 f"fully finished, then emit \"{self.COMPLETION_MARKER}\".")
@@ -2018,6 +2236,12 @@ Rules:
                         rest["tool_call_id"], "Not executed: the user stopped the agent before this command ran."))
                 break
             tcid, command, name = call["tool_call_id"], call.get("command"), call.get("function_name")
+            if name in self.FILE_TOOLS:
+                args = call.get("arguments")
+                result = self._run_file_tool(name, args if isinstance(args, dict) else {}, suggestions)
+                self.conversation_history.append(self._tool_result(tcid, result))
+                self.save_session("tool_result")
+                continue
             if not command:
                 if name == "execute_bash":
                     result = ("ERROR: execute_bash requires a 'command' string argument. Re-issue the tool "
@@ -2050,10 +2274,27 @@ Rules:
         if suggestions:
             self.save_session("tool_result")
 
-    def run(self, user_request: str):
+    def _verify(self) -> str | None:
+        """Run --verify after a completion signal: None when it passes, otherwise
+        the feedback that sends the model back to work."""
+        self._log(f"[VERIFY] Checking the completion signal with: {self.verify_command}", style="cyan")
+        self.sink.emit("CMD_EXEC", {"command": self.verify_command, "function_name": "verify"})
+        try:
+            output, code = self.execute_bash_command(self.verify_command)
+        except CommandTimeoutError as exc:
+            output, code = exc.output, f"timeout after {self.command_timeout}s"
+        if code == 0:
+            return None
+        self._log(f"[VERIFY] Failed (exit {code}); the task continues.", style="yellow")
+        return (f"[VERIFY FAILED] You signalled completion, but the verification command `{self.verify_command}` "
+                f"failed (exit {code}), so the task is NOT complete. Fix the problems, then signal completion "
+                f"again.\nOutput:\n{output}")
+
+    def run(self, user_request: str) -> str:
         """Run the agent loop for one request until it completes, is stopped or
         reaches max_steps. With persist_history the request extends the
-        existing conversation."""
+        existing conversation. Returns the outcome: "complete", "loop_complete"
+        (the --loop marker), "max_steps", "stopped" or "error"."""
         if not self._started_banner_shown:
             self._started_banner_shown = True
             self.sink.emit("SYSTEM", {"text": "[AI-COMMANDER STARTED]", "api_base": self.base_url,
@@ -2076,7 +2317,7 @@ Rules:
         self.save_session("user_request")  # the request survives even if the first call dies
 
         step = empty_turns = overflow_retries = 0
-        completed = False
+        completed, status = False, "stopped"
         try:
             while step < self.max_steps and not self.stop_event.is_set():
                 step += 1
@@ -2100,13 +2341,15 @@ Rules:
                                   "and retrying.", style="yellow")
                         continue
                     self._log_error(f"[API ERROR] {_describe_error(exc)}")
+                    status = "error"
                     break
                 overflow_retries = 0
-                if step == 1 and self.task_summary_enabled:  # after the first reply: never delays the task
+                if step == 1 and self.task_summary_enabled and self.loop_iteration <= 1:  # never delays the task
                     threading.Thread(target=self.generate_task_summary, args=(user_request, generation),
                                      daemon=True).start()
                 message = response["choices"][0]["message"]
                 if message.get("synthesized_terminal") or message.get("stopped"):
+                    status = "complete" if message.get("synthesized_terminal") else "stopped"
                     break
                 content, calls, _first_id, thinking, malformed = self.process_llm_response(response)
                 if not content.strip() and not message.get("tool_calls"):
@@ -2115,6 +2358,7 @@ Rules:
                     empty_turns += 1
                     if empty_turns >= 3:
                         self._log_error("[STOP] The model returned three empty responses in a row.")
+                        status = "error"
                         break
                     self._log("[INFO] Empty assistant response; retrying this step.")
                     if thinking and not _is_continuation(self.conversation_history[-1]):
@@ -2133,21 +2377,69 @@ Rules:
                 # Saved before any command runs: a crash mid-command leaves this
                 # (unanswered) call on disk, closed as "not re-executed" on reload.
                 self.save_session("assistant_message")
+                loop_done = bool(self.loop_iteration) and _has_marker(content, self.LOOP_COMPLETE_MARKER)
+                done = loop_done or _has_marker(content, self.COMPLETION_MARKER)
                 if calls or malformed:
                     self._run_tool_calls(calls, malformed)
-                elif self.COMPLETION_MARKER not in content:
+                elif not done:
                     self.conversation_history.append({"role": "user", "content": self._continuation_prompt()})
                     self.save_session("continuation_prompt")
-                if self.COMPLETION_MARKER in content:
-                    completed = True
+                if done and self.verify_command and not self.stop_event.is_set():
+                    feedback = self._verify()
+                    if feedback is not None and not self.stop_event.is_set():
+                        self.conversation_history.append({"role": "user", "content": feedback})
+                        self.save_session("verify_failed")
+                        continue
+                if done and not self.stop_event.is_set():
+                    completed, status = True, "loop_complete" if loop_done else "complete"
                     break
             else:
                 if step >= self.max_steps:
+                    status = "max_steps"
                     self._log(f"[LIMIT REACHED] Maximum steps ({self.max_steps}) reached.", style="yellow")
         finally:
             self.save_session("loop_terminated")
-            self.sink.emit("SHUTDOWN", {"reason": "agent_loop_terminated", "steps": step, "completed": completed})
+            self.sink.emit("SHUTDOWN", {"reason": "agent_loop_terminated", "steps": step, "completed": completed,
+                                        "status": status})
         self.sink.close()
+        return status
+
+    def run_loop(self, prompt_file: str, max_iterations: int = 10) -> str:
+        """Ralph loop: run the prompt file again and again, each iteration with a
+        fresh context (what persists is on disk: the files, AGENTS.md, the plan,
+        git), re-reading the file every time, until the model signals
+        LOOP_COMPLETE_MARKER (and --verify passes), the run is stopped or fails,
+        or max_iterations (0 = unlimited) is reached. Returns "loop_complete",
+        "max_iterations", "stopped" or "error"."""
+        status = "max_iterations"
+        try:
+            while not self.stop_event.is_set() and (not max_iterations or self.loop_iteration < max_iterations):
+                try:
+                    with open(prompt_file, encoding="utf-8") as f:
+                        prompt = f.read().strip()
+                except OSError as exc:
+                    self._log_error(f"[LOOP] Cannot read the prompt file: {exc}")
+                    return "error"
+                if not prompt:
+                    self._log_error(f"[LOOP] The prompt file {prompt_file} is empty.")
+                    return "error"
+                self.loop_iteration += 1
+                self._log(f"[LOOP] Iteration {self.loop_iteration}{f'/{max_iterations}' if max_iterations else ''} "
+                          f"with a fresh context · {prompt_file}", style="bold bright_yellow")
+                self.persist_history = False  # every iteration starts from the system prompt and the file
+                status = self.run(prompt)
+                if status in ("loop_complete", "stopped", "error"):
+                    break
+                status = "max_iterations"
+            if self.stop_event.is_set():
+                status = "stopped"
+            self._log({"loop_complete": f"[LOOP] Objective complete after {self.loop_iteration} iteration(s).",
+                       "max_iterations": f"[LOOP] Stopped after the maximum of {max_iterations} iteration(s).",
+                       "stopped": "[LOOP] Stopped.", "error": "[LOOP] Stopped: the iteration failed."}[status],
+                      style="green" if status == "loop_complete" else "yellow")
+            return status
+        finally:
+            self.loop_iteration = 0
 
 
 # --- The TUI --------------------------------------------------------------------
@@ -2158,7 +2450,7 @@ if _TEXTUAL_AVAILABLE:
     _WORD_CHARS = re.compile(r"[\w\-./~:@%+=?&#,]")
     _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _SLASH_COMMANDS = ("/help", "/autoapprove", "/aa", "/approve", "/reject", "/suggest ", "/clear", "/new",
-                       "/session", "/reload", "/copy", "/stop", "/quit", "/exit")
+                       "/session", "/reload", "/copy", "/loop ", "/stop", "/quit", "/exit")
     # Palette (Norton Commander blues).
     _C_USER, _C_ANSWER, _C_THINK = "bold #ffff5f", "#87d7ff", "italic #b2b28a"
     _C_CMD, _C_OK, _C_FAIL, _C_DIM = "bold #ffd75f", "#5fd787", "#ff8787", "#8fa8cc"
@@ -2209,8 +2501,11 @@ if _TEXTUAL_AVAILABLE:
             args = json.loads((tool_call.get("function") or {}).get("arguments") or "{}")
         except (json.JSONDecodeError, TypeError, AttributeError):
             return None
-        command = args.get("command") if isinstance(args, dict) else None
-        return command if isinstance(command, str) else None
+        if not isinstance(args, dict):
+            return None
+        if isinstance(args.get("path"), str):
+            return f"{(tool_call.get('function') or {}).get('name')} {args['path']}"
+        return args["command"] if isinstance(args.get("command"), str) else None
 
     class _Line:
         """A logical log line: its text plus style runs [(end_offset, style)]."""
@@ -2659,12 +2954,8 @@ if _TEXTUAL_AVAILABLE:
             self._stream = None
             self._scroll = 0  # rows scrolled back into history
             self._status = ""
-            self._cwd: str | None = None
             self._outbuf = bytearray()
             self._styles: dict = {}
-
-        def on_mount(self) -> None:
-            self.set_interval(0.5, self._sync_cwd)
 
         def on_resize(self, event: events.Resize) -> None:
             cols, rows = self.size.width, self.size.height
@@ -2702,7 +2993,7 @@ if _TEXTUAL_AVAILABLE:
             self._screen = pyte.HistoryScreen(cols, rows, history=5000, ratio=0.5)
             self._screen.write_process_input = lambda data: self._send(data.encode())  # answers DSR queries
             self._stream = pyte.ByteStream(self._screen)
-            self._status, self._scroll, self._cwd = "", 0, _safe_cwd()
+            self._status, self._scroll = "", 0
             asyncio.get_running_loop().add_reader(fd, self._on_readable)
 
         def _set_winsize(self) -> None:
@@ -2728,7 +3019,10 @@ if _TEXTUAL_AVAILABLE:
                 self.screen.selections = {w: s for w, s in self.screen.selections.items() if w is not self}
             self.refresh()
 
-        def _exited(self) -> None:
+        def _release(self) -> None:
+            """Stop watching the PTY and close it (the shell exited, or the widget is going away)."""
+            if self._fd is None:
+                return
             loop = asyncio.get_running_loop()
             loop.remove_reader(self._fd)
             with contextlib.suppress(Exception):
@@ -2739,6 +3033,9 @@ if _TEXTUAL_AVAILABLE:
                 os.waitpid(self._pid, os.WNOHANG)
             self._fd = self._pid = None
             self._outbuf.clear()
+
+        def _exited(self) -> None:
+            self._release()
             self._status = "Shell exited — press Enter to start a new one."
             self.refresh()
 
@@ -2764,19 +3061,6 @@ if _TEXTUAL_AVAILABLE:
             else:
                 with contextlib.suppress(Exception):
                     loop.remove_writer(self._fd)
-
-        def _sync_cwd(self) -> None:
-            """Follow the shell's cd: agent commands inherit the process cwd."""
-            if self._pid is None:
-                return
-            try:
-                cwd = os.readlink(f"/proc/{self._pid}/cwd")
-            except OSError:
-                return
-            if cwd != self._cwd:
-                with contextlib.suppress(OSError):
-                    os.chdir(cwd)
-                    self._cwd = cwd
 
         def paste_text(self, text: str) -> None:
             if self._fd is None:
@@ -2931,6 +3215,7 @@ if _TEXTUAL_AVAILABLE:
             if self._pid is not None:
                 with contextlib.suppress(OSError):
                     os.killpg(self._pid, signal.SIGHUP)
+            self._release()  # a reader left behind would fire on a widget with no screen (NoScreen)
 
     class _ClickBar(Static):
         """A one-row bar of clickable items: subclasses build (text, items)."""
@@ -3013,10 +3298,12 @@ if _TEXTUAL_AVAILABLE:
 
         def compose(self) -> ComposeResult:
             with Vertical(id="approval"):
-                yield Static(Text("The agent wants to run this command:", style="bold #ffd75f"))
+                file_tool = self.command.partition(" ")[0] in AICommander.FILE_TOOLS
+                yield Static(Text("The agent wants to " + ("use a file tool:" if file_tool else "run this command:"),
+                                  style="bold #ffd75f"))
                 with VerticalScroll(id="approval-cmd"):
-                    yield Static(Syntax(self.command, "bash", theme="ansi_dark", word_wrap=True,
-                                        background_color="#000000"))
+                    yield Static(Syntax(self.command, "diff" if file_tool else "bash", theme="ansi_dark",
+                                        word_wrap=True, background_color="#000000"))
                 with Horizontal(id="approval-buttons"):
                     yield Button("Yes (y)", id="yes", variant="success")
                     yield Button("No (n)", id="no", variant="error")
@@ -3112,6 +3399,7 @@ if _TEXTUAL_AVAILABLE:
                   "(Esc restores) · in the Shell every key goes to the shell: leave it with F6 or the mouse"),
         ("Quit", "F10 · Ctrl+Q · Ctrl+C twice while idle"),
         ("Commands", "/help  /aa (/autoapprove)  /clear (/new)  /session  /reload  /copy  /stop  /quit (/exit)  "
+                     "·  /loop [file] runs a ralph loop over a prompt file (default PROMPT.md)  "
                      "·  /approve  /reject  /suggest <text> answer a pending approval"),
     )
 
@@ -3242,7 +3530,9 @@ if _TEXTUAL_AVAILABLE:
             self.set_interval(1 / 20, self._tick)
             request = " ".join(self.args.request or [])
             self.args.request = []
-            if request.strip():
+            if self.args.loop:
+                self.call_after_refresh(self._start_loop, self.args.loop)
+            elif request.strip():
                 self.call_after_refresh(self._submit, request)
 
         def _init_agent(self) -> None:
@@ -3254,7 +3544,7 @@ if _TEXTUAL_AVAILABLE:
                 max_steps=a.max_steps, compress_algorithm="truncate" if a.fast else a.compress_alg,
                 compress_target=a.compress_target, fast=a.fast, reasoning_effort=a.reasoning_effort,
                 sandbox_enabled=a.sandbox_enabled, sandbox_write_dir=a.sandbox_write_dir,
-                session_file=a.session_file, instance_number=a.instance_number)
+                session_file=a.session_file, instance_number=a.instance_number, verify_command=a.verify)
             self.sink.stop_event = self.agent.stop_event
             atexit.register(self.agent.save_session, "process_exit")
             log = self.agent_log
@@ -3292,11 +3582,13 @@ if _TEXTUAL_AVAILABLE:
                     for tc in msg.get("tool_calls") or []:
                         command = _tool_command(tc)
                         if command:
+                            if command.partition(" ")[0] not in AICommander.FILE_TOOLS:
+                                command = f"$ {command}"
                             commands[tc.get("id")] = command
-                            log.write_line(f"$ {command}", _C_CMD)
+                            log.write_line(command, _C_CMD)
                 elif role == "tool":
                     command = commands.pop(msg.get("tool_call_id"), None)
-                    console.write_rule(f"$ {command}" if command else "tool result", _C_CMD)
+                    console.write_rule(command or "tool result", _C_CMD)
                     match = re.match(r"Command executed with exit code (-?\d+)\.\nOutput:\n?(.*)\Z", text, re.S)
                     output = match.group(2) if match else text
                     console.write_line(output[:4000] + ("\n… (truncated)" if len(output) > 4000 else ""), "#d0d0d0")
@@ -3319,7 +3611,7 @@ if _TEXTUAL_AVAILABLE:
             else:
                 callback()
 
-        def _start_agent(self, prompt: str) -> None:
+        def _start_agent(self, prompt: str, loop_file: str = "") -> None:
             agent = self.agent
             agent.stop_event.clear()
             agent.auto_approve = self.sink.auto_approve = self.auto_approve
@@ -3327,13 +3619,24 @@ if _TEXTUAL_AVAILABLE:
             self.step = 0
             self._run_started = time.monotonic()
             self._set_phase("thinking")
-            self.agent_thread = threading.Thread(target=self._agent_main, args=(prompt,), daemon=True,
+            self.agent_thread = threading.Thread(target=self._agent_main, args=(prompt, loop_file), daemon=True,
                                                  name="aic-agent")
             self.agent_thread.start()
 
-        def _agent_main(self, prompt: str) -> None:
+        def _start_loop(self, path: str) -> None:
+            if self._agent_busy():
+                self.agent_log.write_line("Stop the agent (F9) before starting a loop.", _C_FAIL)
+            elif not os.path.isfile(path):
+                self.agent_log.write_line(f"Prompt file not found: {path}", _C_FAIL)
+            else:
+                self._start_agent("", loop_file=os.path.abspath(path))
+
+        def _agent_main(self, prompt: str, loop_file: str = "") -> None:
             try:
-                self.agent.run(prompt)
+                if loop_file:
+                    self.agent.run_loop(loop_file, self.args.max_iterations)
+                else:
+                    self.agent.run(prompt)
             except BaseException as exc:  # never let the thread die silently
                 self.sink.emit("ERROR", {"text": f"[AGENT CRASHED] {exc!r}"})
                 if self.args.debug:
@@ -3432,8 +3735,9 @@ if _TEXTUAL_AVAILABLE:
                 log.write_line(text, _C_USER)
             elif kind == "CMD_EXEC":
                 self.current_command, self._cmd_started = p.get("command", ""), time.monotonic()
-                log.write_line(f"$ {self.current_command}", _C_CMD)
-                console.write_rule(f"$ {self.current_command}", _C_CMD)
+                label = ("" if p.get("function_name") in AICommander.FILE_TOOLS else "$ ") + self.current_command
+                log.write_line(label, _C_CMD)
+                console.write_rule(label, _C_CMD)
                 self._set_phase("running")
             elif kind == "APPROVAL_REQUEST":
                 self._set_phase("approval")
@@ -3587,6 +3891,7 @@ if _TEXTUAL_AVAILABLE:
                 "/clear": self._clear_conversation, "/new": self._clear_conversation,
                 "/session": self._report_session, "/reload": self._reload_session,
                 "/copy": lambda: self._copy_answer(), "/stop": self.action_stop,
+                "/loop": lambda: self._start_loop(arg or "PROMPT.md"),
                 "/quit": self.action_quit, "/exit": self.action_quit,
                 "/approve": lambda: self._answer_approval("yes"), "/reject": lambda: self._answer_approval("no"),
                 "/suggest": lambda: self._answer_approval("suggest", arg),
@@ -3858,11 +4163,16 @@ def _enable_windows_console_vt() -> None:
 def main():
     _enable_windows_console_vt()
     _check_openai_version()
-    parser = argparse.ArgumentParser(description="AI-Commander - a ralph-loop AI agent")
+    parser = argparse.ArgumentParser(
+        description="AI-Commander - a ralph-loop AI agent",
+        epilog="--nogui exit status: 0 task complete, 1 error, 2 step/iteration limit reached, 130 stopped.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--api-base", required=True, help="API base URL")
-    parser.add_argument("--model", required=True, help="Model name")
-    parser.add_argument("--api-key", required=True, help="API key")
+    parser.add_argument("--api-base", default=os.environ.get("AIC_API_BASE") or os.environ.get("OPENAI_BASE_URL"),
+                        help="API base URL (default: $AIC_API_BASE or $OPENAI_BASE_URL)")
+    parser.add_argument("--model", default=os.environ.get("AIC_MODEL"), help="Model name (default: $AIC_MODEL)")
+    parser.add_argument("--api-key", default=None,
+                        help="API key (default: $AIC_API_KEY or $OPENAI_API_KEY; prefer these: a key on the "
+                             "command line is visible to every process, the agent's commands included)")
     parser.add_argument("--auto-approve", action="store_true", help="Auto-approve command execution")
     parser.add_argument("--no-thinking", action="store_true", help="Hide thinking tokens from output")
     parser.add_argument("--timeout", type=int, default=120, help="Command timeout in seconds (default: 120)")
@@ -3895,10 +4205,32 @@ def main():
                              f"\"messages\" array can be edited by hand. A second instance in the same "
                              f"directory uses {_SESSION_BASENAME}2, {_SESSION_BASENAME}3, ...")
     parser.add_argument("--no-session", action="store_true", help="Disable session persistence")
-    parser.add_argument("request", nargs="*", help="Task request")
+    parser.add_argument("--loop", metavar="FILE", default="",
+                        help="Ralph loop: run the prompt in FILE (e.g. PROMPT.md) repeatedly, each iteration with a "
+                             "fresh context and the file re-read, until the model signals LOOPCOMPLETE")
+    parser.add_argument("--max-iterations", type=int, default=10,
+                        help="Maximum --loop iterations (default: 10; 0 = unlimited)")
+    parser.add_argument("--verify", metavar="CMD", default="",
+                        help="Command that must exit 0 before a completion signal is accepted (e.g. 'pytest -q'); "
+                             "on failure its output goes back to the model")
+    parser.add_argument("--json", action="store_true",
+                        help="Emit every event as a JSON line on stdout (implies --nogui)")
+    parser.add_argument("request", nargs="*", help="Task request (--nogui reads it from stdin when piped)")
     args = parser.parse_args()
-    if args.nogui and not args.request:
-        parser.error("a task request is required with --nogui")
+    # AIC_API_KEY is ours: keep it out of the environment the agent's commands inherit.
+    env_key = os.environ.pop("AIC_API_KEY", None)
+    args.api_key = args.api_key or env_key or os.environ.get("OPENAI_API_KEY")
+    for name, env in (("api_base", "AIC_API_BASE"), ("model", "AIC_MODEL"), ("api_key", "AIC_API_KEY")):
+        if not getattr(args, name):
+            parser.error(f"--{name.replace('_', '-')} is required (or set ${env})")
+    args.nogui = args.nogui or args.json
+    if args.nogui and not args.request and not args.loop and not sys.stdin.isatty():
+        args.request = [sys.stdin.read().strip()]  # cat PROMPT.md | aic --nogui
+        if not _IS_WINDOWS:  # approvals and command input still need the terminal
+            with contextlib.suppress(OSError):
+                sys.stdin = open("/dev/tty", encoding="utf-8")  # noqa: SIM115
+    if args.nogui and not "".join(args.request).strip() and not args.loop:
+        parser.error("a task request (argument or stdin) or --loop is required with --nogui")
     if not args.nogui and not _TEXTUAL_AVAILABLE:
         sys.exit("The Textual library is not installed (pip install textual). Use --nogui for the plain CLI.")
 
@@ -3933,7 +4265,7 @@ def main():
         args.sandbox_enabled, args.sandbox_msg = enable_sandbox()
 
     if args.nogui:
-        sink = ConsoleSink()
+        sink = JsonSink() if args.json else ConsoleSink()
         sink.emit("LOG", {"text": args.sandbox_msg, "style": "green" if args.sandbox_enabled else "red"})
         sink.emit("LOG", {"text": args.session_msg,
                           "style": "green" if args.session_file and args.instance_number == 1 else "yellow"})
@@ -3945,7 +4277,7 @@ def main():
             compress_algorithm="truncate" if args.fast else args.compress_alg,
             compress_target=args.compress_target, fast=args.fast, reasoning_effort=args.reasoning_effort,
             sandbox_enabled=args.sandbox_enabled, sandbox_write_dir=args.sandbox_write_dir,
-            session_file=args.session_file, instance_number=args.instance_number)
+            session_file=args.session_file, instance_number=args.instance_number, verify_command=args.verify)
         commander.persist_history = commander.load_session()  # resume where the last run stopped
         atexit.register(commander.save_session, "process_exit")
 
@@ -3960,7 +4292,8 @@ def main():
                 with contextlib.suppress(ValueError, OSError, RuntimeError):
                     signal.signal(sig, save_then_reraise)
         try:
-            commander.run(" ".join(args.request))
+            status = (commander.run_loop(os.path.abspath(args.loop), args.max_iterations) if args.loop
+                      else commander.run(" ".join(args.request)))
         except KeyboardInterrupt:
             commander._log("[INTERRUPTED] AI-Commander stopped by user")
             commander.save_session("interrupted")
@@ -3968,7 +4301,7 @@ def main():
         except Exception:
             commander._log_error("[FATAL ERROR] An unexpected error occurred:\n" + traceback.format_exc())
             sys.exit(1)
-        return
+        sys.exit(_EXIT_CODES.get(status, 1))
 
     app = CommanderApp(args, history)
 

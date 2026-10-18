@@ -1,6 +1,42 @@
 AI-Commander changelog
 ======================
 
+2.1.0
+-----
+
+- Ralph loop mode: --loop PROMPT.md (or /loop in the TUI) re-runs a prompt file
+  with a fresh context each iteration, re-reading the file, until the model
+  signals LOOPCOMPLETE or --max-iterations (default 10) is reached.
+- --verify CMD: a completion signal is accepted only when CMD exits 0;
+  otherwise its output goes back to the model and the task continues.
+- The completion marker only counts on a line of its own or at the end of the
+  reply: mentioning it no longer ends the run.
+- AGENTS.md (or CLAUDE.md) in the working directory is added to the system
+  prompt.
+- File tools: read_file, edit_file (exact string replacement) and write_file,
+  approved like commands, with edits shown as a diff. write_file also accepts
+  a JSON file's data sent as an object (it is written as formatted JSON):
+  models often send it that way, and rejecting it cost them retries and a
+  fallback to bash.
+- Headless: --nogui exits 0 complete / 1 error / 2 limit reached / 130
+  stopped; the prompt can be piped on stdin; --api-base, --model and --api-key
+  default to AIC_API_BASE / AIC_MODEL / AIC_API_KEY (also OPENAI_BASE_URL and
+  OPENAI_API_KEY), and AIC_API_KEY is hidden from the agent's commands; --json
+  prints every event as a JSON line.
+- Fixed a "NoScreen: node has no screen" traceback on quit: the shell tab
+  kept watching its PTY after it was removed.
+- Faster context compression: the summarizer no longer writes an <analysis>
+  scratchpad that was thrown away (and, when cut off, could end up in the
+  history), it gets a one-line context instead of the whole system prompt and
+  long outputs trimmed to their head and tail, and the internal calls (summary,
+  task title) ask for low reasoning effort with a smaller output cap. If the
+  summarizer fails, compression falls back to 'truncate' instead of replacing
+  the evicted history with "[summary unavailable]".
+- The shell tab no longer moves the agent: a cd in the shell used to change
+  the working directory of the whole process, so a running agent's commands
+  and file tools suddenly ran somewhere else. The agent now always works in
+  the directory AI-Commander was started in.
+
 2.0.0
 -----
 
