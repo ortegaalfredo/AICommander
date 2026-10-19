@@ -1507,6 +1507,22 @@ class TestRunner:
                    len(fake2.calls) == 3 and "reasoning_effort" not in fake2.calls[1]
                    and "reasoning_effort" not in fake2.calls[2], f"calls={len(fake2.calls)}")
 
+    def test_output_limit_cut_off(self):
+        # A reply that hits max_tokens loses its half-written tool call (servers drop
+        # it and may still say "tool_calls"): the model is told to split the work
+        # instead of being retried blindly.
+        cut = [fake_openai.thinking_chunk("planning a huge file..."), fake_openai.usage_chunk(10, 50)]
+        done = [fake_openai.content_chunk("done TASKCOMPLETE"), fake_openai.usage_chunk(10, 3)]
+        c, fake = self.make_fake_commander([cut, done], show_thinking=True)
+        c.max_tokens = 50
+        status = c.run("write a big file")
+        logs = [p.get("text", "") for k, p in c.sink.events if k == "LOG"]
+        note = [m for m in fake.calls[1]["messages"] if "output limit" in str(m.get("content"))]
+        self.check("cut-off: reported as hitting the output limit, not as an empty reply",
+                   any("output limit" in t for t in logs) and not any("Empty assistant" in t for t in logs), repr(logs))
+        self.check("cut-off: the model is told to split the work", len(note) == 1 and "split" in note[0]["content"])
+        self.check("cut-off: the run continues and completes", status == "complete" and len(fake.calls) == 2)
+
     def test_context_overflow_is_retried(self):
         class ContextError(Exception):
             status_code = 400
@@ -2036,6 +2052,7 @@ def main():
     runner.test_ccllm_summary_is_folded_not_stacked()
     runner.test_summarizer_failures_fall_back()
     runner.test_internal_calls_use_low_effort()
+    runner.test_output_limit_cut_off()
     runner.test_context_overflow_is_retried()
     runner.test_transient_error_is_retried()
     runner.test_prompt_history_file()

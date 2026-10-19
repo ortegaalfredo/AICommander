@@ -184,6 +184,7 @@ panel. In `--nogui` mode a request is required on the command line.
 | `--no-thinking` | Hide thinking tokens from output. |
 | `--timeout` | Command timeout in seconds (default: `120`). |
 | `--max-prompt-len` | Maximum prompt length in tokens (default: `80000`). |
+| `--max-tokens` | Maximum tokens per model reply, thinking included (default: `16000`); also reserved out of `--max-prompt-len`. Raise it if big edits get cut off. |
 | `--max-output-bytes` | Maximum output bytes returned from commands (default: `10240`). |
 | `--max-steps` | Maximum number of agent loop steps before stopping (default: `500`). |
 | `--debug` | Dump the full conversation history before every LLM call (see [Debugging](#debugging)). |

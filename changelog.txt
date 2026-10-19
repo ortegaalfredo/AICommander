@@ -1,6 +1,16 @@
 AI-Commander changelog
 ======================
 
+2.1.1
+-----
+
+- Replies cut off at the output limit no longer show up as "Empty assistant
+  response; retrying this step": servers drop a half-written tool call (some
+  still report finish_reason "tool_calls"), so a big write_file/edit_file was
+  retried the same way until it failed three times. The cut-off is now
+  detected, reported, and the model is asked to split the work into smaller
+  calls. New --max-tokens option (default 16000) to raise the limit.
+
 2.1.0
 -----
 

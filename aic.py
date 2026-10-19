@@ -7,7 +7,7 @@ default Textual TUI (TUISink) and a plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 import argparse
 import asyncio
@@ -1937,7 +1937,8 @@ Rules:
         return validated
 
     @staticmethod
-    def _assistant_response(content, tool_calls=None, reasoning=None, terminal=False, stopped=False):
+    def _assistant_response(content, tool_calls=None, reasoning=None, terminal=False, stopped=False,
+                            truncated=False):
         """An OpenAI-shaped response dict as consumed by the agent loop."""
         message = {"role": "assistant", "content": content, "tool_calls": tool_calls,
                    "reasoning_content": reasoning}
@@ -1945,6 +1946,8 @@ Rules:
             message["synthesized_terminal"] = True
         if stopped:
             message["stopped"] = True
+        if truncated:
+            message["truncated"] = True
         return {"choices": [{"message": message}]}
 
     def call_llm_api(self, messages: list[dict[str, Any]], use_tools: bool = True,
@@ -2041,7 +2044,7 @@ Rules:
                            show_thinking: bool) -> dict[str, Any]:
         silent = not stream_display and not stream_label
         content, thinking, calls = [], [], []
-        usage = first_token = None
+        usage = first_token = finish_reason = None
         started = time.monotonic()
         label = stream_label
         stream = self.client.chat.completions.create(**params)
@@ -2053,6 +2056,8 @@ Rules:
                 if self.stop_event.is_set():
                     self._log("[STOP] Agent shutdown requested. Aborting the LLM stream.")
                     return self._assistant_response(None, stopped=True)
+                if chunk.choices and getattr(chunk.choices[0], "finish_reason", None):
+                    finish_reason = chunk.choices[0].finish_reason
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if delta is None:
                     continue
@@ -2106,8 +2111,14 @@ Rules:
                 tps = completion / elapsed if elapsed > 0.2 else None
             self._emit_token_usage(getattr(usage, "prompt_tokens", 0) or 0, completion,
                                    cached=self._extract_cached_tokens(usage), tokens_per_sec=tps)
-        # reasoning_content lets the loop detect reasoning-only turns; it is not stored.
-        return self._assistant_response("".join(content) or None, tool_calls or None, "".join(thinking) or None)
+        # Hitting the output cap cuts the reply off; servers then drop a half-written tool
+        # call and may still report finish_reason "tool_calls", so the token count decides.
+        cap = params.get("max_tokens")
+        truncated = finish_reason == "length" or bool(
+            cap and usage is not None and (getattr(usage, "completion_tokens", 0) or 0) >= cap)
+        # reasoning_content lets the loop detect reasoning-only turns.
+        return self._assistant_response("".join(content) or None, tool_calls or None, "".join(thinking) or None,
+                                        truncated=truncated)
 
     @staticmethod
     def _tool_result(tool_call_id, content: str) -> dict[str, str]:
@@ -2352,6 +2363,28 @@ Rules:
                     status = "complete" if message.get("synthesized_terminal") else "stopped"
                     break
                 content, calls, _first_id, thinking, malformed = self.process_llm_response(response)
+                if message.get("truncated"):
+                    self._log(f"[INFO] The reply hit the output limit ({self.max_tokens} tokens, thinking "
+                              f"included) and was cut off" + ("; its tool call was lost." if not calls else "."),
+                              style="yellow")
+                if message.get("truncated") and not calls and not malformed:
+                    # Retrying the same step would hit the same wall: ask for smaller pieces.
+                    empty_turns += 1
+                    if empty_turns >= 3:
+                        self._log_error("[STOP] The model's replies were cut off at the output limit three times "
+                                        "in a row (raise it with --max-tokens).")
+                        status = "error"
+                        break
+                    if content.strip():
+                        self.conversation_history.append({"role": "assistant", "content": content})
+                    self.conversation_history.append({"role": "user", "content": (
+                        f"[SYSTEM NOTE] Your last reply was cut off at the output limit of {self.max_tokens} "
+                        f"tokens (thinking included), so it ended before its tool call was complete and the "
+                        f"call was lost. Keep each tool call much smaller: split big files and edits into "
+                        f"several calls, e.g. write_file with the first part, then edit_file or "
+                        f"`cat >> file <<'EOF'` for the rest, and think more briefly before large writes.")})
+                    self.save_session("output_limit")
+                    continue
                 if not content.strip() and not message.get("tool_calls"):
                     # Nothing to store. A reasoning-only turn gets a nudge; a truly
                     # empty one is retried as is. Three in a row end the run.
@@ -2369,7 +2402,7 @@ Rules:
                 # thinking"): models that see their earlier turns without it learn to
                 # skip thinking (see _validate_messages).
                 stored = {k: v for k, v in message.items()
-                          if k not in ("synthesized_terminal", "stopped") and v is not None}
+                          if k not in ("synthesized_terminal", "stopped", "truncated") and v is not None}
                 stored.setdefault("content", None)
                 if self.conversation_history[-1].get("role") == "assistant":  # never two assistants in a row
                     self.conversation_history.append({"role": "user", "content": _CONTINUE_PROMPT})
@@ -3545,6 +3578,7 @@ if _TEXTUAL_AVAILABLE:
                 compress_target=a.compress_target, fast=a.fast, reasoning_effort=a.reasoning_effort,
                 sandbox_enabled=a.sandbox_enabled, sandbox_write_dir=a.sandbox_write_dir,
                 session_file=a.session_file, instance_number=a.instance_number, verify_command=a.verify)
+            self.agent.max_tokens = getattr(a, "max_tokens", None) or self.agent.max_tokens
             self.sink.stop_event = self.agent.stop_event
             atexit.register(self.agent.save_session, "process_exit")
             log = self.agent_log
@@ -4178,6 +4212,9 @@ def main():
     parser.add_argument("--timeout", type=int, default=120, help="Command timeout in seconds (default: 120)")
     parser.add_argument("--max-prompt-len", type=int, default=DEFAULT_MAX_PROMPT_LEN,
                         help=f"Maximum prompt length in tokens (default: {DEFAULT_MAX_PROMPT_LEN})")
+    parser.add_argument("--max-tokens", type=int, default=16000,
+                        help="Maximum tokens per model reply, thinking included (default: 16000); also "
+                             "reserved out of --max-prompt-len. Raise it if big edits get cut off")
     parser.add_argument("--max-output-bytes", type=int, default=10240,
                         help="Maximum output bytes returned from a command (default: 10240); the command "
                              "is killed after printing 5x as much")
@@ -4278,6 +4315,7 @@ def main():
             compress_target=args.compress_target, fast=args.fast, reasoning_effort=args.reasoning_effort,
             sandbox_enabled=args.sandbox_enabled, sandbox_write_dir=args.sandbox_write_dir,
             session_file=args.session_file, instance_number=args.instance_number, verify_command=args.verify)
+        commander.max_tokens = args.max_tokens
         commander.persist_history = commander.load_session()  # resume where the last run stopped
         atexit.register(commander.save_session, "process_exit")
 
