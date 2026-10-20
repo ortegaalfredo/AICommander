@@ -80,6 +80,9 @@ It supports two presentation modes:
   Linux to restrict writes to the working directory, `/tmp`, `/dev`, and
   `/dev/pts`.
 - **Two presentation modes** — full TUI or plain CLI (`--nogui`).
+- **Agent tabs** — the TUI runs any number of independent agents side by
+  side, each with its own conversation, session file, console and shell
+  (`Ctrl+T` opens one, `Ctrl+G` or a click switches).
 - **Mouse copy & paste** — drag to select text in any pane (copied
   automatically, re-joining soft-wrapped lines), double-click a word,
   triple-click a line, right/middle-click to paste.
@@ -273,11 +276,23 @@ truncated to `--max-output-bytes` with the literal sentinel
 
 The default Textual interface is a Norton-Commander-style split screen:
 
+- **Agent tabs**: the strip above the left pane has one tab per agent; `+`
+  (or `Ctrl+T`) opens another. Every tab is an independent agent with its own
+  conversation, session file and lock, approval mode, console and shell, and
+  agents in background tabs keep working. Selecting a tab (a click, or
+  `Ctrl+G` then its number) switches the agent pane, the console/shell pane and
+  the status line to it; the prompt keeps a draft per tab. A tab shows `◆` when
+  its agent waits for approval (the dialog opens when you select it) and `●`
+  when a run finished while you were elsewhere. The `×` of the current tab (or
+  `/closetab`) closes it: its agent stops, its shell exits and its session is
+  discarded (asked twice if there is a conversation). The sandbox is shared:
+  it is applied once, to the whole process, at startup.
 - **Left pane — Agent**: the model's streamed answer (live, word-wrapped and
   re-wrapped when the terminal is resized), its thinking in dim italics, each
   command it runs (`$ command`) with an exit/duration summary, and status
   messages. The pane title shows an LLM-generated summary of the task.
-- **Right pane — Console / Shell**: two tabs (click them or press `F3`).
+- **Right pane — Console / Shell** of the current agent tab: two tabs (click
+  them or press `F3`; each agent tab remembers its choice).
   *Console* shows every command the agent runs with its live output and exit
   code; *Shell* is an embedded, colored interactive shell with scrollback. It
   is independent of the agent: a `cd` there never changes the directory the
@@ -309,6 +324,9 @@ controls, so they are **not** added to prompt history:
 | `/copy` | — | Copy the agent's last answer to the clipboard. |
 | `/loop [file]` | — | Start a [ralph loop](#ralph-loop-mode) over a prompt file (default `PROMPT.md`), up to `--max-iterations`. |
 | `/stop` | — | Stop the running agent (same as `F9`). |
+| `/newtab` | — | Open a new agent tab (same as `Ctrl+T`). |
+| `/closetab` | — | Close the current agent tab, discarding its conversation (twice if it has one). |
+| `/tab N` | — | Select agent tab N (same as `Alt+N`). |
 | `/quit` | `/exit` | Stop the agent and exit the application. |
 | `/approve`, `/reject`, `/suggest <text>` | — | Answer a pending approval (normally done in the approval dialog). |
 
@@ -330,10 +348,13 @@ controls, so they are **not** added to prompt history:
 | `F8` (twice) | Clear the conversation. |
 | `F9` | Stop the agent (a pending LLM response is cut off immediately). |
 | `Ctrl+C` | Copy the selection; otherwise stop a running agent; press twice while idle to quit. |
-| `F10` / `Ctrl+Q` | Quit (the session and history are saved). |
+| `F10` / `Ctrl+Q` | Quit (every tab's session and the history are saved). |
+| `Ctrl+T` | Open a new agent tab. |
+| `Ctrl+G` | Go to an agent tab: a list opens; `1`…`9` or `↑`/`↓` `Enter` select, `Ctrl+G` again (or `Tab`) the next tab, `N` a new tab, `X` closes the highlighted one, `Esc` cancels. Plain control keys work in every terminal, unlike Alt/Ctrl+digit, which terminals such as Tilix and GNOME Terminal keep for themselves. |
 | `Y` / `N` / `A` | In the approval dialog: approve / reject / always approve. |
 
-While the **Shell** tab has the focus, every key except the function keys goes
+While the **Shell** tab has the focus, every key except the function keys and
+the agent-tab keys (`Ctrl+T`, `Ctrl+G`) goes
 to the shell (so `Ctrl+C`, `Escape`, `Tab` and arrows work as in a terminal);
 use `F6` or the mouse to leave it.
 
@@ -644,6 +665,11 @@ Third instance → `.aicsession3`, and so on. The lock is released by the kernel
 when a process exits or dies, so a crashed run can never permanently squatter a
 name. `--session <path>` participates in the same numbering
 (`<path>2`, `<path>3`, …).
+
+TUI agent tabs use the same scheme: every tab is an agent with its own lock,
+so a new tab takes the first free name (`.aicsession2`, …). On startup the TUI
+reopens a tab for every other saved session of the directory that no running
+agent holds, so tabs survive a restart; closing a tab deletes its session file.
 
 ### Crash recovery semantics
 

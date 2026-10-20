@@ -3,11 +3,12 @@
 function calling.
 
 One agent core (AICommander) drives two front-ends through an EventSink: the
-default Textual TUI (TUISink) and a plain CLI (--nogui, ConsoleSink).
+default Textual TUI (TUISink), where every tab is an independent agent, and a
+plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 import argparse
 import asyncio
@@ -15,6 +16,7 @@ import atexit
 import base64
 import bisect
 import codecs
+import collections
 import contextlib
 import difflib
 import json
@@ -68,7 +70,7 @@ try:  # optional: the TUI (--nogui runs without it)
     from textual.selection import Selection
     from textual.strip import Strip
     from textual.widget import Widget
-    from textual.widgets import Button, ContentSwitcher, Input, Static, TextArea
+    from textual.widgets import Button, Input, OptionList, Static, TextArea
     _TEXTUAL_AVAILABLE = True
 except ImportError:
     _TEXTUAL_AVAILABLE = False
@@ -77,6 +79,37 @@ try:  # optional: the embedded interactive shell tab
     import pyte
 except ImportError:
     pyte = None
+
+if pyte is not None:
+    class _ScrollbackScreen(pyte.Screen):
+        """pyte.HistoryScreen minus its paging, which hooks every attribute
+        access (most of the shell's CPU time under heavy output). Lines that
+        scroll off the top go to ``history.top``, as in HistoryScreen."""
+
+        def __init__(self, columns: int, lines: int, history: int = 5000):
+            self.history = _Scrollback(collections.deque(maxlen=history))
+            super().__init__(columns, lines)
+
+        def reset(self) -> None:
+            super().reset()
+            self.history.top.clear()
+
+        def erase_in_display(self, how: int = 0, *args, **kwargs) -> None:
+            super().erase_in_display(how, *args, **kwargs)
+            if how == 3:  # "clear scrollback"
+                self.history.top.clear()
+
+        def restore_cursor(self) -> None:
+            super().restore_cursor()  # it would bring back the saved cursor's visibility too
+            self.cursor.hidden = pyte.modes.DECTCEM not in self.mode
+
+        def index(self) -> None:
+            top, bottom = self.margins or pyte.screens.Margins(0, self.lines - 1)
+            if self.cursor.y == bottom:
+                self.history.top.append(self.buffer[top])
+            super().index()
+
+    _Scrollback = collections.namedtuple("_Scrollback", "top")
 
 try:
     _DDGS_AVAILABLE = find_spec("ddgs") is not None
@@ -501,12 +534,13 @@ class PromptHistory:
 
 # --- Session persistence -----------------------------------------------------
 # The conversation is mirrored to a hand-editable JSON file after every step, so
-# a crash loses at most the in-flight turn. Each process holds an flock on
-# "<file>.lock"; a second instance in the same directory takes .aicsession2, ...
+# a crash loses at most the in-flight turn. Each agent (a process, or a TUI
+# tab) holds an flock on "<file>.lock"; the next one in the same directory
+# takes .aicsession2, .aicsession3, ...
 _SESSION_BASENAME = ".aicsession"
 _SESSION_LOCK_SUFFIX = ".lock"
 _SESSION_VERSION = 1
-_SESSION_LOCK_FDS: list[int] = []  # kept open (and locked) for the process lifetime
+_SESSION_LOCK_FDS: dict[str, int] = {}  # session path -> locked fd, kept open while the agent lives
 
 
 def _acquire_instance_lock(session_path: str) -> int | None:
@@ -530,23 +564,48 @@ def _acquire_instance_lock(session_path: str) -> int | None:
     with contextlib.suppress(OSError):  # diagnostics only; the lock is the truth
         os.ftruncate(fd, 0)
         os.write(fd, f"pid={os.getpid()}\nstarted={datetime.now().isoformat()}\n".encode())
-    _SESSION_LOCK_FDS.append(fd)
+    _SESSION_LOCK_FDS[session_path] = fd
     return fd
 
 
+def release_session_lock(session_path: str) -> None:
+    """Drop the lock taken by _acquire_instance_lock (a closed TUI tab)."""
+    fd = _SESSION_LOCK_FDS.pop(session_path, None)
+    if fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _session_base(session_path: str | None) -> str:
+    return (os.path.abspath(os.path.expanduser(session_path))
+            if session_path else os.path.join(os.getcwd(), _SESSION_BASENAME))
+
+
 def acquire_session_file(session_path: str | None = None) -> tuple[str, int]:
-    """Reserve this process's session file; returns ``(path, instance_number)``.
+    """Reserve a session file for one agent; returns ``(path, instance_number)``.
 
     ``<path>2``, ``<path>3`` ... are tried while the preferred file is locked by
-    another live instance. ``("", 0)`` means persistence could not be set up.
+    another live agent. ``("", 0)`` means persistence could not be set up.
     """
-    base = (os.path.abspath(os.path.expanduser(session_path))
-            if session_path else os.path.join(os.getcwd(), _SESSION_BASENAME))
+    base = _session_base(session_path)
     for instance in range(1, 1000):
         candidate = base if instance == 1 else f"{base}{instance}"
         if _acquire_instance_lock(candidate) is not None:
             return candidate, instance
     return "", 0
+
+
+def saved_session_files(session_path: str | None = None) -> list[tuple[str, int]]:
+    """The session files of ``<path>``, ``<path>2``, ... on disk, as (path, instance_number)."""
+    base = _session_base(session_path)
+    folder, name = os.path.split(base)
+    try:
+        entries = os.listdir(folder)
+    except OSError:
+        return []
+    found = [(os.path.join(folder, e), int(e[len(name):] or 1)) for e in entries
+             if e.startswith(name) and (e == name or e[len(name):].isdigit())]
+    return sorted(found, key=lambda item: item[1])
 
 
 def read_session_file(path: str) -> tuple[dict | None, str | None]:
@@ -2044,6 +2103,7 @@ Rules:
                            show_thinking: bool) -> dict[str, Any]:
         silent = not stream_display and not stream_label
         content, thinking, calls = [], [], []
+        arguments: list[list[str]] = []  # per call; joined once (+= on a dict value is quadratic)
         usage = first_token = finish_reason = None
         started = time.monotonic()
         label = stream_label
@@ -2086,16 +2146,21 @@ Rules:
                         index = len(calls) if (tc.id or not calls) else len(calls) - 1
                     while len(calls) <= index:
                         calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                        arguments.append([])
                     entry = calls[index]
                     if tc.id:
                         entry["id"] = tc.id
                     if tc.function:
                         entry["function"]["name"] += tc.function.name or ""
-                        entry["function"]["arguments"] += tc.function.arguments or ""
+                        if tc.function.arguments:
+                            arguments[index].append(tc.function.arguments)
         finally:
             self._active_streams.discard(stream)
             with contextlib.suppress(Exception):
                 stream.close()
+
+        for call, parts in zip(calls, arguments):
+            call["function"]["arguments"] = "".join(parts)
 
         tool_calls = []
         for i, call in enumerate(calls):
@@ -2483,7 +2548,8 @@ if _TEXTUAL_AVAILABLE:
     _WORD_CHARS = re.compile(r"[\w\-./~:@%+=?&#,]")
     _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _SLASH_COMMANDS = ("/help", "/autoapprove", "/aa", "/approve", "/reject", "/suggest ", "/clear", "/new",
-                       "/session", "/reload", "/copy", "/loop ", "/stop", "/quit", "/exit")
+                       "/session", "/reload", "/copy", "/loop ", "/stop", "/newtab", "/closetab", "/tab ",
+                       "/quit", "/exit")
     # Palette (Norton Commander blues).
     _C_USER, _C_ANSWER, _C_THINK = "bold #ffff5f", "#87d7ff", "italic #b2b28a"
     _C_CMD, _C_OK, _C_FAIL, _C_DIM = "bold #ffd75f", "#5fd787", "#ff8787", "#8fa8cc"
@@ -2992,7 +3058,7 @@ if _TEXTUAL_AVAILABLE:
 
         def on_resize(self, event: events.Resize) -> None:
             cols, rows = self.size.width, self.size.height
-            if cols < 4 or rows < 2:  # hidden in the ContentSwitcher
+            if cols < 4 or rows < 2:  # hidden (another pane or tab is shown)
                 return
             if self._screen is None and not self._status:
                 self._spawn(cols, rows)
@@ -3023,7 +3089,7 @@ if _TEXTUAL_AVAILABLE:
                     os._exit(127)
             self._pid, self._fd = pid, fd
             os.set_blocking(fd, False)
-            self._screen = pyte.HistoryScreen(cols, rows, history=5000, ratio=0.5)
+            self._screen = _ScrollbackScreen(cols, rows, history=5000)
             self._screen.write_process_input = lambda data: self._send(data.encode())  # answers DSR queries
             self._stream = pyte.ByteStream(self._screen)
             self._status, self._scroll = "", 0
@@ -3062,10 +3128,19 @@ if _TEXTUAL_AVAILABLE:
                 loop.remove_writer(self._fd)
             with contextlib.suppress(OSError):
                 os.close(self._fd)
-            with contextlib.suppress(ChildProcessError):
-                os.waitpid(self._pid, os.WNOHANG)
+            try:
+                reaped = os.waitpid(self._pid, os.WNOHANG)[0]
+            except ChildProcessError:
+                reaped = True
+            if not reaped:  # still exiting (SIGHUP was just sent): reap it later, not leave a zombie
+                threading.Thread(target=self._reap, args=(self._pid,), daemon=True).start()
             self._fd = self._pid = None
             self._outbuf.clear()
+
+        @staticmethod
+        def _reap(pid: int) -> None:
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
 
         def _exited(self) -> None:
             self._release()
@@ -3293,18 +3368,99 @@ if _TEXTUAL_AVAILABLE:
             return text
 
     class PaneTabs(_ClickBar):
-        """The Console / Shell tab strip of the right panel."""
-        active = "console-log"
+        """The Console / Shell tab strip of the right panel (of the current agent tab)."""
 
         def build(self, width: int) -> Text:
             self._spans = []
             text = Text(no_wrap=True, overflow="crop")
-            for pane, label in (("console-log", " Console "), ("shell-widget", " Shell ")):
-                style = "bold #000000 on #06989a" if pane == self.active else "#e5e5e5 on #0b2f5e"
+            active = self.app.tab.pane if self.app.tab else "console"
+            for pane, label in (("console", " Console "), ("shell", " Shell ")):
+                style = "bold #000000 on #06989a" if pane == active else "#e5e5e5 on #0b2f5e"
                 self._add(text, label, style, f"show_pane('{pane}')")
                 text.append(" ")
             text.append("F3 switches", "#6f8fc0")
             return text
+
+    class AgentTabs(_ClickBar):
+        """The agent tab strip of the left panel: one tab per agent, + opens one."""
+
+        def build(self, width: int) -> Text:
+            self._spans = []
+            text = Text(no_wrap=True, overflow="crop")
+            tabs, active = self.app.tabs, self.app.tab
+            slot = max(8, (width - 4) // max(1, len(tabs)) - 1)
+            for pos, tab in enumerate(tabs, 1):
+                mark, close = tab.mark(), " ×" if tab is active and len(tabs) > 1 else ""
+                title = " ".join(tab.agent.task_summary.split()) or "Agent"
+                room = max(1, slot - len(str(pos)) - len(mark) - len(close) - 3)
+                if cell_len(title) > room:
+                    title = title[:max(1, room - 1)] + "…"
+                style = ("bold #000000 on #06989a" if tab is active else
+                         "bold #000000 on #ffd75f" if tab.pending_approval is not None else "#e5e5e5 on #0b2f5e")
+                self._add(text, f" {pos} {mark}{title}", style, f"select_tab({pos})")
+                if close:
+                    self._add(text, close, style, f"close_tab({pos})")
+                text.append(" ", style)
+                text.append(" ")
+            self._add(text, " + ", "bold #ffff5f on #0b2f5e", "new_tab")
+            if width - text.cell_len > 17:
+                text.append(" ^T new ^G go to", "#6f8fc0")
+            return text
+
+    class TabSwitcher(ModalScreen):
+        """Ctrl+G: the agent tabs as a list. 1-9 (or ↑↓ Enter, or a click) select,
+        Tab / Ctrl+G the next tab, N a new one, X closes the highlighted one."""
+
+        CSS = """
+        TabSwitcher { align: left top; background: transparent; }
+        #switcher-box { width: 72; max-width: 96%; height: auto; margin: 1 0 0 1; border: round #06989a;
+                        background: #0b2f5e; padding: 0 1; }
+        #switcher-box OptionList { height: auto; max-height: 20; border: none; background: #0b2f5e;
+                                   padding: 0; }
+        """
+        BINDINGS = [*(Binding(str(n), f"pick({n})", show=False) for n in range(1, 10)),
+                    Binding("tab", "next", show=False), Binding("n", "finish('new')", show=False),
+                    Binding("x,delete", "finish('close')", show=False),
+                    Binding("escape,q", "dismiss(None)", show=False)]
+
+        def __init__(self, tabs: list, current):
+            super().__init__()
+            self.tabs, self.current = list(tabs), current
+
+        def compose(self) -> ComposeResult:
+            options = []
+            for pos, tab in enumerate(self.tabs, 1):
+                state = ("waiting for approval" if tab.pending_approval is not None else "working" if tab.busy()
+                         else "finished" if tab.unseen else "")
+                row = Text(f"{pos:>2} ", "bold #ffff5f")
+                row.append(" ".join(tab.agent.task_summary.split()) or "Agent", "bold #e5e5e5" if tab is self.current else "#e5e5e5")
+                if state:
+                    row.append(f"  {state}", "#ffd75f" if tab.pending_approval is not None else _C_DIM)
+                options.append(row)
+            with Vertical(id="switcher-box"):
+                yield OptionList(*options)
+                yield Static(Text("1-9 / ↑↓ Enter select · ^G next · N new · X close · Esc", _C_DIM))
+
+        def on_mount(self) -> None:
+            self.query_one("#switcher-box").border_title = "Agent tabs"
+            options = self.query_one(OptionList)
+            options.highlighted = self.tabs.index(self.current) if self.current in self.tabs else 0
+            options.focus()
+
+        def action_pick(self, pos: int) -> None:
+            if pos <= len(self.tabs):
+                self.dismiss(("select", pos))
+
+        def action_next(self) -> None:
+            pos = self.tabs.index(self.current) + 2 if self.current in self.tabs else 1
+            self.dismiss(("select", (pos - 1) % len(self.tabs) + 1))
+
+        def action_finish(self, kind: str) -> None:
+            self.dismiss((kind, (self.query_one(OptionList).highlighted or 0) + 1))
+
+        def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+            event.stop()
+            self.dismiss(("select", event.option_index + 1))
 
     class ApprovalScreen(ModalScreen):
         """Run this command? Yes / No / Always, or reject with a suggestion.
@@ -3328,6 +3484,19 @@ if _TEXTUAL_AVAILABLE:
             super().__init__()
             self.command = command
             self._opened = 0.0
+            self._retired = False
+
+        def retire(self) -> None:
+            """Close without an answer (the run ended, or another tab was selected):
+            now if on top, else once the dialogs above it close (dismiss() pops
+            whatever screen is on top)."""
+            self._retired = True
+            if self.app.screen is self:
+                self.dismiss(None)
+
+        def on_screen_resume(self) -> None:
+            if self._retired and self.app.screen is self:  # a late resume must not pop another screen
+                self.dismiss(None)
 
         def compose(self) -> ComposeResult:
             with Vertical(id="approval"):
@@ -3351,7 +3520,7 @@ if _TEXTUAL_AVAILABLE:
         def action_decide(self, verdict: str) -> None:
             if verdict != "no" and time.monotonic() - self._opened < 0.4:
                 return
-            self.dismiss((verdict, ""))
+            self.dismiss(None if self._retired else (verdict, ""))
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
             event.stop()
@@ -3360,7 +3529,7 @@ if _TEXTUAL_AVAILABLE:
         def on_input_submitted(self, event: Input.Submitted) -> None:
             event.stop()
             if event.value.strip():
-                self.dismiss(("suggest", event.value.strip()))
+                self.dismiss(None if self._retired else ("suggest", event.value.strip()))
 
     class ReverseSearchScreen(ModalScreen):
         """Incremental reverse search over the prompt history (Ctrl+R)."""
@@ -3428,11 +3597,18 @@ if _TEXTUAL_AVAILABLE:
                       "last answer · F5 pastes · copies reach the desktop clipboard directly on X11/Xwayland, "
                       "through OSC 52 in terminals that support it, and wl-copy or pbcopy when present"),
         ("Agent", "F2 toggles auto-approve · F9 or Ctrl+C stops the agent · F8 twice clears the conversation"),
+        ("Tabs", "every tab is an independent agent with its own conversation, session file, console and shell "
+                 "(the sandbox is shared) · Ctrl+T or the + opens a tab · Ctrl+G picks one: 1-9 or ↑↓ Enter, "
+                 "Ctrl+G again the next tab, X closes · a click on the tab strip selects · "
+                 "the × of the current tab or /closetab closes it (twice if it has a "
+                 "conversation, which is discarded) · ◆ waits for approval, ● finished while away · saved tabs "
+                 "reopen on the next start"),
         ("Panes", "F3 switches Console ⇄ Shell · F6 or Tab moves to the next pane · F7 zooms the focused pane "
                   "(Esc restores) · in the Shell every key goes to the shell: leave it with F6 or the mouse"),
         ("Quit", "F10 · Ctrl+Q · Ctrl+C twice while idle"),
         ("Commands", "/help  /aa (/autoapprove)  /clear (/new)  /session  /reload  /copy  /stop  /quit (/exit)  "
                      "·  /loop [file] runs a ralph loop over a prompt file (default PROMPT.md)  "
+                     "·  /newtab  /closetab  /tab N  "
                      "·  /approve  /reject  /suggest <text> answer a pending approval"),
     )
 
@@ -3458,133 +3634,85 @@ if _TEXTUAL_AVAILABLE:
         def action_close(self) -> None:
             self.dismiss()
 
-    class CommanderApp(App):
-        """Norton-Commander style TUI: agent output (left), console/shell tabs
-        (right), prompt, status line and function-key bar. The agent runs in a
-        thread and only enqueues events; the UI thread drains and renders them."""
+    class AgentTab:
+        """One agent of the TUI: its AICommander (own session file, lock, queue
+        and thread), its panes (agent log, console, shell) and run state. Its
+        events render into its own panes whether or not it is on screen."""
 
-        CSS = """
-        Screen { background: #12488b; }
-        #panels { height: 1fr; }
-        * { scrollbar-size-vertical: 1; scrollbar-background: #0b2f5e; scrollbar-background-hover: #0b2f5e;
-            scrollbar-background-active: #0b2f5e; scrollbar-color: #4f74b3; scrollbar-color-hover: #8fb3e0;
-            scrollbar-color-active: #87d7ff; }
-        OutputLog, ShellWidget { border: solid #6f8fc0; }
-        OutputLog:focus, ShellWidget:focus { border: double #87d7ff; }
-        OutputLog { background: #12488b; color: #e5e5e5; }
-        #agent-log { width: 1fr; border-title-color: #ffff5f; border-title-style: bold; }
-        #right-panel { width: 1fr; }
-        #tabs { height: 1; background: #0b2f5e; }
-        #switcher { height: 1fr; }
-        ShellWidget { background: #000000; color: #e5e5e5; }
-        PromptArea { height: auto; min-height: 3; max-height: 12; background: #000000; color: #f2f2f2;
-                     border: round #06989a; padding: 0 1; border-title-color: #5fd7ff;
-                     border-subtitle-color: #6f8fc0; }
-        PromptArea:focus { border: round #5fd7ff; }
-        PromptArea .text-area--cursor-line { background: #000000; }
-        #status-bar { height: 1; background: #06989a; color: #000000; }
-        #fkeys { height: 1; background: #000000; }
-        """
-        BINDINGS = [
-            Binding("f1", "help", "Help", priority=True),
-            Binding("f2", "toggle_auto", "Auto-approve", priority=True),
-            Binding("f3", "toggle_pane", "Console/Shell", priority=True),
-            Binding("f4", "copy", "Copy", priority=True),
-            Binding("f5", "paste", "Paste", priority=True),
-            Binding("f6", "cycle_focus", "Next pane", priority=True),
-            Binding("f7", "zoom", "Zoom", priority=True),
-            Binding("f8", "clear", "Clear", priority=True),
-            Binding("f9", "stop", "Stop", priority=True),
-            Binding("f10,ctrl+q", "quit", "Quit", priority=True),
-            # Not a priority binding: the focused widget and the screen copy a
-            # selection first; only an unhandled Ctrl+C stops or quits.
-            Binding("ctrl+c", "interrupt", "Stop / quit", show=False),
-        ]
-        ENABLE_COMMAND_PALETTE = False  # it would take Ctrl+P (history) from the prompt
+        _next_uid = 0
 
-        def __init__(self, args, history: PromptHistory | None = None):
-            super().__init__()
-            self.args = args
-            self.history = history or PromptHistory()
+        def __init__(self, app: CommanderApp, session_file: str, instance_number: int, session_msg: str):
+            AgentTab._next_uid += 1
+            self.uid = AgentTab._next_uid  # stable widget ids; the position in the tab bar can change
+            self.app, a = app, app.args
+            self.session_file, self.instance_number, self.session_msg = session_file, instance_number, session_msg
             self.event_queue: queue.Queue = queue.Queue()
             self.sink = TUISink(self.event_queue, threading.Event())
-            self.auto_approve = self.sink.auto_approve = args.auto_approve
-            self.agent: AICommander | None = None
-            self.agent_thread: threading.Thread | None = None
-            self._idle_callbacks: list = []
-            self.phase, self._phase_since = "idle", time.monotonic()
-            self.step, self.max_steps = 0, args.max_steps
-            self.total_tokens, self.tok_rate = 0, 0.0
-            self.retry_text = self.current_command = ""
-            self._run_started = self._cmd_started = time.monotonic()
-            self._approval_screen: ApprovalScreen | None = None
-            self._agent_stream: str | None = None  # "think" / "text" while the agent pane streams
-            self._console_stream = False
-            self._marker_hold = ""
-            self._stream_chunks, self._stream_t0 = 0, 0.0
-            self._last_ctrl_c = self._last_clear = 0.0
-            self._last_status = None
-            self._ctx_cache = (None, 0)
-            self._last_autocopy = None
-            self._shutting_down = False
-
-        # Layout -----------------------------------------------------------------
-
-        def compose(self) -> ComposeResult:
-            with Horizontal(id="panels"):
-                yield OutputLog(id="agent-log")
-                with Vertical(id="right-panel"):
-                    yield PaneTabs(id="tabs")
-                    with ContentSwitcher(initial="console-log", id="switcher"):
-                        yield OutputLog(id="console-log", max_lines=5000)
-                        yield ShellWidget(id="shell-widget")
-            yield PromptArea(self.history, id="prompt-input", placeholder="Type a task or /command…")
-            yield Static(id="status-bar")
-            yield FKeyBar(id="fkeys")
-
-        @property
-        def agent_log(self) -> OutputLog:
-            return self.query_one("#agent-log", OutputLog)
-
-        @property
-        def console_log(self) -> OutputLog:
-            return self.query_one("#console-log", OutputLog)
-
-        @property
-        def prompt(self) -> PromptArea:
-            return self.query_one("#prompt-input", PromptArea)
-
-        def on_mount(self) -> None:
-            self.title = "AI-Commander"
-            self.agent_log.border_title = "Agent"
-            self.prompt.border_title = "Prompt"
-            self._init_agent()
-            self.prompt.focus()
-            self.set_interval(1 / 20, self._tick)
-            request = " ".join(self.args.request or [])
-            self.args.request = []
-            if self.args.loop:
-                self.call_after_refresh(self._start_loop, self.args.loop)
-            elif request.strip():
-                self.call_after_refresh(self._submit, request)
-
-        def _init_agent(self) -> None:
-            a = self.args
+            self.sink.auto_approve = a.auto_approve
             self.agent = AICommander(
-                api_base=a.api_base, model=a.model, api_key=a.api_key, auto_approve=self.auto_approve,
+                api_base=a.api_base, model=a.model, api_key=a.api_key, auto_approve=a.auto_approve,
                 show_thinking=not a.no_thinking, command_timeout=a.timeout, max_prompt_len=a.max_prompt_len,
                 max_output_bytes=a.max_output_bytes, debug=a.debug, sink=self.sink, persist_history=True,
                 max_steps=a.max_steps, compress_algorithm="truncate" if a.fast else a.compress_alg,
                 compress_target=a.compress_target, fast=a.fast, reasoning_effort=a.reasoning_effort,
                 sandbox_enabled=a.sandbox_enabled, sandbox_write_dir=a.sandbox_write_dir,
-                session_file=a.session_file, instance_number=a.instance_number, verify_command=a.verify)
+                session_file=session_file, instance_number=instance_number, verify_command=a.verify)
             self.agent.max_tokens = getattr(a, "max_tokens", None) or self.agent.max_tokens
             self.sink.stop_event = self.agent.stop_event
-            atexit.register(self.agent.save_session, "process_exit")
-            log = self.agent_log
+            self.agent_log = OutputLog(id=f"agent-log-{self.uid}", classes="agent-log")
+            self.console_log = OutputLog(id=f"console-log-{self.uid}", max_lines=5000)
+            self.shell = ShellWidget(id=f"shell-widget-{self.uid}")
+            for widget in self.widgets:
+                widget.display = False
+            self.pane = "console"  # what the right panel shows for this tab: "console" or "shell"
+            self.thread: threading.Thread | None = None
+            self._idle_callbacks: list = []
+            self.phase, self._phase_since = "idle", time.monotonic()
+            self.step, self.max_steps = 0, a.max_steps
+            self.total_tokens, self.tok_rate = 0, 0.0
+            self.retry_text = self.current_command = ""
+            self._run_started = self._cmd_started = time.monotonic()
+            self.pending_approval: str | None = None  # a command waiting for the user's verdict
+            self.draft = ""  # the prompt text while another tab is on screen
+            self.unseen = False  # a run ended while another tab was on screen
+            self.closing = False
+            self._agent_stream: str | None = None  # "think" / "text" while the agent pane streams
+            self._console_stream = False
+            self._marker_hold = ""
+            self._stream_chunks, self._stream_t0 = 0, 0.0
+
+        @property
+        def widgets(self) -> tuple:
+            return self.agent_log, self.console_log, self.shell
+
+        @property
+        def right_pane(self) -> Widget:
+            return self.shell if self.pane == "shell" else self.console_log
+
+        @property
+        def auto_approve(self) -> bool:
+            return self.sink.auto_approve
+
+        @auto_approve.setter
+        def auto_approve(self, value: bool) -> None:
+            self.sink.auto_approve = self.agent.auto_approve = value
+
+        def mark(self) -> str:
+            """The tab bar's status glyph."""
+            if self.pending_approval is not None:
+                return "◆ "
+            if self.busy():
+                return _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)] + " "
+            return "● " if self.unseen else ""
+
+        def start_up(self) -> None:
+            """Greeting lines and the restored session (the panes are mounted)."""
+            a, log = self.args, self.agent_log
+            log.border_title = "Agent"
             log.write_line(f"AI-Commander {__version__} · model {a.model} · {a.api_base}", _C_DIM)
             log.write_line(a.sandbox_msg, _C_OK if a.sandbox_enabled else _C_FAIL)
-            log.write_line(a.session_msg, _C_OK if a.instance_number == 1 and a.session_file else "#ffd75f")
+            log.write_line(self.session_msg, _C_OK if self.session_file and "WARNING" not in self.session_msg
+                           else "#ffd75f")
             try:
                 restored = self.agent.load_session(notify=False)
             except Exception as exc:
@@ -3593,14 +3721,18 @@ if _TEXTUAL_AVAILABLE:
             if restored:
                 self.step = self.agent.step_count
                 self.total_tokens = self.agent.usage_totals.get("billable_tokens", 0)
-                self._render_history()
-            self._set_title(self.agent.task_summary)
+                self.render_history()
+            self.set_title(self.agent.task_summary)
             log.write_line("Commands run automatically (auto-approve is ON; F2 toggles)." if self.auto_approve
                            else "Every command asks for approval (F2 or /aa turns on auto-approve).",
                            "#ffd75f" if self.auto_approve else _C_DIM)
             log.write_line("Type a task below and press Enter · F1 shows keys, mouse and commands.", _C_DIM)
 
-        def _render_history(self) -> None:
+        @property
+        def args(self):
+            return self.app.args
+
+        def render_history(self) -> None:
             """Replay a restored conversation into both panes."""
             log, console = self.agent_log, self.console_log
             commands: dict = {}
@@ -3631,41 +3763,39 @@ if _TEXTUAL_AVAILABLE:
                         console.write_line(f"{'✓' if ok else '✗'} exit {match.group(1)}", f"bold {_C_OK if ok else _C_FAIL}")
             log.write_rule("restored session", _C_DIM)
 
-        def _set_title(self, summary: str) -> None:
+        def set_title(self, summary: str) -> None:
             self.agent_log.border_title = f"Agent · {summary}" if summary else "Agent"
 
         # Agent lifecycle --------------------------------------------------------
 
-        def _agent_busy(self) -> bool:
-            return self.agent_thread is not None and self.agent_thread.is_alive()
+        def busy(self) -> bool:
+            return self.thread is not None and self.thread.is_alive()
 
-        def _when_idle(self, callback) -> None:
-            if self._agent_busy():
+        def when_idle(self, callback) -> None:
+            if self.busy():
                 self._idle_callbacks.append(callback)
             else:
                 callback()
 
-        def _start_agent(self, prompt: str, loop_file: str = "") -> None:
-            agent = self.agent
-            agent.stop_event.clear()
-            agent.auto_approve = self.sink.auto_approve = self.auto_approve
-            agent.persist_history = True
+        def start(self, prompt: str, loop_file: str = "") -> None:
+            self.agent.stop_event.clear()
+            self.agent.persist_history = True
             self.step = 0
             self._run_started = time.monotonic()
-            self._set_phase("thinking")
-            self.agent_thread = threading.Thread(target=self._agent_main, args=(prompt, loop_file), daemon=True,
-                                                 name="aic-agent")
-            self.agent_thread.start()
+            self.set_phase("thinking")
+            self.thread = threading.Thread(target=self._main, args=(prompt, loop_file), daemon=True,
+                                           name=f"aic-agent-{self.uid}")
+            self.thread.start()
 
-        def _start_loop(self, path: str) -> None:
-            if self._agent_busy():
+        def start_loop(self, path: str) -> None:
+            if self.busy():
                 self.agent_log.write_line("Stop the agent (F9) before starting a loop.", _C_FAIL)
             elif not os.path.isfile(path):
                 self.agent_log.write_line(f"Prompt file not found: {path}", _C_FAIL)
             else:
-                self._start_agent("", loop_file=os.path.abspath(path))
+                self.start("", loop_file=os.path.abspath(path))
 
-        def _agent_main(self, prompt: str, loop_file: str = "") -> None:
+        def _main(self, prompt: str, loop_file: str = "") -> None:
             try:
                 if loop_file:
                     self.agent.run_loop(loop_file, self.args.max_iterations)
@@ -3677,28 +3807,43 @@ if _TEXTUAL_AVAILABLE:
                     self.sink.emit("ERROR", {"text": traceback.format_exc()})
                 self.sink.emit("SHUTDOWN", {"reason": "crashed", "steps": self.step})
 
-        def _stop_agent(self) -> None:
-            if self._agent_busy():
+        def stop(self) -> None:
+            if self.busy():
                 self.agent.request_stop()
-                self._set_phase("stopping")
+                self.set_phase("stopping")
 
-        def _on_agent_finished(self) -> None:
-            self.agent_thread = None
+        def tick(self) -> None:
+            self._drain_events()
+            if self.thread is not None and not self.thread.is_alive():
+                self._drain_events()
+                self._on_finished()
+
+        def _on_finished(self) -> None:
+            self.thread = None
             self._end_streams()
-            if self._approval_screen is not None:
-                with contextlib.suppress(Exception):
-                    self._approval_screen.dismiss(None)
-            self._set_phase("idle")
+            self.pending_approval = None
+            self.app._approval_closed(self)
+            self.set_phase("idle")
+            unread = []  # steering messages typed after the agent's last step
+            with contextlib.suppress(queue.Empty):
+                while True:
+                    unread.append(self.agent.suggestion_queue.get_nowait())
+            if unread and not self.closing and not self._idle_callbacks:  # a clear or close discards them
+                text = "\n".join(unread)
+                self.agent_log.write_line("↳ the agent finished before reading your message; "
+                                          "it is back in the prompt.", "#ffd75f")
+                if self is self.app.tab:
+                    prompt = self.app.prompt
+                    prompt.set_text(f"{text}\n{prompt.text}".strip("\n") if prompt.text.strip() else text)
+                else:
+                    self.draft = f"{text}\n{self.draft}".strip("\n") if self.draft.strip() else text
             callbacks, self._idle_callbacks = self._idle_callbacks, []
             for callback in callbacks:
                 callback()
 
-        def _tick(self) -> None:
-            self._drain_events()
-            if self.agent_thread is not None and not self.agent_thread.is_alive():
-                self._drain_events()
-                self._on_agent_finished()
-            self._refresh_status()
+        def set_phase(self, phase: str) -> None:
+            if phase != self.phase:
+                self.phase, self._phase_since = phase, time.monotonic()
 
         # Events from the agent ---------------------------------------------------
 
@@ -3741,7 +3886,7 @@ if _TEXTUAL_AVAILABLE:
                 self.step, self.max_steps = p.get("step", self.step), p.get("max_steps", self.max_steps)
                 phase = p.get("phase")
                 self.retry_text = p.get("retry", "") if phase == "api_retry" else ""
-                self._set_phase({"llm_call": "thinking", "api_retry": "retry"}.get(phase, phase or "thinking"))
+                self.set_phase({"llm_call": "thinking", "api_retry": "retry"}.get(phase, phase or "thinking"))
             elif kind == "TOKEN_USAGE":
                 if not p.get("estimate"):
                     self.total_tokens += (max(0, (p.get("input_tokens") or 0) - (p.get("cached_tokens") or 0))
@@ -3751,7 +3896,7 @@ if _TEXTUAL_AVAILABLE:
                 else:
                     self._stream_chunks = 0
             elif kind == "TASK_TITLE":
-                self._set_title(p.get("summary", ""))
+                self.set_title(p.get("summary", ""))
             elif kind == "SYSTEM":
                 pass  # the startup lines already show this
             else:
@@ -3772,10 +3917,11 @@ if _TEXTUAL_AVAILABLE:
                 label = ("" if p.get("function_name") in AICommander.FILE_TOOLS else "$ ") + self.current_command
                 log.write_line(label, _C_CMD)
                 console.write_rule(label, _C_CMD)
-                self._set_phase("running")
+                self.set_phase("running")
             elif kind == "APPROVAL_REQUEST":
-                self._set_phase("approval")
-                self._ask_approval(p.get("command", ""))
+                self.set_phase("approval")
+                self.pending_approval = p.get("command", "")
+                self.app._approval_requested(self)
             elif kind == "CMD_COMPLETE":
                 code, output = p.get("exit_code"), p.get("output") or ""
                 ok = code == 0
@@ -3784,11 +3930,12 @@ if _TEXTUAL_AVAILABLE:
                            f" · {lines} line{'s' * (lines != 1)}")
                 console.write_line(summary, f"bold {_C_OK if ok else _C_FAIL}")
                 log.write_line(f"  {summary}", _C_OK if ok else _C_FAIL)
-                self._set_phase("thinking")
+                self.set_phase("thinking")
             elif kind == "SHUTDOWN":
                 log.write_rule(f"{'✓ task complete' if p.get('completed') else 'ready'} · "
                                f"{p.get('steps', self.step)} step(s) · "
                                f"{_fmt_secs(time.monotonic() - self._run_started)}", _C_OK)
+                self.unseen = self is not self.app.tab
 
         def _agent_write(self, text: str, kind: str) -> None:
             log = self.agent_log
@@ -3798,7 +3945,7 @@ if _TEXTUAL_AVAILABLE:
                 if kind == "think":
                     log.write_line("✻ thinking", _C_DIM)
                 self._agent_stream = kind
-                self._set_phase("thinking" if kind == "think" else "writing")
+                self.set_phase("thinking" if kind == "think" else "writing")
             if kind == "text":
                 text = self._filter_marker(text)
             log.write(text, _C_THINK if kind == "think" else _C_ANSWER)
@@ -3825,28 +3972,297 @@ if _TEXTUAL_AVAILABLE:
                 self.console_log.close_line()
                 self._console_stream = False
 
-        def _ask_approval(self, command: str) -> None:
+    class CommanderApp(App):
+        """Norton-Commander style TUI: agent tabs with their output (left), the
+        current tab's console/shell (right), prompt, status line and function-key
+        bar. Every tab is an independent agent running in its own thread; agents
+        only enqueue events and the UI thread drains and renders them."""
+
+        CSS = """
+        Screen { background: #12488b; }
+        #panels { height: 1fr; }
+        * { scrollbar-size-vertical: 1; scrollbar-background: #0b2f5e; scrollbar-background-hover: #0b2f5e;
+            scrollbar-background-active: #0b2f5e; scrollbar-color: #4f74b3; scrollbar-color-hover: #8fb3e0;
+            scrollbar-color-active: #87d7ff; }
+        OutputLog, ShellWidget { border: solid #6f8fc0; height: 1fr; }
+        OutputLog:focus, ShellWidget:focus { border: double #87d7ff; }
+        OutputLog { background: #12488b; color: #e5e5e5; }
+        .agent-log { border-title-color: #ffff5f; border-title-style: bold; }
+        #left-panel, #right-panel { width: 1fr; }
+        #agent-tabs, #tabs { height: 1; background: #0b2f5e; }
+        #agent-stack, #switcher { height: 1fr; }
+        ShellWidget { background: #000000; color: #e5e5e5; }
+        PromptArea { height: auto; min-height: 3; max-height: 12; background: #000000; color: #f2f2f2;
+                     border: round #06989a; padding: 0 1; border-title-color: #5fd7ff;
+                     border-subtitle-color: #6f8fc0; }
+        PromptArea:focus { border: round #5fd7ff; }
+        PromptArea .text-area--cursor-line { background: #000000; }
+        #status-bar { height: 1; background: #06989a; color: #000000; }
+        #fkeys { height: 1; background: #000000; }
+        """
+        BINDINGS = [
+            Binding("f1", "help", "Help", priority=True),
+            Binding("f2", "toggle_auto", "Auto-approve", priority=True),
+            Binding("f3", "toggle_pane", "Console/Shell", priority=True),
+            Binding("f4", "copy", "Copy", priority=True),
+            Binding("f5", "paste", "Paste", priority=True),
+            Binding("f6", "cycle_focus", "Next pane", priority=True),
+            Binding("f7", "zoom", "Zoom", priority=True),
+            Binding("f8", "clear", "Clear", priority=True),
+            Binding("f9", "stop", "Stop", priority=True),
+            Binding("f10,ctrl+q", "quit", "Quit", priority=True),
+            # Plain control bytes: every terminal sends them and none claims them
+            # (Alt/Ctrl+digit and Ctrl+PgUp are often taken or unsendable).
+            Binding("ctrl+t", "new_tab", "New tab", priority=True),
+            Binding("ctrl+g", "tab_switcher", "Go to tab", priority=True),
+            # Not a priority binding: the focused widget and the screen copy a
+            # selection first; only an unhandled Ctrl+C stops or quits.
+            Binding("ctrl+c", "interrupt", "Stop / quit", show=False),
+        ]
+        ENABLE_COMMAND_PALETTE = False  # it would take Ctrl+P (history) from the prompt
+
+        def __init__(self, args, history: PromptHistory | None = None):
+            super().__init__()
+            self.args = args
+            self.history = history or PromptHistory()
+            self.tabs: list[AgentTab] = []
+            self.tab: AgentTab | None = None  # the one on screen
+            self._approval_screen: ApprovalScreen | None = None
+            self._last_ctrl_c = self._last_clear = 0.0
+            self._last_close: tuple = (None, 0.0)
+            self._last_status = self._last_tabs = None
+            self._ctx_cache = (None, 0)
+            self._last_autocopy = None
+            self._shutting_down = False
+
+        # Layout -----------------------------------------------------------------
+
+        def compose(self) -> ComposeResult:
+            with Horizontal(id="panels"):
+                with Vertical(id="left-panel"):
+                    yield AgentTabs(id="agent-tabs")
+                    yield Vertical(id="agent-stack")
+                with Vertical(id="right-panel"):
+                    yield PaneTabs(id="tabs")
+                    yield Vertical(id="switcher")
+            yield PromptArea(self.history, id="prompt-input", placeholder="Type a task or /command…")
+            yield Static(id="status-bar")
+            yield FKeyBar(id="fkeys")
+
+        # The current tab's parts.
+        @property
+        def agent(self) -> AICommander | None:
+            return self.tab.agent if self.tab else None
+
+        @property
+        def sink(self) -> TUISink | None:
+            return self.tab.sink if self.tab else None
+
+        @property
+        def agent_log(self) -> OutputLog:
+            return self.tab.agent_log
+
+        @property
+        def console_log(self) -> OutputLog:
+            return self.tab.console_log
+
+        @property
+        def prompt(self) -> PromptArea:
+            return self.query_one("#prompt-input", PromptArea)
+
+        async def on_mount(self) -> None:
+            self.title = "AI-Commander"
+            self.prompt.border_title = "Prompt"
+            atexit.register(self.save_sessions, "process_exit")
+            first = await self._open_tab(self.args.session_file, self.args.instance_number, self.args.session_msg)
+            await self._restore_tabs()
+            self.select_tab(first)
+            self.prompt.focus()
+            self.set_interval(1 / 20, self._tick)
+            request = " ".join(self.args.request or [])
+            self.args.request = []
+            if self.args.loop:
+                self.call_after_refresh(first.start_loop, self.args.loop)
+            elif request.strip():
+                self.call_after_refresh(self._submit, request)
+
+        async def _restore_tabs(self) -> None:
+            """Reopen a tab for every other saved session of this directory that no
+            running agent holds, so tabs survive a restart."""
+            if not self.args.session_file:
+                return
+            for path, number in saved_session_files(getattr(self.args, "session", None)):
+                if path == self.args.session_file or _acquire_instance_lock(path) is None:
+                    continue
+                data, _err = read_session_file(path)
+                if data and data.get("messages"):
+                    await self._open_tab(path, number, f"[SESSION] Restored this tab from {path}", select=False)
+                else:
+                    release_session_lock(path)
+
+        # Tabs -------------------------------------------------------------------
+
+        async def _open_tab(self, session_file: str, instance_number: int, session_msg: str,
+                            select: bool = True) -> AgentTab:
+            tab = AgentTab(self, session_file, instance_number, session_msg)
+            self.tabs.append(tab)
+            await self.query_one("#agent-stack").mount(tab.agent_log)
+            await self.query_one("#switcher").mount(tab.console_log, tab.shell)
+            tab.start_up()
+            if select:
+                self.select_tab(tab)
+            return tab
+
+        def select_tab(self, tab: AgentTab) -> None:
+            """Show *tab*: its agent log, console or shell, prompt draft and approval."""
+            old = self.tab
+            if old is tab or tab not in self.tabs:
+                return
+            if self.screen.maximized is not None:
+                self.screen.minimize()
+            if self._approval_screen is not None:
+                screen, self._approval_screen = self._approval_screen, None
+                screen.retire()  # the request stays pending on its tab
+            focus = None
+            if old is not None:
+                old.draft = self.prompt.text
+                focus = ("agent" if self.focused is old.agent_log else
+                         "right" if self.focused in (old.console_log, old.shell) else None)
+                for widget in old.widgets:
+                    widget.display = False
+                self.prompt.set_text(tab.draft)
+                self.prompt._hist_pos = None
+            self.tab, tab.unseen = tab, False
+            tab.agent_log.display = tab.right_pane.display = True
+            self.query_one("#tabs", PaneTabs).refresh()
+            if focus:
+                self.call_after_refresh((tab.agent_log if focus == "agent" else tab.right_pane).focus)
+            elif focus is None and old is not None and self.focused is None:
+                self.prompt.focus()
+            if tab.pending_approval is not None:
+                self.call_after_refresh(self._show_approval, tab)
+
+        async def action_new_tab(self) -> None:
+            if self._shutting_down:
+                return
+            if isinstance(self.screen, TabSwitcher):
+                self.screen.dismiss(None)
+            session_file, number, msg = "", 1, self.args.session_msg
+            if self.args.session_file:
+                session_file, number = acquire_session_file(getattr(self.args, "session", None))
+                msg = (f"[SESSION] Persisting this tab's session to {session_file}" if session_file else
+                       "[SESSION] WARNING: could not lock a session file; this tab runs without persistence")
+            await self._open_tab(session_file, number, msg)
+            self.prompt.focus()
+
+        def action_tab_switcher(self) -> None:
+            if isinstance(self.screen, TabSwitcher):  # Ctrl+G twice: the next tab
+                self.screen.action_next()
+                return
+            if isinstance(self.screen, ReverseSearchScreen):  # there Ctrl+G cancels, as in readline
+                self.screen.action_cancel()
+                return
+
             def done(result) -> None:
-                self._approval_screen = None
-                if result is None:  # dismissed because the run ended
+                if not result:
+                    return
+                kind, pos = result
+                if kind == "select":
+                    self.action_select_tab(pos)
+                elif kind == "new":
+                    self.call_later(self.action_new_tab)
+                elif kind == "close":
+                    self.action_close_tab(pos)
+            self.push_screen(TabSwitcher(self.tabs, self.tab), done)
+
+        def action_select_tab(self, pos: int) -> None:
+            if 1 <= pos <= len(self.tabs):
+                self.select_tab(self.tabs[pos - 1])
+
+        def action_close_tab(self, pos: int = 0) -> None:
+            """Close a tab (the current one for 0): its agent stops, its shell
+            exits and its session is discarded. Asks twice if there is work to lose."""
+            tab = self.tabs[pos - 1] if 1 <= pos <= len(self.tabs) else self.tab
+            if tab is None or tab.closing:
+                return
+            if sum(not t.closing for t in self.tabs) <= 1:
+                self.notify("This is the only tab (F10 quits).", timeout=3)
+                return
+            now = time.monotonic()
+            if ((tab.busy() or tab.agent.conversation_history)
+                    and (self._last_close[0] is not tab or now - self._last_close[1] > 2)):
+                self._last_close = (tab, now)
+                self.notify(f"Close tab {self.tabs.index(tab) + 1} again to "
+                            f"{'stop its agent and ' if tab.busy() else ''}discard its conversation.", timeout=3)
+                return
+            self._last_close = (None, 0.0)
+            tab.closing = True
+            tab.stop()
+            tab.when_idle(lambda: self._remove_tab(tab))
+
+        def _remove_tab(self, tab: AgentTab) -> None:
+            if tab not in self.tabs:
+                return
+            if tab is self.tab:
+                i = self.tabs.index(tab)
+                self.select_tab(self.tabs[i + 1] if i + 1 < len(self.tabs) else self.tabs[i - 1])
+            self.tabs.remove(tab)
+            tab.agent.session_file = ""  # a late save (the title summarizer) must not recreate it
+            if tab.session_file:  # nothing to resume: drop the file, then the lock
+                with contextlib.suppress(OSError):
+                    os.unlink(tab.session_file)
+                release_session_lock(tab.session_file)
+            for widget in tab.widgets:
+                widget.remove()
+
+        def save_sessions(self, reason: str) -> None:
+            for tab in list(self.tabs):
+                tab.agent.save_session(reason)
+
+        def _tick(self) -> None:
+            for tab in list(self.tabs):
+                tab.tick()
+            self._refresh_status()
+
+        # Approvals ---------------------------------------------------------------
+
+        def _approval_requested(self, tab: AgentTab) -> None:
+            if tab is self.tab:
+                self._show_approval(tab)
+            else:
+                pos = self.tabs.index(tab) + 1
+                self.notify(f"Tab {pos} is waiting for your approval" + (f" (Alt+{pos})." if pos < 10 else "."),
+                            timeout=4)
+
+        def _show_approval(self, tab: AgentTab) -> None:
+            if tab is not self.tab or tab.pending_approval is None or self._approval_screen is not None:
+                return
+
+            def done(result) -> None:
+                if self._approval_screen is screen:
+                    self._approval_screen = None
+                if result is None:  # the run ended, or another tab was selected
                     return
                 verdict, suggestion = result
+                tab.pending_approval = None
                 if verdict == "always":
-                    self._set_auto_approve(True)
+                    self._set_auto_approve(True, tab)
                 approved = verdict in ("yes", "always")
-                self.sink.resolve_approval(approved, suggestion)
-                self.agent_log.write_line(
+                tab.sink.resolve_approval(approved, suggestion)
+                tab.agent_log.write_line(
                     "  ✓ approved" if approved else f"  ↳ rejected with suggestion: {suggestion}" if suggestion
                     else "  ✗ rejected", _C_OK if approved else "#ffd75f")
-                self._set_phase("running" if approved else "thinking")
-            self._approval_screen = ApprovalScreen(command)
-            self.push_screen(self._approval_screen, done)
+                tab.set_phase("running" if approved else "thinking")
+            screen = self._approval_screen = ApprovalScreen(tab.pending_approval)
+            self.push_screen(screen, done)
+
+        def _approval_closed(self, tab: AgentTab) -> None:
+            """*tab*'s run ended: drop its approval dialog if it is open."""
+            if tab is self.tab and self._approval_screen is not None:
+                screen, self._approval_screen = self._approval_screen, None
+                screen.retire()
 
         # Status line --------------------------------------------------------------
-
-        def _set_phase(self, phase: str) -> None:
-            if phase != self.phase:
-                self.phase, self._phase_since = phase, time.monotonic()
 
         def _context_tokens(self) -> int:
             hist = self.agent.conversation_history if self.agent else []
@@ -3856,38 +4272,46 @@ if _TEXTUAL_AVAILABLE:
             return self._ctx_cache[1]
 
         def _refresh_status(self) -> None:
+            tab = self.tab
+            if tab is None:
+                return
+            bar = self.query_one("#agent-tabs", AgentTabs)
+            tabs = bar.build(bar.size.width or 80).plain
+            if tabs != self._last_tabs:
+                self._last_tabs = tabs
+                bar.refresh()
             now = time.monotonic()
-            busy = self._agent_busy()
-            elapsed = _fmt_secs(now - self._phase_since)
+            busy = tab.busy()
+            elapsed = _fmt_secs(now - tab._phase_since)
             spin = _SPINNER[int(now * 10) % len(_SPINNER)]
             if not busy:
                 phase = ("●", "ready")
-            elif self.phase == "approval":
+            elif tab.phase == "approval":
                 phase = ("◆", "waiting for your approval")
-            elif self.phase == "retry":
-                phase = ("↻", self.retry_text or "retrying")
-            elif self.phase == "running":
-                command = " ".join(self.current_command.split())
+            elif tab.phase == "retry":
+                phase = ("↻", tab.retry_text or "retrying")
+            elif tab.phase == "running":
+                command = " ".join(tab.current_command.split())
                 phase = (spin, f"running {elapsed}: {command[:40] + '…' if len(command) > 40 else command}")
             else:
-                phase = (spin, f"{self.phase} {elapsed}")
-            if busy and self.phase == "writing" and self._stream_chunks > 4:
-                rate = self._stream_chunks / max(0.1, now - self._stream_t0)
+                phase = (spin, f"{tab.phase} {elapsed}")
+            if busy and tab.phase == "writing" and tab._stream_chunks > 4:
+                rate = tab._stream_chunks / max(0.1, now - tab._stream_t0)
             else:
-                rate = self.tok_rate
-            ctx, budget = self._context_tokens(), max(1, self.agent._prompt_budget() if self.agent else 1)
+                rate = tab.tok_rate
+            ctx, budget = self._context_tokens(), max(1, tab.agent._prompt_budget())
             parts = [
                 (f"{phase[0]} {phase[1]}", "bold #000000 on #5fd7ff" if busy else "bold #000000 on #5fd787"),
-                (f"step {self.step}/{self.max_steps}", ""),
+                (f"step {tab.step}/{tab.max_steps}", ""),
                 (f"ctx {_fmt_tokens(ctx)}/{_fmt_tokens(budget)} {min(999, ctx * 100 // budget)}%",
                  "bold #800000" if ctx > budget * 0.9 else ""),
-                (f"Σ {_fmt_tokens(self.total_tokens)} tok", ""),
+                (f"Σ {_fmt_tokens(tab.total_tokens)} tok", ""),
                 (f"{rate:.0f} tok/s", ""),
-                ("AUTO-APPROVE" if self.auto_approve else "approve: ask",
-                 "bold #ffffff on #af0000" if self.auto_approve else ""),
+                ("AUTO-APPROVE" if tab.auto_approve else "approve: ask",
+                 "bold #ffffff on #af0000" if tab.auto_approve else ""),
                 ("sandbox ✓" if self.args.sandbox_enabled else "sandbox ✗", ""),
                 (f"{self.args.model} · {_safe_cwd().replace(os.path.expanduser('~'), '~', 1)} · "
-                 f"{os.path.basename(self.args.session_file) if self.args.session_file else 'no session'}", ""),
+                 f"{os.path.basename(tab.session_file) if tab.session_file else 'no session'}", ""),
             ]
             status = Text(no_wrap=True, overflow="ellipsis")
             for i, (chunk, style) in enumerate(parts):
@@ -3896,9 +4320,13 @@ if _TEXTUAL_AVAILABLE:
                 status.append(f" {chunk} ", style)
             if status.plain != self._last_status:
                 self._last_status = status.plain
-                self.query_one("#status-bar", Static).update(status)
+                # One row whatever the text: no layout pass (it would repaint every widget).
+                self.query_one("#status-bar", Static).update(status, layout=False)
 
         # Prompt and slash commands -------------------------------------------------
+
+        def _agent_busy(self) -> bool:
+            return self.tab is not None and self.tab.busy()
 
         def on_prompt_area_submitted(self, message: PromptArea.Submitted) -> None:
             self._submit(message.text)
@@ -3911,11 +4339,11 @@ if _TEXTUAL_AVAILABLE:
                 self._slash_command(text)
                 return
             self.history.add(text)
-            if self._agent_busy():
+            if self.tab.busy():
                 self.agent.inject_suggestion(text)
                 self.agent_log.write_line(f"↳ steering message queued for the agent: {text}", _C_USER)
                 return
-            self._start_agent(text)
+            self.tab.start(text)
 
         def _slash_command(self, text: str) -> None:
             command, _, arg = text.partition(" ")
@@ -3925,7 +4353,10 @@ if _TEXTUAL_AVAILABLE:
                 "/clear": self._clear_conversation, "/new": self._clear_conversation,
                 "/session": self._report_session, "/reload": self._reload_session,
                 "/copy": lambda: self._copy_answer(), "/stop": self.action_stop,
-                "/loop": lambda: self._start_loop(arg or "PROMPT.md"),
+                "/loop": lambda: self.tab.start_loop(arg or "PROMPT.md"),
+                "/newtab": lambda: self.call_later(self.action_new_tab), "/closetab": self.action_close_tab,
+                "/tab": lambda: self.action_select_tab(int(arg)) if arg.isdigit() else self.agent_log.write_line(
+                    f"Usage: /tab N (1-{len(self.tabs)})", _C_FAIL),
                 "/quit": self.action_quit, "/exit": self.action_quit,
                 "/approve": lambda: self._answer_approval("yes"), "/reject": lambda: self._answer_approval("no"),
                 "/suggest": lambda: self._answer_approval("suggest", arg),
@@ -3943,43 +4374,47 @@ if _TEXTUAL_AVAILABLE:
                 self._approval_screen.dismiss((verdict, suggestion))
 
         def _clear_conversation(self) -> None:
+            tab = self.tab
+
             def clear():
-                self.agent.suggestion_queue = queue.Queue()
-                self.agent.discard_session("cleared")
-                self.agent_log.clear()
-                self.console_log.clear()
-                self.step, self.total_tokens, self.tok_rate = 0, 0, 0.0
-                self._set_title("")
-                self.agent_log.write_line("New conversation started. Ready for your next prompt.", _C_OK)
-            self._stop_agent()
-            self._when_idle(clear)
+                tab.agent.suggestion_queue = queue.Queue()
+                tab.agent.discard_session("cleared")
+                tab.agent_log.clear()
+                tab.console_log.clear()
+                tab.step, tab.total_tokens, tab.tok_rate = 0, 0, 0.0
+                tab.set_title("")
+                tab.agent_log.write_line("New conversation started. Ready for your next prompt.", _C_OK)
+            tab.stop()
+            tab.when_idle(clear)
 
         def _reload_session(self) -> None:
-            if not self.agent.session_file:
+            tab = self.tab
+            if not tab.session_file:
                 self.agent_log.write_line("Session persistence is disabled.", _C_FAIL)
                 return
-            if self._agent_busy():
+            if tab.busy():
                 self.agent_log.write_line("Stop the agent (F9) before reloading the session.", _C_FAIL)
                 return
-            if self.agent.load_session(notify=False):
-                self.agent_log.clear()
-                self.console_log.clear()
-                self.step = self.agent.step_count
-                self.total_tokens = self.agent.usage_totals.get("billable_tokens", 0)
-                self._render_history()
-                self._set_title(self.agent.task_summary)
-                self.agent_log.write_line("Session reloaded from disk.", _C_OK)
+            if tab.agent.load_session(notify=False):
+                tab.agent_log.clear()
+                tab.console_log.clear()
+                tab.step = tab.agent.step_count
+                tab.total_tokens = tab.agent.usage_totals.get("billable_tokens", 0)
+                tab.render_history()
+                tab.set_title(tab.agent.task_summary)
+                tab.agent_log.write_line("Session reloaded from disk.", _C_OK)
             else:
-                self.agent_log.write_line(f"Nothing reloaded from {self.agent.session_file}.", "#ffd75f")
+                tab.agent_log.write_line(f"Nothing reloaded from {tab.session_file}.", "#ffd75f")
 
         def _report_session(self) -> None:
-            log, path = self.agent_log, self.args.session_file
-            if not path:
+            tab, log = self.tab, self.agent_log
+            if not tab.session_file:
                 log.write_line("[SESSION] Persistence is disabled.", "#ffd75f")
                 return
-            data, err = read_session_file(path)
-            log.write_line(f"[SESSION] {path} (instance {self.args.instance_number}) · id {self.agent.session_id} "
-                           f"· {len(self.agent.conversation_history)} message(s) in memory", "#87d7ff")
+            data, err = read_session_file(tab.session_file)
+            log.write_line(f"[SESSION] {tab.session_file} (instance {tab.instance_number}) · id "
+                           f"{tab.agent.session_id} · {len(tab.agent.conversation_history)} message(s) in memory",
+                           "#87d7ff")
             if err:
                 log.write_line(f"  The saved file is unreadable: {err}", _C_FAIL)
             elif data:
@@ -4064,24 +4499,24 @@ if _TEXTUAL_AVAILABLE:
             else:
                 self.push_screen(HelpScreen())
 
-        def _set_auto_approve(self, value: bool) -> None:
-            self.auto_approve = self.sink.auto_approve = value
-            if self.agent:
-                self.agent.auto_approve = value
-            self.agent_log.write_line(
+        def _set_auto_approve(self, value: bool, tab: AgentTab | None = None) -> None:
+            tab = tab or self.tab
+            tab.auto_approve = value
+            tab.agent_log.write_line(
                 "Auto-approve is ON: commands run without asking. F9 stops the agent." if value
                 else "Auto-approve is OFF: every command asks for approval.", "#ffd75f" if value else _C_OK)
 
         def action_toggle_auto(self) -> None:
-            self._set_auto_approve(not self.auto_approve)
+            self._set_auto_approve(not self.tab.auto_approve)
 
         def show_pane(self, pane: str, focus: bool = True) -> None:
-            self.query_one("#switcher", ContentSwitcher).current = pane
-            tabs = self.query_one("#tabs", PaneTabs)
-            tabs.active = pane
-            tabs.refresh()
-            if focus and pane == "shell-widget":
-                self.call_after_refresh(self.query_one("#shell-widget").focus)
+            tab = self.tab
+            tab.right_pane.display = False
+            tab.pane = pane
+            tab.right_pane.display = True
+            self.query_one("#tabs", PaneTabs).refresh()
+            if focus and pane == "shell":
+                self.call_after_refresh(tab.shell.focus)
             elif isinstance(self.focused, ShellWidget):
                 self.prompt.focus()
 
@@ -4089,8 +4524,7 @@ if _TEXTUAL_AVAILABLE:
             self.show_pane(pane)
 
         def action_toggle_pane(self) -> None:
-            current = self.query_one("#switcher", ContentSwitcher).current
-            self.show_pane("console-log" if current == "shell-widget" else "shell-widget")
+            self.show_pane("console" if self.tab.pane == "shell" else "shell")
 
         def action_copy(self) -> None:
             text = self.screen.get_selected_text()
@@ -4106,8 +4540,7 @@ if _TEXTUAL_AVAILABLE:
             self._paste(target)
 
         def action_cycle_focus(self) -> None:
-            right = self.query_one("#switcher", ContentSwitcher).current
-            order = [self.prompt, self.agent_log, self.query_one(f"#{right}")]
+            order = [self.prompt, self.tab.agent_log, self.tab.right_pane]
             current = next((i for i, w in enumerate(order) if w is self.focused), -1)
             order[(current + 1) % len(order)].focus()
 
@@ -4128,14 +4561,14 @@ if _TEXTUAL_AVAILABLE:
                 self.notify("Press F8 again to clear the conversation.", timeout=2)
 
         def action_stop(self) -> None:
-            if self._agent_busy():
+            if self.tab.busy():
                 self.agent_log.write_line("Stopping the agent…", "#ffd75f")
-                self._stop_agent()
+                self.tab.stop()
             else:
                 self.notify("The agent is not running.", timeout=2)
 
         def action_interrupt(self) -> None:
-            if self._agent_busy():
+            if self.tab.busy():
                 self.action_stop()
                 return
             now = time.monotonic()
@@ -4146,15 +4579,17 @@ if _TEXTUAL_AVAILABLE:
                 self.notify("Press Ctrl+C again to quit (or F10).", timeout=2)
 
         def action_quit(self) -> None:
-            """Stop the agent, save the session and history, exit."""
+            """Stop every agent, save the sessions and the history, exit."""
             if self._shutting_down:
                 return
             self._shutting_down = True
-            if self.agent:
-                self.agent.request_stop()
-                if self.agent_thread is not None:
-                    self.agent_thread.join(timeout=3)
-                self.agent.save_session("tui_shutdown")
+            for tab in self.tabs:
+                tab.agent.request_stop()
+            deadline = time.monotonic() + 3
+            for tab in self.tabs:
+                if tab.thread is not None:
+                    tab.thread.join(timeout=max(0.05, deadline - time.monotonic()))
+            self.save_sessions("tui_shutdown")
             self.history.close()
             self.exit()
 
@@ -4344,8 +4779,7 @@ def main():
     app = CommanderApp(args, history)
 
     def on_signal(signum, _frame):
-        if app.agent:
-            app.agent.save_session(f"signal_{signum}")
+        app.save_sessions(f"signal_{signum}")
         if signum == getattr(signal, "SIGHUP", None):
             os._exit(128 + signum)  # the terminal is gone: nothing left to restore
         app.call_later(app.action_quit)
@@ -4357,9 +4791,9 @@ def main():
     try:
         app.run(mouse=not args.no_mouse)
     except KeyboardInterrupt:
-        if app.agent:
-            app.agent.request_stop()
-            app.agent.save_session("interrupted")
+        for tab in app.tabs:
+            tab.agent.request_stop()
+        app.save_sessions("interrupted")
         sys.exit(130)
     finally:
         history.close()

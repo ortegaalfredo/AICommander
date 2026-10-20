@@ -1,6 +1,28 @@
 AI-Commander changelog
 ======================
 
+2.2.0
+-----
+
+- Agent tabs in the TUI: Ctrl+T (or the + of the new tab strip, or /newtab)
+  opens another agent. Every tab is an independent agent with its own
+  conversation, session file and lock, approval mode, console and shell;
+  background tabs keep working, and a tab waiting for approval is marked and
+  shows its dialog when selected. Ctrl+G (a tab list: 1-9 or arrows,
+  Ctrl+G twice for the next tab), a click or /tab N switch tabs; the tab's × or /closetab closes one. Saved tabs reopen on the
+  next start. The Landlock sandbox stays shared by all tabs.
+- Fixes: an approval dialog left under the help screen or the tab switcher
+  when its run ended became a dead dialog that crashed the TUI on the next
+  key; closed shells are reaped instead of lingering as zombies; a steering
+  message typed while the agent was finishing is put back in the prompt
+  instead of surfacing in the next task.
+- Lower CPU use: the status line no longer re-lays out the whole screen on
+  every update (a busy agent used ~20% CPU just for the spinner, now ~6%); the
+  embedded shell uses a lean pyte screen instead of HistoryScreen, whose
+  per-attribute hook made heavy shell output ~2.7x more expensive; streamed
+  tool-call arguments are joined once instead of re-copied per chunk (a
+  quadratic cost for big write_file calls).
+
 2.1.1
 -----
 

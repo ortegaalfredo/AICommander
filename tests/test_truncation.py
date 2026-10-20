@@ -40,6 +40,7 @@ import argparse
 import json
 import os
 import queue
+import shutil
 import sys
 import threading
 
@@ -875,6 +876,203 @@ class TestRunner:
         self.check("context: two LLM calls made", len(fake.calls) == 2,
                    f"calls={len(fake.calls)}")
 
+    def test_tui_tabs(self):
+        """Agent tabs: independent agents, panes, approvals and session files per
+        tab; background runs; closing a tab; saved tabs reopen on restart."""
+        if not aic._TEXTUAL_AVAILABLE:
+            self.check("tabs: skipped (textual missing)", True)
+            return
+        import asyncio
+        import tempfile
+        import time
+        tmp = tempfile.mkdtemp()
+        base = os.path.join(tmp, ".aicsession")
+
+        def make_args():
+            session_file, number = aic.acquire_session_file(base)
+            return argparse.Namespace(
+                api_base="http://localhost:1/v1", model="test-model", api_key="test-key", auto_approve=False,
+                no_thinking=False, timeout=30, max_prompt_len=80000, max_output_bytes=10240, max_steps=10,
+                debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
+                request=[], session=base, session_file=session_file, instance_number=number,
+                session_msg="[SESSION] test", sandbox_enabled=False, sandbox_msg="[SANDBOX] off",
+                sandbox_write_dir=os.getcwd(), loop="", max_iterations=10, verify="")
+
+        def release_all():  # what the process exit does to the locks
+            for path in [p for p in aic._SESSION_LOCK_FDS if p.startswith(tmp)]:
+                aic.release_session_lock(path)
+
+        def answer(text):
+            return [fake_openai.content_chunk(text + " TASKCOMPLETE"), fake_openai.usage_chunk(10, 3)]
+
+        def command(cid, cmd):
+            return [fake_openai.tool_call_chunk(0, id=cid, name="execute_bash",
+                                                arguments=json.dumps({"command": cmd})),
+                    fake_openai.usage_chunk(10, 3)]
+
+        def fake(tab, script):
+            tab.agent.client = fake_openai.FakeOpenAIClient(script)
+            tab.agent.task_summary_enabled = False
+
+        async def until(pilot, condition, timeout=10):
+            end = time.monotonic() + timeout
+            while not condition() and time.monotonic() < end:
+                await pilot.pause(0.05)
+            return condition()
+
+        def bar(app):
+            widget = app.query_one("#agent-tabs")
+            return widget.build(widget.size.width or 80).plain
+
+        async def first_run():
+            app = aic.CommanderApp(make_args(), aic.PromptHistory(None))
+            r = {}
+            async with app.run_test(size=(140, 36)) as pilot:
+                await pilot.pause(0.2)
+                tab1 = app.tab
+                r["one tab at start"] = len(app.tabs) == 1 and tab1.session_file == base
+                fake(tab1, [answer("first-answer")])
+                await pilot.press(*"hi", "enter")
+                await until(pilot, lambda: not tab1.busy())
+                await pilot.press("ctrl+t")
+                await until(pilot, lambda: len(app.tabs) == 2)
+                await pilot.pause(0.1)
+                tab2 = app.tab
+                r["ctrl+t opens and selects a tab"] = tab2 is not tab1 and tab2.agent is not tab1.agent
+                r["new tab: own session file and lock"] = (tab2.session_file == base + "2"
+                                                          and tab2.session_file in aic._SESSION_LOCK_FDS)
+                r["new tab: own panes"] = (tab2.agent_log.display and not tab1.agent_log.display
+                                           and "first-answer" not in tab2.agent_log.plain_text)
+                fake(tab2, [command("c1", "echo tab2-output"), answer("second-done")])
+                await pilot.press(*"run it", "enter")
+                r["approval shown for the current tab"] = await until(
+                    pilot, lambda: type(app.screen).__name__ == "ApprovalScreen")
+                await pilot.press("ctrl+g")
+                r["ctrl+g opens the tab switcher"] = await until(
+                    pilot, lambda: type(app.screen).__name__ == "TabSwitcher", 3)
+                await pilot.press("1")
+                await pilot.pause(0.2)
+                r["ctrl+g 1 switches back, approval stays pending"] = (
+                    app.tab is tab1 and type(app.screen).__name__ not in ("ApprovalScreen", "TabSwitcher")
+                    and tab2.pending_approval == "echo tab2-output" and "◆" in bar(app))
+                await pilot.press("ctrl+g", "down", "enter")
+                r["the pending approval returns with its tab"] = await until(
+                    pilot, lambda: type(app.screen).__name__ == "ApprovalScreen" and app.tab is tab2)
+                await pilot.press("ctrl+g", "1")  # select tab 1 from a switcher opened over the dialog
+                await pilot.pause(0.3)
+                r["switching from over the dialog leaves no stale dialog"] = (
+                    app.tab is tab1 and len(app.screen_stack) == 1 and tab2.pending_approval is not None)
+                await pilot.press("ctrl+g", "2")
+                await until(pilot, lambda: type(app.screen).__name__ == "ApprovalScreen")
+                await pilot.pause(0.5)
+                await pilot.press("y")
+                await until(pilot, lambda: not tab2.busy())
+                await pilot.pause(0.1)
+                r["command output lands in its own console"] = (
+                    "tab2-output" in tab2.console_log.plain_text and "tab2-output" not in tab1.console_log.plain_text)
+                await pilot.press("f2")
+                r["auto-approve is per tab"] = tab2.auto_approve and not tab1.auto_approve
+                fake(tab2, [command("c2", "sleep 0.5; echo bg-output"), answer("bg-done")])
+                await pilot.press(*"again", "enter")
+                await pilot.press("ctrl+g", "ctrl+g")
+                await pilot.pause(0.1)
+                r["ctrl+g twice selects the next tab"] = app.tab is tab1
+                await until(pilot, lambda: not tab2.busy())
+                await pilot.pause(0.1)
+                r["a background tab keeps working"] = ("bg-output" in tab2.console_log.plain_text
+                                                       and "bg-done" in tab2.agent_log.plain_text
+                                                       and "bg-output" not in tab1.console_log.plain_text)
+                r["finished background tab is marked"] = tab2.unseen and "●" in bar(app)
+                await pilot.press("f3")
+                await until(pilot, lambda: tab1.shell._pid is not None, 5)
+                await pilot.press("ctrl+g", "2")  # from inside the shell
+                await pilot.pause(0.1)
+                r["each tab remembers its right pane"] = (app.tab is tab2 and tab2.pane == "console"
+                                                          and tab2.console_log.display and not tab1.shell.display)
+                await pilot.press("f3")
+                shells = await until(pilot, lambda: tab2.shell._pid is not None, 5)
+                r["each tab has its own shell"] = shells and tab2.shell._pid != tab1.shell._pid
+                r["both sessions saved"] = all(aic.read_session_file(p)[0].get("messages")
+                                               for p in (base, base + "2"))
+                # A run ending under another dialog: the help screen stays, the
+                # approval dialog goes once it is uncovered.
+                fake(tab2, [command("c3", "echo never-run"), answer("x")])
+                tab2.auto_approve = False
+                await pilot.click("#prompt-input")
+                await pilot.press(*"needs approval", "enter")
+                asked = await until(pilot, lambda: type(app.screen).__name__ == "ApprovalScreen")
+                await pilot.press("f1")
+                await pilot.pause(0.2)
+                await pilot.press("f9")
+                await until(pilot, lambda: not tab2.busy())
+                await pilot.pause(0.2)
+                help_kept = type(app.screen).__name__ == "HelpScreen"
+                await pilot.press("escape")
+                await pilot.pause(0.3)
+                r["a run ending under the help screen closes its approval dialog"] = (
+                    asked and help_kept and len(app.screen_stack) == 1 and app._approval_screen is None)
+                # A steering message the agent never read comes back to the prompt.
+                tab2.agent.suggestion_queue.put("late steering")
+                done = threading.Thread(target=lambda: None)
+                done.start()
+                done.join()
+                tab2.thread = done
+                r["an unread steering message returns to the prompt"] = await until(
+                    pilot, lambda: app.prompt.text == "late steering", 3)
+                app.prompt.clear()
+                shell_pid = tab2.shell._pid
+                await pilot.click("#prompt-input")
+                await pilot.press(*"/closetab", "enter")
+                await pilot.pause(0.1)
+                r["closing a tab with a conversation asks twice"] = len(app.tabs) == 2
+                await pilot.press(*"/closetab", "enter")
+                await until(pilot, lambda: len(app.tabs) == 1)
+                await pilot.pause(0.1)
+                r["closed tab: session dropped, lock released"] = (
+                    not os.path.exists(base + "2") and base + "2" not in aic._SESSION_LOCK_FDS)
+                r["closed tab: its shell exited and was reaped"] = tab2.shell._pid is None and await until(
+                    pilot, lambda: not os.path.exists(f"/proc/{shell_pid}"), 5)
+                r["closed tab: the other one is shown"] = app.tab is tab1 and tab1.agent_log.display
+                await pilot.press("ctrl+t")
+                await until(pilot, lambda: len(app.tabs) == 2)
+                await pilot.pause(0.1)
+                tab3 = app.tab
+                r["a new tab reuses the free session file"] = tab3.session_file == base + "2"
+                fake(tab3, [answer("third-answer")])
+                await pilot.press(*"hello", "enter")
+                await until(pilot, lambda: not tab3.busy())
+                await pilot.press("f10")
+                await pilot.pause(0.3)
+            r["quit"] = not app.is_running
+            return r
+
+        async def second_run():
+            app = aic.CommanderApp(make_args(), aic.PromptHistory(None))
+            r = {}
+            async with app.run_test(size=(140, 36)) as pilot:
+                await pilot.pause(0.3)
+                r["restart reopens the saved tabs"] = (len(app.tabs) == 2 and app.tab is app.tabs[0]
+                                                       and app.tabs[1].session_file == base + "2")
+                if len(app.tabs) == 2:
+                    r["reopened tab shows its conversation"] = "third-answer" in app.tabs[1].agent_log.plain_text
+                    r["first tab restored too"] = "first-answer" in app.tabs[0].agent_log.plain_text
+                await pilot.press("f10")
+                await pilot.pause(0.3)
+            return r
+
+        native = aic.clipboard_write_native, aic.clipboard_read_native
+        aic.clipboard_write_native, aic.clipboard_read_native = (lambda text: False), (lambda: None)
+        try:
+            results = asyncio.run(first_run())
+            release_all()
+            results.update(asyncio.run(second_run()))
+        finally:
+            release_all()
+            aic.clipboard_write_native, aic.clipboard_read_native = native
+            shutil.rmtree(tmp, ignore_errors=True)
+        for name, ok in results.items():
+            self.check(f"tabs: {name}", ok)
+
     # ------------------------------------------------------------------ #
     # 5. Live integration tests (network)                                #
     # ------------------------------------------------------------------ #
@@ -1695,8 +1893,8 @@ class TestRunner:
                 app.prompt.clear()
                 await pilot.press("f3")
                 await pilot.pause(0.2)
-                results["F3 shows the shell"] = app.query_one("#switcher").current == "shell-widget"
-                shell = app.query_one("#shell-widget")
+                shell = app.tab.shell
+                results["F3 shows the shell"] = app.tab.pane == "shell" and shell.display and not app.console_log.display
                 if await until(pilot, lambda: shell._pid is not None, 5) and os.path.exists("/proc/self/cwd"):
                     # A cd in the shell must never move the agent's working directory.
                     before = os.getcwd()
@@ -2060,6 +2258,7 @@ def main():
     runner.test_preserved_thinking()
     runner.test_x11_clipboard()
     runner.test_tui_end_to_end()
+    runner.test_tui_tabs()
     runner.test_completion_marker()
     runner.test_file_tools()
     runner.test_verify_gate()
