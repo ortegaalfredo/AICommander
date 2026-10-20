@@ -8,7 +8,7 @@ plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 import argparse
 import asyncio
@@ -54,6 +54,7 @@ except ImportError:
 
 try:  # optional: the TUI (--nogui runs without it)
     from rich.cells import cell_len
+    from rich.color import Color, blend_rgb
     from rich.segment import Segment
     from rich.style import Style
     from rich.syntax import Syntax
@@ -2546,6 +2547,8 @@ if _TEXTUAL_AVAILABLE:
     _WRAP_TOKEN_RE = re.compile(r"\S+\s*|\s+")
     _NEWLINE_RE = re.compile(r"(\r\n|\n|\r)")
     _WORD_CHARS = re.compile(r"[\w\-./~:@%+=?&#,]")
+    _URL_RE = re.compile(r"https?://[^\s<>\"'`)\]]+")
+    _FOLD_OUTPUT = 20  # longer command output is folded in the console once it completes
     _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _SLASH_COMMANDS = ("/help", "/autoapprove", "/aa", "/approve", "/reject", "/suggest ", "/clear", "/new",
                        "/session", "/reload", "/copy", "/loop ", "/stop", "/newtab", "/closetab", "/tab ",
@@ -2559,6 +2562,11 @@ if _TEXTUAL_AVAILABLE:
 
     def _fmt_tokens(n: float) -> str:
         return f"{n:.0f}" if n < 1000 else f"{n / 1000:.1f}k" if n < 1_000_000 else f"{n / 1e6:.1f}M"
+
+    def _pulse(a: str, b: str, period: float = 0.7) -> str:
+        """A color easing back and forth between *a* and *b* (an attention pulse)."""
+        t = abs(time.monotonic() / period % 2 - 1)
+        return blend_rgb(Color.parse(a).triplet, Color.parse(b).triplet, t * t * (3 - 2 * t)).hex
 
     def _fmt_secs(s: float) -> str:
         return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m{int(s % 60):02d}s"
@@ -2607,11 +2615,13 @@ if _TEXTUAL_AVAILABLE:
         return args["command"] if isinstance(args.get("command"), str) else None
 
     class _Line:
-        """A logical log line: its text plus style runs [(end_offset, style)]."""
-        __slots__ = ("plain", "runs", "rule")
+        """A logical log line: its text plus style runs [(end_offset, style)].
+        Lines of a fold point to its header (owner); a header's folded flag is
+        None (not foldable), True (members hidden) or False (open)."""
+        __slots__ = ("plain", "runs", "rule", "owner", "folded")
 
-        def __init__(self, rule: bool = False):
-            self.plain, self.runs, self.rule = "", [], rule
+        def __init__(self, rule: bool = False, owner: _Line | None = None):
+            self.plain, self.runs, self.rule, self.owner, self.folded = "", [], rule, owner, None
 
         def append(self, text: str, style) -> None:
             self.plain += text
@@ -2649,6 +2659,10 @@ if _TEXTUAL_AVAILABLE:
             self._width = 0
             self._cache: dict[int, Strip] = {}
             self._cr = False  # a '\r' ended the last chunk: decided by what follows
+            self._fold: _Line | None = None  # header of the fold new lines join
+            self._fold_min = 0  # the fold collapses when it ends with more lines than this
+            self._down_at = None  # where the left button went down (a click is not a drag)
+            self._anim = None  # (timer, frame) of a fold rolling in or out
 
         # Writing -------------------------------------------------------------
 
@@ -2666,7 +2680,7 @@ if _TEXTUAL_AVAILABLE:
                 if self._cr:
                     self._cr = False
                     if part not in ("\n", "\r\n"):
-                        self._lines[-1] = _Line()
+                        self._lines[-1] = _Line(owner=self._fold)
                 if part in ("\n", "\r\n"):
                     self._newline()
                 else:
@@ -2682,11 +2696,81 @@ if _TEXTUAL_AVAILABLE:
             """A full-width horizontal rule with an optional title."""
             follow = self._at_bottom()
             self.close_line(settle=False)
-            rule = _Line(rule=True)
+            rule = _Line(rule=True, owner=self._fold)
             rule.append(" ".join(title.split()), style)
             self._lines[-1] = rule
             self._newline()
             self._settle(follow)
+
+        def begin_fold(self, title: str, style="", fold_over: int = 0, rule: bool = False) -> None:
+            """Start a fold headed by *title*: the lines written until end_fold()
+            are hidden behind it if there are more than *fold_over*."""
+            self.end_fold()
+            self.write_rule(title, style) if rule else self.write_line(title, style)
+            self._fold, self._fold_min = self._lines[-2], fold_over
+            self._lines[-1].owner = self._fold
+
+        def end_fold(self) -> None:
+            head, self._fold = self._fold, None
+            if head is None:
+                return
+            self.close_line()
+            self._lines[-1].owner = None
+            count = 0
+            while count + 2 <= len(self._lines) and self._lines[-2 - count].owner is head:
+                count += 1
+            if count > self._fold_min:  # retitle the header, then roll the fold up
+                head.plain = f"▾ {head.plain} · {count} line{'s' * (count != 1)}"
+                head.runs, head.folded = [(len(head.plain), head.runs[0][1] if head.runs else "")], False
+                hi = len(self._lines) - 2 - count
+                a, b = (bisect.bisect_left(self._rows, (k, -1, -1)) for k in (hi, hi + 1))
+                self._rows[a:b] = self._line_rows(hi)
+                self.toggle_fold(head, follow=self._at_bottom())
+
+        def toggle_fold(self, head: _Line, animate: bool = True, follow: bool = False) -> None:
+            """Fold or unfold *head*: its rows roll in or out over a few frames
+            (ease-out), spliced into the row list without a full reflow."""
+            self._stop_anim(finish=True)
+            head.folded = not head.folded
+            head.plain = ("▸" if head.folded else "▾") + head.plain[1:]
+            hi = next((k for k in range(len(self._lines) - 1, -1, -1) if self._lines[k] is head), -1)
+            if not animate or hi < 0:
+                return self._reflow(follow=False)
+            pos = end = bisect.bisect_left(self._rows, (hi + 1, -1, -1))
+            if head.folded:
+                while end < len(self._rows) and self._lines[self._rows[end][0]].owner is head:
+                    end += 1
+                rows = self._rows[pos:end]
+            else:
+                rows, k = [], hi + 1
+                while k < len(self._lines) - 1 and self._lines[k].owner is head:
+                    rows += self._line_rows(k)
+                    k += 1
+            total, shown = len(rows), [end - pos]
+            steps = iter([round(total * (1 - (1 - t / 8) ** 2)) for t in range(1, 9)])
+
+            def frame() -> bool:
+                step = next(steps, total)
+                target = total - step if head.folded else step
+                self._rows[pos:pos + shown[0]] = rows[:target]
+                shown[0] = target
+                self._cache.clear()
+                self.virtual_size = Size(self._width, len(self._rows))
+                if follow:
+                    self.scroll_end(animate=False, immediate=True, x_axis=False)
+                self.refresh()
+                return step >= total
+
+            if not frame():
+                self._anim = (self.set_interval(0.02, lambda: frame() and self._stop_anim()), frame)
+
+        def _stop_anim(self, finish: bool = False) -> None:
+            if self._anim:
+                timer, frame = self._anim
+                self._anim = None
+                timer.stop()
+                while finish and not frame():
+                    pass
 
         def close_line(self, settle: bool = True) -> None:
             self._cr = False
@@ -2697,7 +2781,8 @@ if _TEXTUAL_AVAILABLE:
                     self._settle(follow)
 
         def clear(self) -> None:
-            self._lines, self._rows, self._tail, self._cr = [_Line()], [], 0, False
+            self._stop_anim()
+            self._lines, self._rows, self._tail, self._cr, self._fold = [_Line()], [], 0, False, None
             self._cache.clear()
             self.virtual_size = Size(self._width, 0)
             self.scroll_to(y=0, animate=False, immediate=True)
@@ -2709,11 +2794,13 @@ if _TEXTUAL_AVAILABLE:
 
         def _newline(self) -> None:
             self._retail(final=True)
-            self._lines.append(_Line())
+            self._lines.append(_Line(owner=self._fold))
             self._tail = 0
 
         def _line_rows(self, i: int) -> list[tuple[int, int, int]]:
             line = self._lines[i]
+            if line.owner is not None and line.owner.folded:
+                return []
             if line.rule:
                 return [(i, 0, len(line.plain))]
             return [(i, s, e) for s, e in _wrap_spans(line.plain, self._width or 1_000_000)]
@@ -2751,6 +2838,7 @@ if _TEXTUAL_AVAILABLE:
 
         def _trim(self, count: int) -> None:
             """Drop the oldest *count* lines, keeping the viewport on the same text."""
+            self._stop_anim(finish=True)
             removed = bisect.bisect_left(self._rows, (count, -1, -1))
             del self._lines[:count]
             self._rows = [(i - count, s, e) for i, s, e in self._rows[removed:]]
@@ -2759,6 +2847,9 @@ if _TEXTUAL_AVAILABLE:
                 if self.text_selection is not None:
                     self.screen.selections = {w: s for w, s in self.screen.selections.items() if w is not self}
             self.scroll_to(y=max(0, self.scroll_y - removed), animate=False, immediate=True)
+            if self._lines[0].owner is not None and self._lines[0].owner.folded:
+                self._lines[0].owner.folded = None  # its header is gone: show the rest
+                self._reflow()
 
         def _at_bottom(self) -> bool:
             try:
@@ -2770,11 +2861,15 @@ if _TEXTUAL_AVAILABLE:
 
         def on_resize(self, event: events.Resize) -> None:
             width = self.scrollable_content_region.width
-            if width <= 0 or width == self._width:
-                return
-            follow = self._at_bottom()
+            if width > 0 and width != self._width:
+                self._width = width
+                self._reflow()
+
+        def _reflow(self, follow: bool | None = None) -> None:
+            """Recompute every row (width change, fold toggled), keeping the view."""
+            self._stop_anim()
+            follow = self._at_bottom() if follow is None else follow
             top = self._rows[min(int(self.scroll_y), len(self._rows) - 1)] if self._rows else None
-            self._width = width
             self._rows, self._tail = [], 0
             for i in range(len(self._lines) - 1):
                 self._rows.extend(self._line_rows(i))
@@ -2818,6 +2913,8 @@ if _TEXTUAL_AVAILABLE:
             i, start, end = self._rows[row]
             line = self._lines[i]
             text = self._rule_text(line, width) if line.rule else line.text(start, end)
+            for match in _URL_RE.finditer(text.plain):
+                text.stylize("underline", *match.span())
             if span is not None:
                 a, b = span
                 text.stylize(_SELECTION, a, len(text) if b == -1 else b)
@@ -2876,21 +2973,35 @@ if _TEXTUAL_AVAILABLE:
                 row += 1
             return Offset(char - self._rows[row][1], row)
 
+        def _word_at(self, i: int, char: int) -> tuple[int, int]:
+            plain = self._lines[i].plain
+            a = b = char
+            while a > 0 and _WORD_CHARS.match(plain[a - 1]):
+                a -= 1
+            while b < len(plain) and _WORD_CHARS.match(plain[b]):
+                b += 1
+            return a, b
+
         async def _on_click(self, event: events.Click) -> None:
-            if event.chain < 2:
+            hit = self._offset_at(event)
+            if event.chain < 2:  # a click (not a drag): Ctrl opens a link, a fold header toggles
+                if hit is None or event.screen_offset != self._down_at:
+                    return
+                char, i = hit
+                line = self._lines[i]
+                if event.ctrl and not line.rule:
+                    url = next((m for m in _URL_RE.finditer(line.plain) if m.start() <= char < m.end()), None)
+                    self.app.open_link(url.group() if url else line.plain[slice(*self._word_at(i, char))])
+                elif line.folded is not None:
+                    self.toggle_fold(line)
                 return
             event.prevent_default()  # instead of Textual's select-the-whole-widget
-            hit = self._offset_at(event)
             if hit is None:
                 return
             char, i = hit
             plain = self._lines[i].plain
             if event.chain == 2:
-                a = b = char
-                while a > 0 and _WORD_CHARS.match(plain[a - 1]):
-                    a -= 1
-                while b < len(plain) and _WORD_CHARS.match(plain[b]):
-                    b += 1
+                a, b = self._word_at(i, char)
                 if a == b:
                     return
             else:
@@ -2899,9 +3010,35 @@ if _TEXTUAL_AVAILABLE:
             self.app.copy_selection()
 
         async def _on_mouse_down(self, event: events.MouseDown) -> None:
+            self._down_at = event.screen_offset
             if event.button in (2, 3):
                 event.prevent_default()
                 self.app.mouse_paste_or_copy(event.button, target=None)
+
+        def find_all(self, query: str) -> list[tuple[int, int]]:
+            """(line index, offset) of every case-insensitive match of *query*."""
+            query, found = query.lower(), []
+            for i, line in enumerate(self._lines):
+                low = line.plain.lower()
+                k = low.find(query)
+                while k >= 0:
+                    found.append((i, k))
+                    k = low.find(query, k + 1)
+            return found
+
+        def show_match(self, i: int, a: int, b: int) -> None:
+            """Select characters a..b of line *i*, unfolding and scrolling to it."""
+            self._stop_anim(finish=True)
+            if i >= len(self._lines):
+                return
+            line = self._lines[i]
+            if line.owner is not None and line.owner.folded:
+                self.toggle_fold(line.owner, animate=False)
+            if line.rule:  # drawn as "── title ──"
+                a, b = a + 3, b + 3
+            start = self._position(i, a)
+            self.screen.selections = {self: Selection(start, self._position(i, b))}
+            self.scroll_to(y=max(0, start.y - self.size.height // 2), duration=0.15, easing="out_cubic")
 
         def on_paste(self, event: events.Paste) -> None:
             """Logs are read-only: pasting or typing here goes to the prompt."""
@@ -2914,6 +3051,52 @@ if _TEXTUAL_AVAILABLE:
                 event.stop()
                 self.app.prompt.focus()
                 self.app.prompt.paste_text(event.character)
+
+    class FindBar(Input):
+        """Ctrl+F: incremental search of the agent log or the console."""
+
+        BINDINGS = [Binding("escape", "close", show=False), Binding("up,ctrl+f", "step(-1)", show=False),
+                    Binding("down", "step(1)", show=False)]
+        HINT = "Enter/↑ older · ↓ newer · Esc closes"
+
+        def __init__(self, **kwargs):
+            super().__init__(placeholder="Find…", **kwargs)
+            self.target: OutputLog | None = None
+            self._matches: list[tuple[int, int]] = []
+            self._pos = 0
+
+        def start(self, log: OutputLog) -> None:
+            self.target, self.display = log, True
+            self.border_title = f"Find in the {'agent log' if log.has_class('agent-log') else 'console'}"
+            self.focus()
+            self.select_all()
+            self._search()
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            event.stop()
+            self._search()
+
+        def action_submit(self) -> None:
+            self.action_step(-1)
+
+        def _search(self) -> None:
+            self._matches = self.target.find_all(self.value) if self.value and self.target else []
+            self._pos = len(self._matches)
+            self.action_step(-1)
+
+        def action_step(self, delta: int) -> None:
+            if not self._matches:
+                self.border_subtitle = f"no matches · {self.HINT}" if self.value else self.HINT
+                return
+            self._pos = (self._pos + delta) % len(self._matches)
+            i, k = self._matches[self._pos]
+            self.target.show_match(i, k, k + len(self.value))
+            self.border_subtitle = f"{self._pos + 1}/{len(self._matches)} · {self.HINT}"
+
+        def action_close(self) -> None:
+            self.display = False
+            if self.target is not None and self.target.display:
+                self.target.focus()
 
     class PromptArea(TextArea):
         """Multi-line prompt: Enter sends, Ctrl+J / Shift+Enter add a line,
@@ -3325,6 +3508,51 @@ if _TEXTUAL_AVAILABLE:
                     os.killpg(self._pid, signal.SIGHUP)
             self._release()  # a reader left behind would fire on a widget with no screen (NoScreen)
 
+    class Splitter(Widget):
+        """The column between the two panels: drag it to resize them, double-click
+        to split them evenly again. The left width is kept as a percentage."""
+
+        DEFAULT_CSS = """
+        Splitter { width: 1; height: 1fr; background: #12488b; }
+        Splitter:hover, Splitter.-drag { background: #87d7ff; }
+        """
+
+        def render(self) -> str:
+            return ""
+
+        @property
+        def split(self) -> float:
+            """The left panel's width in percent (animatable)."""
+            left = self.parent.query_one("#left-panel")
+            return left.size.width * 100 / max(1, self.parent.size.width)
+
+        @split.setter
+        def split(self, percent: float) -> None:
+            self.parent.query_one("#left-panel").styles.width = f"{percent:.2f}%"
+
+        def on_mouse_down(self, event: events.MouseDown) -> None:
+            event.stop()
+            if event.button == 1:
+                self.capture_mouse()
+                self.add_class("-drag")
+
+        def on_mouse_move(self, event: events.MouseMove) -> None:
+            if self.has_class("-drag") and (panels := self.parent).size.width > 24:
+                total = panels.size.width
+                self.split = max(10, min(total - 11, event.screen_x - panels.region.x)) * 100 / total
+
+        def on_mouse_up(self, event: events.MouseUp) -> None:
+            event.stop()
+            self.release_mouse()
+            self.remove_class("-drag")
+
+        def on_click(self, event: events.Click) -> None:
+            event.stop()
+            if event.chain == 2:  # glide back to an even split
+                total = max(1, self.parent.size.width)
+                self.animate("split", 50 * (total - 1) / total, duration=0.2, easing="out_cubic",
+                             on_complete=lambda: setattr(self.parent.query_one("#left-panel").styles, "width", "1fr"))
+
     class _ClickBar(Static):
         """A one-row bar of clickable items: subclasses build (text, items)."""
 
@@ -3396,7 +3624,8 @@ if _TEXTUAL_AVAILABLE:
                 if cell_len(title) > room:
                     title = title[:max(1, room - 1)] + "…"
                 style = ("bold #000000 on #06989a" if tab is active else
-                         "bold #000000 on #ffd75f" if tab.pending_approval is not None else "#e5e5e5 on #0b2f5e")
+                         f"bold #000000 on {_pulse('#ffd75f', '#8a6d1f')}" if tab.pending_approval is not None
+                         else "#e5e5e5 on #0b2f5e")
                 self._add(text, f" {pos} {mark}{title}", style, f"select_tab({pos})")
                 if close:
                     self._add(text, close, style, f"close_tab({pos})")
@@ -3592,7 +3821,12 @@ if _TEXTUAL_AVAILABLE:
         ("Prompt", "Enter sends · Ctrl+J or Shift+Enter adds a line · ↑/↓ browse history at the first/last line · "
                    "Ctrl+R searches history · Tab completes /commands · typing while the agent works steers it"),
         ("Mouse", "drag selects text (copied automatically) · double-click selects a word, triple-click a line · "
-                  "right-click copies the selection, or pastes · middle-click pastes · the wheel scrolls"),
+                  "right-click copies the selection, or pastes · middle-click pastes · the wheel scrolls · "
+                  "drag the bar between the panels to resize them, double-click it to even them · "
+                  "Ctrl+click opens a URL or file path · a click on a ▸/▾ line folds or unfolds it "
+                  "(thinking and long command output start folded)"),
+        ("Find", "Ctrl+F searches the agent log, or the console when it has the focus · Enter or ↑ goes to "
+                 "the previous match, ↓ the next · Esc closes"),
         ("Clipboard", "Ctrl+C copies the selection · Ctrl+V pastes in the prompt · F4 copies the selection or the "
                       "last answer · F5 pastes · copies reach the desktop clipboard directly on X11/Xwayland, "
                       "through OSC 52 in terminals that support it, and wl-copy or pbcopy when present"),
@@ -3754,10 +3988,11 @@ if _TEXTUAL_AVAILABLE:
                             log.write_line(command, _C_CMD)
                 elif role == "tool":
                     command = commands.pop(msg.get("tool_call_id"), None)
-                    console.write_rule(command or "tool result", _C_CMD)
+                    console.begin_fold(command or "tool result", _C_CMD, _FOLD_OUTPUT, rule=True)
                     match = re.match(r"Command executed with exit code (-?\d+)\.\nOutput:\n?(.*)\Z", text, re.S)
                     output = match.group(2) if match else text
                     console.write_line(output[:4000] + ("\n… (truncated)" if len(output) > 4000 else ""), "#d0d0d0")
+                    console.end_fold()
                     if match:
                         ok = match.group(1) == "0"
                         console.write_line(f"{'✓' if ok else '✗'} exit {match.group(1)}", f"bold {_C_OK if ok else _C_FAIL}")
@@ -3916,7 +4151,7 @@ if _TEXTUAL_AVAILABLE:
                 self.current_command, self._cmd_started = p.get("command", ""), time.monotonic()
                 label = ("" if p.get("function_name") in AICommander.FILE_TOOLS else "$ ") + self.current_command
                 log.write_line(label, _C_CMD)
-                console.write_rule(label, _C_CMD)
+                console.begin_fold(label, _C_CMD, _FOLD_OUTPUT, rule=True)
                 self.set_phase("running")
             elif kind == "APPROVAL_REQUEST":
                 self.set_phase("approval")
@@ -3928,6 +4163,7 @@ if _TEXTUAL_AVAILABLE:
                 lines = output.count("\n") + bool(output and not output.endswith("\n"))
                 summary = (f"{'✓' if ok else '✗'} exit {code} · {_fmt_secs(p.get('duration') or 0.0)}"
                            f" · {lines} line{'s' * (lines != 1)}")
+                console.end_fold()
                 console.write_line(summary, f"bold {_C_OK if ok else _C_FAIL}")
                 log.write_line(f"  {summary}", _C_OK if ok else _C_FAIL)
                 self.set_phase("thinking")
@@ -3941,9 +4177,10 @@ if _TEXTUAL_AVAILABLE:
             log = self.agent_log
             if kind != self._agent_stream:
                 self._flush_marker()
+                log.end_fold()
                 log.close_line()
                 if kind == "think":
-                    log.write_line("✻ thinking", _C_DIM)
+                    log.begin_fold("✻ thinking", _C_DIM)
                 self._agent_stream = kind
                 self.set_phase("thinking" if kind == "think" else "writing")
             if kind == "text":
@@ -3966,6 +4203,7 @@ if _TEXTUAL_AVAILABLE:
         def _end_streams(self) -> None:
             if self._agent_stream:
                 self._flush_marker()
+                self.agent_log.end_fold()
                 self.agent_log.close_line()
                 self._agent_stream = None
             if self._console_stream:
@@ -3999,6 +4237,8 @@ if _TEXTUAL_AVAILABLE:
         PromptArea .text-area--cursor-line { background: #000000; }
         #status-bar { height: 1; background: #06989a; color: #000000; }
         #fkeys { height: 1; background: #000000; }
+        FindBar { display: none; height: 3; background: #000000; color: #f2f2f2; border: round #ffd75f;
+                  border-title-color: #ffd75f; border-subtitle-color: #6f8fc0; }
         """
         BINDINGS = [
             Binding("f1", "help", "Help", priority=True),
@@ -4015,6 +4255,7 @@ if _TEXTUAL_AVAILABLE:
             # (Alt/Ctrl+digit and Ctrl+PgUp are often taken or unsendable).
             Binding("ctrl+t", "new_tab", "New tab", priority=True),
             Binding("ctrl+g", "tab_switcher", "Go to tab", priority=True),
+            Binding("ctrl+f", "find", "Find", show=False),  # not priority: the shell keeps Ctrl+F
             # Not a priority binding: the focused widget and the screen copy a
             # selection first; only an unhandled Ctrl+C stops or quits.
             Binding("ctrl+c", "interrupt", "Stop / quit", show=False),
@@ -4042,9 +4283,11 @@ if _TEXTUAL_AVAILABLE:
                 with Vertical(id="left-panel"):
                     yield AgentTabs(id="agent-tabs")
                     yield Vertical(id="agent-stack")
+                yield Splitter()
                 with Vertical(id="right-panel"):
                     yield PaneTabs(id="tabs")
                     yield Vertical(id="switcher")
+            yield FindBar()
             yield PromptArea(self.history, id="prompt-input", placeholder="Type a task or /command…")
             yield Static(id="status-bar")
             yield FKeyBar(id="fkeys")
@@ -4073,6 +4316,8 @@ if _TEXTUAL_AVAILABLE:
         async def on_mount(self) -> None:
             self.title = "AI-Commander"
             self.prompt.border_title = "Prompt"
+            self._tabs_bar = self.query_one("#agent-tabs", AgentTabs)
+            self._status_bar = self.query_one("#status-bar", Static)
             atexit.register(self.save_sessions, "process_exit")
             first = await self._open_tab(self.args.session_file, self.args.instance_number, self.args.session_msg)
             await self._restore_tabs()
@@ -4220,6 +4465,8 @@ if _TEXTUAL_AVAILABLE:
                 tab.agent.save_session(reason)
 
         def _tick(self) -> None:
+            if not self._status_bar.is_attached:  # shutting down: the widgets are being removed
+                return
             for tab in list(self.tabs):
                 tab.tick()
             self._refresh_status()
@@ -4275,10 +4522,10 @@ if _TEXTUAL_AVAILABLE:
             tab = self.tab
             if tab is None:
                 return
-            bar = self.query_one("#agent-tabs", AgentTabs)
+            bar = self._tabs_bar
             tabs = bar.build(bar.size.width or 80).plain
-            if tabs != self._last_tabs:
-                self._last_tabs = tabs
+            if tabs != self._last_tabs or any(t.pending_approval is not None for t in self.tabs if t is not tab):
+                self._last_tabs = tabs  # (a tab waiting for approval pulses)
                 bar.refresh()
             now = time.monotonic()
             busy = tab.busy()
@@ -4321,7 +4568,7 @@ if _TEXTUAL_AVAILABLE:
             if status.plain != self._last_status:
                 self._last_status = status.plain
                 # One row whatever the text: no layout pass (it would repaint every widget).
-                self.query_one("#status-bar", Static).update(status, layout=False)
+                self._status_bar.update(status, layout=False)
 
         # Prompt and slash commands -------------------------------------------------
 
@@ -4543,6 +4790,32 @@ if _TEXTUAL_AVAILABLE:
             order = [self.prompt, self.tab.agent_log, self.tab.right_pane]
             current = next((i for i, w in enumerate(order) if w is self.focused), -1)
             order[(current + 1) % len(order)].focus()
+
+        def action_find(self) -> None:
+            self.query_one(FindBar).start(self.console_log if self.focused is self.console_log else self.agent_log)
+
+        def open_link(self, link: str) -> None:
+            """Ctrl+click: a URL opens in the browser, an existing path[:line] in
+            VS Code (inside its terminal) or the desktop's default application."""
+            link = link.strip(".,:;'\"")
+            argv = None
+            if not _URL_RE.match(link):
+                path, line = re.match(r"(.*?)(?::(\d+))?(?::\d+)?$", link).groups()
+                link = os.path.abspath(os.path.expanduser(path)) if path else ""
+                if not link or not os.path.exists(link):
+                    return
+                if os.path.isfile(link) and os.environ.get("TERM_PROGRAM") == "vscode" and shutil.which("code"):
+                    argv = ["code", "-g", f"{link}:{line or 1}"]
+            try:
+                if _IS_WINDOWS and argv is None:
+                    os.startfile(link)
+                else:
+                    subprocess.Popen(argv or ["open" if sys.platform == "darwin" else "xdg-open", link],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True)
+                self.notify(f"Opening {link}", timeout=2)
+            except OSError as exc:
+                self.notify(f"Could not open {link}: {exc}", severity="error", timeout=4)
 
         def action_zoom(self) -> None:
             if self.screen.maximized is not None:

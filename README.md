@@ -13,7 +13,8 @@ It supports two presentation modes:
 - **Default (TUI)** — a [Textual](https://textual.textualize.io/)-based,
   Norton-Commander-style terminal UI: agent output and console/shell panes, a
   multi-line prompt, a status line and a function-key bar, with full mouse
-  support (select to copy, right/middle-click to paste).
+  support (select to copy, right/middle-click to paste, resizable panes,
+  foldable output, clickable links) and `Ctrl+F` search.
 - **`--nogui`** — the original direct-CLI behaviour (stdout/stderr, no TUI).
 
 ![AI-Commander TUI](aic.png)
@@ -86,6 +87,9 @@ It supports two presentation modes:
 - **Mouse copy & paste** — drag to select text in any pane (copied
   automatically, re-joining soft-wrapped lines), double-click a word,
   triple-click a line, right/middle-click to paste.
+- **Find, folding and links** — `Ctrl+F` searches the agent log or console;
+  thinking and long command output fold to one clickable line; `Ctrl+click`
+  opens URLs and file paths.
 - **Multi-line prompt with history** — Enter sends, Ctrl+J/Shift+Enter adds a
   line, Up/Down and Ctrl+R search persistent history; multi-line pastes stay
   intact.
@@ -283,20 +287,25 @@ The default Textual interface is a Norton-Commander-style split screen:
   `Ctrl+G` then its number) switches the agent pane, the console/shell pane and
   the status line to it; the prompt keeps a draft per tab. A tab shows `◆` when
   its agent waits for approval (the dialog opens when you select it) and `●`
-  when a run finished while you were elsewhere. The `×` of the current tab (or
+  when a run finished while you were elsewhere (a background tab waiting for
+  approval pulses). The `×` of the current tab (or
   `/closetab`) closes it: its agent stops, its shell exits and its session is
   discarded (asked twice if there is a conversation). The sandbox is shared:
   it is applied once, to the whole process, at startup.
 - **Left pane — Agent**: the model's streamed answer (live, word-wrapped and
-  re-wrapped when the terminal is resized), its thinking in dim italics, each
+  re-wrapped when the terminal is resized), its thinking in dim italics
+  (folded to `▸ ✻ thinking · N lines` once it ends; click to unfold), each
   command it runs (`$ command`) with an exit/duration summary, and status
   messages. The pane title shows an LLM-generated summary of the task.
 - **Right pane — Console / Shell** of the current agent tab: two tabs (click
   them or press `F3`; each agent tab remembers its choice).
   *Console* shows every command the agent runs with its live output and exit
-  code; *Shell* is an embedded, colored interactive shell with scrollback. It
+  code; output longer than 20 lines folds to its `▸ $ command · N lines`
+  header once the command completes (click to unfold). *Shell* is an embedded, colored interactive shell with scrollback. It
   is independent of the agent: a `cd` there never changes the directory the
   agent works in, which stays the one AI-Commander was started in.
+- **Divider**: the bar between the two panes can be dragged to resize them;
+  a double-click splits them evenly again.
 - **Prompt**: a multi-line input box (it grows with its content).
 - **Status line**: what the agent is doing (thinking, writing, running a
   command, waiting for approval, retrying) with elapsed time, step count,
@@ -349,13 +358,14 @@ controls, so they are **not** added to prompt history:
 | `F9` | Stop the agent (a pending LLM response is cut off immediately). |
 | `Ctrl+C` | Copy the selection; otherwise stop a running agent; press twice while idle to quit. |
 | `F10` / `Ctrl+Q` | Quit (every tab's session and the history are saved). |
+| `Ctrl+F` | Find in the agent log, or in the console when it has the focus: incremental and case-insensitive; `Enter`/`↑` previous match, `↓` next, `Esc` closes. A match inside folded output unfolds it. |
 | `Ctrl+T` | Open a new agent tab. |
 | `Ctrl+G` | Go to an agent tab: a list opens; `1`…`9` or `↑`/`↓` `Enter` select, `Ctrl+G` again (or `Tab`) the next tab, `N` a new tab, `X` closes the highlighted one, `Esc` cancels. Plain control keys work in every terminal, unlike Alt/Ctrl+digit, which terminals such as Tilix and GNOME Terminal keep for themselves. |
 | `Y` / `N` / `A` | In the approval dialog: approve / reject / always approve. |
 
 While the **Shell** tab has the focus, every key except the function keys and
 the agent-tab keys (`Ctrl+T`, `Ctrl+G`) goes
-to the shell (so `Ctrl+C`, `Escape`, `Tab` and arrows work as in a terminal);
+to the shell (so `Ctrl+C`, `Ctrl+F`, `Escape`, `Tab` and arrows work as in a terminal);
 use `F6` or the mouse to leave it.
 
 ### Mouse, copy and paste
@@ -379,6 +389,14 @@ use `F6` or the mouse to leave it.
   and OSC 52 covers terminals that support it (also over SSH and in tmux).
   Mouse pastes read the desktop clipboard the same way, falling back to
   AI-Commander's own clipboard.
+- **Click** a `▸`/`▾` line to fold or unfold it (thinking, long command
+  output). **Ctrl+click** a URL (shown underlined) to open it in the browser,
+  or an existing file path (`path` or `path:line`, relative to the working
+  directory) to open it: in VS Code at that line when running in VS Code's
+  terminal, otherwise with the desktop's default application. Terminals that
+  handle `Ctrl+click` themselves may open the link first.
+- **Drag** the bar between the panes to resize them; double-click it to split
+  them evenly.
 - The mouse wheel scrolls every pane, including the shell's scrollback
   (`Shift+PgUp` / `Shift+PgDn` too). Start with `--no-mouse` to leave the
   mouse entirely to your terminal.

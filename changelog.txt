@@ -1,6 +1,25 @@
 AI-Commander changelog
 ======================
 
+2.3.0
+-----
+
+- Resizable panels: drag the bar between the agent and console panels;
+  double-click it to split them evenly again.
+- Ctrl+F finds text in the agent log, or the console when it has the focus:
+  incremental, Enter/Up for the previous match, Down for the next, Esc
+  closes. Matches inside folded text unfold it.
+- Folding: thinking collapses to "▸ ✻ thinking · N lines" when it ends, and
+  command output longer than 20 lines collapses in the console once the
+  command completes. A click on a ▸/▾ line folds or unfolds it.
+- Ctrl+click opens URLs (underlined) in the browser, and existing file paths
+  (path:line) in VS Code when running in its terminal, or the default app.
+- Short animations (under 200 ms, only on your actions or to ask for
+  attention): folds roll in and out, a Ctrl+F match scrolls into view, the
+  divider glides back on double-click, and a background tab waiting for
+  approval pulses.
+- Fix: the status-line timer could crash the TUI while it was shutting down.
+
 2.2.0
 -----
 
