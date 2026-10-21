@@ -3128,6 +3128,24 @@ if _TEXTUAL_AVAILABLE:
             self.text = text
             self.move_cursor(self.document.end)
 
+        def undo(self) -> None:
+            self._safe_history(super().undo)
+
+        def redo(self) -> None:
+            self._safe_history(super().redo)
+
+        def _safe_history(self, op) -> None:
+            # Textual 8.2.x reads the cursor partway through an undo/redo, before
+            # the edit restores it; when the edit shrinks the document (e.g.
+            # undoing a multi-line paste) the stale cursor is out of bounds and
+            # crashes. Parking it at the start keeps it valid throughout.
+            self.move_cursor((0, 0))
+            try:
+                op()
+            except ValueError:
+                self.history.clear()
+                self.move_cursor(self.document.end)
+
         def paste_text(self, text: str) -> None:
             result = self.replace(text, *self.selection)
             self.move_cursor(result.end_location)

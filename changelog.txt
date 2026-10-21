@@ -1,6 +1,13 @@
 AI-Commander changelog
 ======================
 
+Unreleased
+----------
+
+- Fix: undoing (Ctrl+Z) a multi-line paste in the prompt no longer crashes
+  the TUI (a Textual bug read the cursor mid-undo, before the edit restored
+  it, leaving it out of bounds once the paste was removed).
+
 2.3.1
 -----
 
