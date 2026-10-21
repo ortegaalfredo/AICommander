@@ -319,7 +319,11 @@ The default Textual interface is a Norton-Commander-style split screen:
   re-wrapped when the terminal is resized), its thinking in dim italics
   (folded to `▸ ✻ thinking · N lines` once it ends; click to unfold), each
   command it runs (`$ command`) with an exit/duration summary, and status
-  messages. The pane title shows an LLM-generated summary of the task.
+  messages. The pane title shows an LLM-generated summary of the task, and its
+  bottom border the agent's task list (from its `todo` tool): progress and the
+  current item, e.g. `☑ 2/5 · ▸ Run the tests`. Each update of the list is a
+  single folded `▸ todo · 2/5 done` line in the pane (click to unfold);
+  `/todo` prints the whole list.
 - **Right pane — Console / Shell** of the current agent tab: two tabs (click
   them or press `F3`; each agent tab remembers its choice).
   *Console* shows every command the agent runs with its live output and exit
@@ -355,6 +359,7 @@ controls, so they are **not** added to prompt history:
 | `/session` | — | Show the session file, session id, instance number, and what is currently saved on disk. |
 | `/reload` | — | Re-read the session file, picking up edits made to its `messages` array outside AI-Commander (requires a stopped agent). |
 | `/copy` | — | Copy the agent's last answer to the clipboard. |
+| `/todo` | — | Print the agent's task list (its progress is always in the agent pane's bottom border). |
 | `/loop [file]` | — | Start a [ralph loop](#ralph-loop-mode) over a prompt file (default `PROMPT.md`), up to `--max-iterations`. |
 | `/stop` | — | Stop the running agent (same as `F9`). |
 | `/newtab` | — | Open a new agent tab (same as `Ctrl+T`). |

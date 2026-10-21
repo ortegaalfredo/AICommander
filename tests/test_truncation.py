@@ -1929,6 +1929,64 @@ class TestRunner:
     # 5. Live integration tests (network)                                #
     # ------------------------------------------------------------------ #
 
+    def test_tui_todo(self):
+        """The task list in the TUI: the agent panel's bottom border, one folded
+        log line per update, /todo, history replay and /clear."""
+        if not aic._TEXTUAL_AVAILABLE:
+            self.check("tui todo: skipped (textual missing)", True)
+            return
+        import asyncio
+        import time
+        from textual.markup import to_content
+        args = argparse.Namespace(
+            api_base="http://localhost:1/v1", model="test-model", api_key="test-key", auto_approve=False,
+            no_thinking=False, timeout=30, max_prompt_len=80000, max_output_bytes=10240, max_steps=10,
+            debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
+            request=[], session_file="", instance_number=1, session_msg="[SESSION] off",
+            sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd(),
+            loop="", max_iterations=10, verify="", confirm_reads=False)
+        items = [{"text": "one", "status": "done"}, {"text": "fix [b]two[/b]", "status": "in_progress"},
+                 {"text": "three", "status": "pending"}]
+        script = [self._call("todo", {"items": items}), self._done()]
+
+        async def scenario():
+            app = aic.CommanderApp(args, aic.PromptHistory(None))
+            results = {}
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause(0.2)
+                app.agent.client = fake_openai.FakeOpenAIClient(script)
+                app.agent.task_summary_enabled = False
+                await pilot.press(*"plan", "enter")
+                end = time.monotonic() + 10
+                while app._agent_busy() and time.monotonic() < end:
+                    await pilot.pause(0.05)
+                await pilot.pause(0.2)
+                subtitle = to_content(app.agent_log.border_subtitle or "").plain
+                results["border shows progress and the current item"] = subtitle == "☑ 1/3 · ▸ fix [b]two[/b]"
+                log = app.agent_log.plain_text
+                results["one folded log line"] = "▸ todo · 1/3 done · 3 lines" in log and "exit 0" not in log
+                await pilot.press(*"/todo", "enter")
+                await pilot.pause(0.2)
+                results["/todo prints the list"] = "[>] fix [b]two[/b]" in app.agent_log.plain_text
+                app.agent_log.clear()
+                app.console_log.clear()
+                app.tab.render_history()
+                results["replay folds it again"] = ("▸ todo · 1/3 done" in app.agent_log.plain_text
+                                                    and "Task list updated" not in app.console_log.plain_text)
+                await pilot.press(*"/clear", "enter")
+                await pilot.pause(0.5)
+                results["/clear empties the border"] = not app.agent_log.border_subtitle
+            return results
+
+        native = aic.clipboard_write_native, aic.clipboard_read_native
+        aic.clipboard_write_native, aic.clipboard_read_native = (lambda text: False), (lambda: None)
+        try:
+            results = asyncio.run(scenario())
+        finally:
+            aic.clipboard_write_native, aic.clipboard_read_native = native
+        for name, ok in results.items():
+            self.check(f"tui todo: {name}", ok, repr(results) if not ok else "")
+
     def test_live_call_llm(self):
         c = self.make_commander()
         msgs = [
@@ -2168,8 +2226,8 @@ class TestRunner:
         self.check("todo: saved in the session", c.session_snapshot()["todos"] == c.todos)
         r = c._todo({"items": json.dumps([{"text": "x", "status": "done"}])})
         self.check("todo: a list sent as JSON text is accepted", c.todos == [{"text": "x", "status": "done"}], r)
-        c._set_todos([{"text": "a", "status": "completed"}, {"text": "b", "status": "In-Progress"},
-                      {"text": "c", "status": ["odd"]}])
+        c.todos = AICommander.normalize_todos([{"text": "a", "status": "completed"},
+                                               {"text": "b", "status": "In-Progress"}, {"text": "c", "status": ["odd"]}])
         self.check("todo: status spellings normalized", [t["status"] for t in c.todos]
                    == ["done", "in_progress", "pending"], repr(c.todos))
         c.cwd = "/"
@@ -2416,6 +2474,7 @@ def main():
     runner.test_x11_clipboard()
     runner.test_tui_end_to_end()
     runner.test_tui_tabs()
+    runner.test_tui_todo()
     runner.test_completion_marker()
     runner.test_file_tools()
     runner.test_verify_gate()

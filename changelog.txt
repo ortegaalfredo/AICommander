@@ -1,6 +1,14 @@
 AI-Commander changelog
 ======================
 
+2.4.1
+-----
+
+- The TUI shows the agent's task list: its progress and current item in the
+  agent pane's bottom border, and each update as one folded "▸ todo · 2/5
+  done" line in the pane (it used to take two lines there plus a console
+  entry). /todo prints the whole list; --nogui prints each update.
+
 2.4.0
 -----
 

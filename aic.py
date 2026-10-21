@@ -8,7 +8,7 @@ plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 import argparse
 import asyncio
@@ -67,6 +67,7 @@ try:  # optional: the TUI (--nogui runs without it)
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.geometry import Offset, Size
+    from textual.markup import escape as escape_markup
     from textual.message import Message
     from textual.screen import ModalScreen
     from textual.scroll_view import ScrollView
@@ -700,7 +701,7 @@ class EventSink:
     Event kinds: LOG, ERROR, USER_REQUEST, LLM_STREAM, THINKING_STREAM,
     CONSOLE_STREAM (internal calls such as the summarizer), CMD_EXEC,
     CMD_OUTPUT, CMD_COMPLETE, APPROVAL_REQUEST, STATUS_UPDATE, TOKEN_USAGE,
-    TASK_TITLE, SYSTEM and SHUTDOWN.
+    TASK_TITLE, TODO (the task list: items), SYSTEM and SHUTDOWN.
     """
 
     def emit(self, kind: str, payload: dict):
@@ -771,6 +772,12 @@ class ConsoleSink(EventSink):
                 self._line(f"{prefix}{payload.get('command', '')}", colors.BOLD + colors.YELLOW)
             elif kind == "CMD_COMPLETE":
                 self._line(f"[exit {payload.get('exit_code')}]", colors.BOLD)
+            elif kind == "TODO" and payload.get("items"):
+                items = payload["items"]
+                self._line(f"todo · {sum(t['status'] == 'done' for t in items)}/{len(items)} done",
+                           colors.BOLD + colors.YELLOW)
+                for t in items:
+                    self._line(f"  {AICommander._TODO_MARKS[t['status']]} {t['text']}")
             elif kind == "SYSTEM":
                 self._line(f"[AI-COMMANDER STARTED] model={payload.get('model')} "
                            f"api={payload.get('api_base')}", colors.BOLD + colors.BLUE)
@@ -1219,8 +1226,7 @@ class AICommander:
         self.task_summary = data.get("task_summary") or ""
         if isinstance(data.get("cwd"), str) and os.path.isdir(data["cwd"]):
             self.cwd = data["cwd"]
-        if isinstance(data.get("todos"), list):
-            self._set_todos(data["todos"])
+        self.todos = self.normalize_todos(data.get("todos")) or []
         if notify:
             self._log(f"[SESSION] Restored {len(restored)} message(s) from {os.path.basename(self.session_file)} "
                       f"(session {self.session_id}, step {self.step_count})", style="green")
@@ -2476,36 +2482,38 @@ Rules:
                 f"available tools. Remember: you must keep going until the task is fully finished, then call "
                 f"task_complete.")
 
-    def _set_todos(self, items: list) -> None:
-        self.todos = []
+    @classmethod
+    def normalize_todos(cls, items: Any) -> list[dict[str, str]] | None:
+        """Task-list items as a model sends them (a list, or a list as JSON text)
+        as [{"text", "status"}]; None when they are not a list."""
+        if isinstance(items, str):
+            with contextlib.suppress(json.JSONDecodeError):
+                items = json.loads(items)
+        if not isinstance(items, list):
+            return None
+        todos = []
         for item in items:
             item = item if isinstance(item, dict) else {"text": item}
             text = " ".join(str(item.get("text") or "").split())
             if text:
                 status = str(item.get("status") or "").lower().replace("-", "_").replace(" ", "_")
                 status = {"completed": "done", "complete": "done", "active": "in_progress"}.get(status, status)
-                self.todos.append({"text": text, "status": status if status in self._TODO_MARKS else "pending"})
+                todos.append({"text": text, "status": status if status in cls._TODO_MARKS else "pending"})
+        return todos
 
     def _todo_text(self) -> str:
         return "\n".join(f"{self._TODO_MARKS[t['status']]} {t['text']}" for t in self.todos) or "(empty)"
 
     def _todo(self, args: Any) -> str:
         """The todo tool: replace the task list and show it."""
-        items = args.get("items") if isinstance(args, dict) else None
-        if isinstance(items, str):  # models send the list as JSON text, too
-            with contextlib.suppress(json.JSONDecodeError):
-                items = json.loads(items)
-        if not isinstance(items, list):
+        todos = self.normalize_todos(args.get("items") if isinstance(args, dict) else None)
+        if todos is None:
             return ("ERROR: todo needs 'items': the complete task list, as objects with 'text' and 'status' "
                     "(pending, in_progress or done).")
-        self._set_todos(items)
+        self.todos = todos
+        self.sink.emit("TODO", {"items": [dict(t) for t in self.todos]})
         done = sum(t["status"] == "done" for t in self.todos)
-        summary, text = f"todo ({done}/{len(self.todos)} done)", self._todo_text()
-        self._command_started = time.monotonic()
-        self.sink.emit("CMD_EXEC", {"command": summary, "function_name": "todo"})
-        self.sink.emit("CMD_OUTPUT", {"text": text + "\n", "command": summary})
-        self.sink.emit("CMD_COMPLETE", {"command": summary, "exit_code": 0, "output": text, "duration": 0.0})
-        return f"Task list updated ({done}/{len(self.todos)} done):\n{text}"
+        return f"Task list updated ({done}/{len(self.todos)} done):\n{self._todo_text()}"
 
     @staticmethod
     def finish_summary(msg: dict) -> str:
@@ -2706,6 +2714,8 @@ Rules:
             self.conversation_history.append(request)
         else:
             self.conversation_history = [{"role": "system", "content": self.get_system_prompt()}, request]
+            if self.todos:
+                self.sink.emit("TODO", {"items": []})
             self.todos, self.cwd = [], self.start_cwd
         self._current_request = request
         self.save_session("user_request")  # the request survives even if the first call dies
@@ -2873,7 +2883,7 @@ if _TEXTUAL_AVAILABLE:
     _URL_RE = re.compile(r"https?://[^\s<>\"'`)\]]+")
     _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _SLASH_COMMANDS = ("/help", "/autoapprove", "/aa", "/approve", "/reject", "/suggest ", "/clear", "/new",
-                       "/session", "/reload", "/copy", "/loop ", "/stop", "/newtab", "/closetab", "/tab ",
+                       "/session", "/reload", "/copy", "/todo", "/loop ", "/stop", "/newtab", "/closetab", "/tab ",
                        "/quit", "/exit")
     # Palette (Norton Commander blues).
     _C_USER, _C_ANSWER, _C_THINK = "bold #ffff5f", "#87d7ff", "italic #b2b28a"
@@ -4184,7 +4194,8 @@ if _TEXTUAL_AVAILABLE:
         ("Panes", "F3 switches Console ⇄ Shell · F6 or Tab moves to the next pane · F7 zooms the focused pane "
                   "(Esc restores) · in the Shell every key goes to the shell: leave it with F6 or the mouse"),
         ("Quit", "F10 · Ctrl+Q · Ctrl+C twice while idle"),
-        ("Commands", "/help  /aa (/autoapprove)  /clear (/new)  /session  /reload  /copy  /stop  /quit (/exit)  "
+        ("Commands", "/help  /aa (/autoapprove)  /clear (/new)  /session  /reload  /copy  /todo  /stop  "
+                     "/quit (/exit)  "
                      "·  /loop [file] runs a ralph loop over a prompt file (default PROMPT.md)  "
                      "·  /newtab  /closetab  /tab N  "
                      "·  /approve  /reject  /suggest <text> answer a pending approval"),
@@ -4326,6 +4337,16 @@ if _TEXTUAL_AVAILABLE:
                         if line:
                             log.write_line(line, _C_ANSWER)
                     for tc in msg.get("tool_calls") or []:
+                        fn = tc.get("function") or {}
+                        if fn.get("name") == "todo":  # the folded list, as when it ran
+                            raw = fn.get("arguments")
+                            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                                raw = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+                            todos = AICommander.normalize_todos(raw.get("items") if isinstance(raw, dict) else None)
+                            if todos:
+                                self.write_todos(todos)
+                            commands[tc.get("id")] = ""  # its result needs no console fold
+                            continue
                         command = _tool_command(tc)
                         if command:
                             if command.partition(" ")[0] not in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS:
@@ -4334,6 +4355,8 @@ if _TEXTUAL_AVAILABLE:
                             log.write_line(command, _C_CMD)
                 elif role == "tool":
                     command = commands.pop(msg.get("tool_call_id"), None)
+                    if command == "":
+                        continue
                     console.begin_fold(command or "tool result", _C_CMD, rule=True)
                     match = re.match(r"Command executed with exit code (-?\d+)\.\nOutput:\n?(.*)\Z", text, re.S)
                     output = match.group(2) if match else text
@@ -4343,9 +4366,31 @@ if _TEXTUAL_AVAILABLE:
                         ok = match.group(1) == "0"
                         console.write_line(f"{'✓' if ok else '✗'} exit {match.group(1)}", f"bold {_C_OK if ok else _C_FAIL}")
             log.write_rule("restored session", _C_DIM)
+            self.show_todos(self.agent.todos)
 
         def set_title(self, summary: str) -> None:
             self.agent_log.border_title = f"Agent · {summary}" if summary else "Agent"
+
+        def show_todos(self, todos: list) -> None:
+            """The task list's progress and current item, in the agent panel's bottom border."""
+            done = sum(t["status"] == "done" for t in todos)
+            current = next((t["text"] for t in todos if t["status"] == "in_progress"),
+                           next((t["text"] for t in todos if t["status"] == "pending"), ""))
+            current = current if len(current) <= 60 else current[:59] + "…"
+            self.agent_log.border_subtitle = (escape_markup(f"☑ {done}/{len(todos)} · "
+                                                            + (f"▸ {current}" if current else "all done"))
+                                              if todos else "")
+
+        def write_todos(self, todos: list, fold: bool = True) -> None:
+            """The list in the agent log; folded, it is one line (▸ todo · 2/5 done) a click unfolds."""
+            log = self.agent_log
+            title = f"todo · {sum(t['status'] == 'done' for t in todos)}/{len(todos)} done"
+            log.begin_fold(title, _C_CMD) if fold else log.write_line(title, _C_CMD)
+            for t in todos:
+                log.write_line(f"  {AICommander._TODO_MARKS[t['status']]} {t['text']}",
+                               {"done": _C_DIM, "in_progress": f"bold {_C_ANSWER}"}.get(t["status"], "#c8d0e0"))
+            if fold:
+                log.end_fold()
 
         # Agent lifecycle --------------------------------------------------------
 
@@ -4493,6 +4538,10 @@ if _TEXTUAL_AVAILABLE:
             elif kind == "USER_REQUEST":
                 log.write_rule(f"You · {datetime.now().strftime('%H:%M:%S')}", _C_DIM)
                 log.write_line(text, _C_USER)
+            elif kind == "TODO":
+                self.show_todos(p.get("items") or [])
+                if p.get("items"):
+                    self.write_todos(p["items"])
             elif kind == "CMD_EXEC":
                 self.current_command, self._cmd_started = p.get("command", ""), time.monotonic()
                 label = ("" if p.get("function_name") in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS
@@ -4573,7 +4622,7 @@ if _TEXTUAL_AVAILABLE:
         OutputLog, ShellWidget { border: solid #6f8fc0; height: 1fr; }
         OutputLog:focus, ShellWidget:focus { border: double #87d7ff; }
         OutputLog { background: #12488b; color: #e5e5e5; }
-        .agent-log { border-title-color: #ffff5f; border-title-style: bold; }
+        .agent-log { border-title-color: #ffff5f; border-title-style: bold; border-subtitle-color: #87d7ff; }
         #left-panel, #right-panel { width: 1fr; }
         #agent-tabs, #tabs { height: 1; background: #0b2f5e; }
         #agent-stack, #switcher { height: 1fr; }
@@ -4948,7 +4997,7 @@ if _TEXTUAL_AVAILABLE:
                 "/help": self.action_help, "/autoapprove": self.action_toggle_auto, "/aa": self.action_toggle_auto,
                 "/clear": self._clear_conversation, "/new": self._clear_conversation,
                 "/session": self._report_session, "/reload": self._reload_session,
-                "/copy": lambda: self._copy_answer(), "/stop": self.action_stop,
+                "/copy": lambda: self._copy_answer(), "/todo": self._report_todos, "/stop": self.action_stop,
                 "/loop": lambda: self.tab.start_loop(arg or "PROMPT.md"),
                 "/newtab": lambda: self.call_later(self.action_new_tab), "/closetab": self.action_close_tab,
                 "/tab": lambda: self.action_select_tab(int(arg)) if arg.isdigit() else self.agent_log.write_line(
@@ -4962,6 +5011,12 @@ if _TEXTUAL_AVAILABLE:
             else:
                 self.agent_log.write_line(f"Unknown command {command}. Available: "
                                           + " ".join(c.strip() for c in _SLASH_COMMANDS), _C_FAIL)
+
+        def _report_todos(self) -> None:
+            if self.tab.agent.todos:
+                self.tab.write_todos(list(self.tab.agent.todos), fold=False)
+            else:
+                self.agent_log.write_line("No task list yet: the agent keeps one with its todo tool.", _C_DIM)
 
         def _answer_approval(self, verdict: str, suggestion: str = "") -> None:
             if self._approval_screen is None:
@@ -4979,6 +5034,7 @@ if _TEXTUAL_AVAILABLE:
                 tab.console_log.clear()
                 tab.step, tab.total_tokens, tab.tok_rate = 0, 0, 0.0
                 tab.set_title("")
+                tab.show_todos([])
                 tab.agent_log.write_line("New conversation started. Ready for your next prompt.", _C_OK)
             tab.stop()
             tab.when_idle(clear)
