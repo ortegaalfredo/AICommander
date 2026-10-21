@@ -1,6 +1,14 @@
 AI-Commander changelog
 ======================
 
+2.3.1
+-----
+
+- Every tool's output now folds in the console once the command completes,
+  not only output longer than 20 lines.
+- The session summary folds under its "Session Summary" header too,
+  including the summarizer's reasoning, which used to stream without it.
+
 2.3.0
 -----
 

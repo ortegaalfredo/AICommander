@@ -8,7 +8,7 @@ plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 import argparse
 import asyncio
@@ -2127,8 +2127,11 @@ Rules:
                 if reasoning:
                     first_token = first_token or time.monotonic()
                     thinking.append(reasoning)
-                    if show_thinking and not silent:
-                        self.sink.emit("THINKING_STREAM" if stream_display else "CONSOLE_STREAM", {"text": reasoning})
+                    if show_thinking and not silent and stream_display:
+                        self.sink.emit("THINKING_STREAM", {"text": reasoning})
+                    elif show_thinking and not silent:
+                        self.sink.emit("CONSOLE_STREAM", {"text": reasoning, **({"label": label} if label else {})})
+                        label = None
                 if delta.content:
                     first_token = first_token or time.monotonic()
                     content.append(delta.content)
@@ -2548,7 +2551,6 @@ if _TEXTUAL_AVAILABLE:
     _NEWLINE_RE = re.compile(r"(\r\n|\n|\r)")
     _WORD_CHARS = re.compile(r"[\w\-./~:@%+=?&#,]")
     _URL_RE = re.compile(r"https?://[^\s<>\"'`)\]]+")
-    _FOLD_OUTPUT = 20  # longer command output is folded in the console once it completes
     _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _SLASH_COMMANDS = ("/help", "/autoapprove", "/aa", "/approve", "/reject", "/suggest ", "/clear", "/new",
                        "/session", "/reload", "/copy", "/loop ", "/stop", "/newtab", "/closetab", "/tab ",
@@ -2660,7 +2662,6 @@ if _TEXTUAL_AVAILABLE:
             self._cache: dict[int, Strip] = {}
             self._cr = False  # a '\r' ended the last chunk: decided by what follows
             self._fold: _Line | None = None  # header of the fold new lines join
-            self._fold_min = 0  # the fold collapses when it ends with more lines than this
             self._down_at = None  # where the left button went down (a click is not a drag)
             self._anim = None  # (timer, frame) of a fold rolling in or out
 
@@ -2702,12 +2703,12 @@ if _TEXTUAL_AVAILABLE:
             self._newline()
             self._settle(follow)
 
-        def begin_fold(self, title: str, style="", fold_over: int = 0, rule: bool = False) -> None:
+        def begin_fold(self, title: str, style="", rule: bool = False) -> None:
             """Start a fold headed by *title*: the lines written until end_fold()
-            are hidden behind it if there are more than *fold_over*."""
+            are hidden behind it (if there are any)."""
             self.end_fold()
             self.write_rule(title, style) if rule else self.write_line(title, style)
-            self._fold, self._fold_min = self._lines[-2], fold_over
+            self._fold = self._lines[-2]
             self._lines[-1].owner = self._fold
 
         def end_fold(self) -> None:
@@ -2719,7 +2720,7 @@ if _TEXTUAL_AVAILABLE:
             count = 0
             while count + 2 <= len(self._lines) and self._lines[-2 - count].owner is head:
                 count += 1
-            if count > self._fold_min:  # retitle the header, then roll the fold up
+            if count:  # retitle the header, then roll the fold up
                 head.plain = f"▾ {head.plain} · {count} line{'s' * (count != 1)}"
                 head.runs, head.folded = [(len(head.plain), head.runs[0][1] if head.runs else "")], False
                 hi = len(self._lines) - 2 - count
@@ -3824,7 +3825,7 @@ if _TEXTUAL_AVAILABLE:
                   "right-click copies the selection, or pastes · middle-click pastes · the wheel scrolls · "
                   "drag the bar between the panels to resize them, double-click it to even them · "
                   "Ctrl+click opens a URL or file path · a click on a ▸/▾ line folds or unfolds it "
-                  "(thinking and long command output start folded)"),
+                  "(thinking, command output and session summaries fold when they end)"),
         ("Find", "Ctrl+F searches the agent log, or the console when it has the focus · Enter or ↑ goes to "
                  "the previous match, ↓ the next · Esc closes"),
         ("Clipboard", "Ctrl+C copies the selection · Ctrl+V pastes in the prompt · F4 copies the selection or the "
@@ -3988,7 +3989,7 @@ if _TEXTUAL_AVAILABLE:
                             log.write_line(command, _C_CMD)
                 elif role == "tool":
                     command = commands.pop(msg.get("tool_call_id"), None)
-                    console.begin_fold(command or "tool result", _C_CMD, _FOLD_OUTPUT, rule=True)
+                    console.begin_fold(command or "tool result", _C_CMD, rule=True)
                     match = re.match(r"Command executed with exit code (-?\d+)\.\nOutput:\n?(.*)\Z", text, re.S)
                     output = match.group(2) if match else text
                     console.write_line(output[:4000] + ("\n… (truncated)" if len(output) > 4000 else ""), "#d0d0d0")
@@ -4113,8 +4114,8 @@ if _TEXTUAL_AVAILABLE:
             elif kind == "CMD_OUTPUT":
                 self.console_log.write(text, "#d0d0d0")
             elif kind == "CONSOLE_STREAM":
-                if p.get("label") and not self._console_stream:
-                    self.console_log.write_rule(p["label"].strip("[]").title(), "#ffd75f")
+                if p.get("label"):
+                    self.console_log.begin_fold(p["label"].strip("[]").title(), "#ffd75f", rule=True)
                 self._console_stream = True
                 self.console_log.write(text, "#ffd75f")
             elif kind == "STATUS_UPDATE":
@@ -4151,7 +4152,7 @@ if _TEXTUAL_AVAILABLE:
                 self.current_command, self._cmd_started = p.get("command", ""), time.monotonic()
                 label = ("" if p.get("function_name") in AICommander.FILE_TOOLS else "$ ") + self.current_command
                 log.write_line(label, _C_CMD)
-                console.begin_fold(label, _C_CMD, _FOLD_OUTPUT, rule=True)
+                console.begin_fold(label, _C_CMD, rule=True)
                 self.set_phase("running")
             elif kind == "APPROVAL_REQUEST":
                 self.set_phase("approval")
@@ -4207,6 +4208,7 @@ if _TEXTUAL_AVAILABLE:
                 self.agent_log.close_line()
                 self._agent_stream = None
             if self._console_stream:
+                self.console_log.end_fold()
                 self.console_log.close_line()
                 self._console_stream = False
 

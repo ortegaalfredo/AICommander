@@ -88,7 +88,7 @@ It supports two presentation modes:
   automatically, re-joining soft-wrapped lines), double-click a word,
   triple-click a line, right/middle-click to paste.
 - **Find, folding and links** — `Ctrl+F` searches the agent log or console;
-  thinking and long command output fold to one clickable line; `Ctrl+click`
+  thinking, command output and session summaries fold to one clickable line; `Ctrl+click`
   opens URLs and file paths.
 - **Multi-line prompt with history** — Enter sends, Ctrl+J/Shift+Enter adds a
   line, Up/Down and Ctrl+R search persistent history; multi-line pastes stay
@@ -300,8 +300,9 @@ The default Textual interface is a Norton-Commander-style split screen:
 - **Right pane — Console / Shell** of the current agent tab: two tabs (click
   them or press `F3`; each agent tab remembers its choice).
   *Console* shows every command the agent runs with its live output and exit
-  code; output longer than 20 lines folds to its `▸ $ command · N lines`
-  header once the command completes (click to unfold). *Shell* is an embedded, colored interactive shell with scrollback. It
+  code; the output folds to its `▸ $ command · N lines` header once the
+  command completes, and so does a session summary (click to unfold).
+  *Shell* is an embedded, colored interactive shell with scrollback. It
   is independent of the agent: a `cd` there never changes the directory the
   agent works in, which stays the one AI-Commander was started in.
 - **Divider**: the bar between the two panes can be dragged to resize them;
@@ -389,8 +390,8 @@ use `F6` or the mouse to leave it.
   and OSC 52 covers terminals that support it (also over SSH and in tmux).
   Mouse pastes read the desktop clipboard the same way, falling back to
   AI-Commander's own clipboard.
-- **Click** a `▸`/`▾` line to fold or unfold it (thinking, long command
-  output). **Ctrl+click** a URL (shown underlined) to open it in the browser,
+- **Click** a `▸`/`▾` line to fold or unfold it (thinking, command output,
+  session summaries). **Ctrl+click** a URL (shown underlined) to open it in the browser,
   or an existing file path (`path` or `path:line`, relative to the working
   directory) to open it: in VS Code at that line when running in VS Code's
   terminal, otherwise with the desktop's default application. Terminals that
