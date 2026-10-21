@@ -1,9 +1,31 @@
 AI-Commander changelog
 ======================
 
-Unreleased
-----------
+2.4.0
+-----
 
+- Commands run in bash (dash, the usual /bin/sh, lacks [[ ]], arrays and
+  pipefail), falling back to /bin/sh when bash is missing.
+- The working directory carries over between commands: a `cd` persists, the
+  model is told when it changed, the file tools resolve relative paths
+  against it, and it is saved in the session. --verify still runs where
+  AI-Commander was started.
+- Long command output keeps its start and its end (the last 70%, where
+  errors and test summaries are) instead of only the start, and the full
+  output is saved to a temporary file named in the cut marker. Commands are
+  killed at 1 MiB of output (was 5x --max-output-bytes), with a note saying so.
+- Read-only commands (ls, cat, grep, find, git status/diff/log, ...) and
+  read_file run without approval; --confirm-reads asks for everything again.
+- New todo tool: the model's task list, shown back to it after the context is
+  compacted and saved in the session (replaces "restate your plan every ~5
+  steps").
+- New task_complete(summary) tool ends a task instead of the TASKCOMPLETE
+  text marker (still accepted). It is refused alongside other tool calls, and
+  --verify gates it; in --loop mode, objective_complete replaces LOOPCOMPLETE.
+- execute_bash takes background: true for servers, watchers and long builds:
+  it returns at once with a log file, and the job's exit code and last lines
+  are reported at the next step. Jobs are killed when AI-Commander exits.
+- The system prompt no longer claims unlimited thinking tokens.
 - Fix: undoing (Ctrl+Z) a multi-line paste in the prompt no longer crashes
   the TUI (a Textual bug read the cursor mid-undo, before the edit restored
   it, leaving it out of bounds once the paste was removed).

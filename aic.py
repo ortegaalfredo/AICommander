@@ -8,7 +8,7 @@ plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.3.1"
+__version__ = "2.4.0"
 
 import argparse
 import asyncio
@@ -24,11 +24,13 @@ import os
 import queue
 import re
 import select
+import shlex
 import shutil
 import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -131,6 +133,13 @@ _COMMAND_ENV = {"PAGER": "cat", "GIT_PAGER": "cat", "MANPAGER": "cat",
                 "SYSTEMD_PAGER": "", "HTTP_USER_AGENT": USER_AGENT}
 _SHELL_PRELUDE = ('curl() { command curl -A "$HTTP_USER_AGENT" "$@"; }; '
                   'wget() { command wget --user-agent="$HTTP_USER_AGENT" "$@"; }; ')
+# The tool is execute_bash: /bin/sh is often dash, without [[ ]], arrays or pipefail.
+_POSIX_SHELL = "" if _IS_WINDOWS else (shutil.which("bash") or "/bin/sh")
+_SHELL_NAME = "PowerShell" if _IS_WINDOWS else os.path.basename(_POSIX_SHELL)
+# Records the shell's final directory, so a `cd` carries over to the next command.
+_CWD_TRAP = "trap 'pwd >| \"$AIC_CWD_FILE\"' EXIT; "
+_PS_CWD = ("\nif ($env:AIC_CWD_FILE) { try { [IO.File]::WriteAllText($env:AIC_CWD_FILE, "
+           "(Get-Location).ProviderPath) } catch {} }")
 
 # Windows: PowerShell must speak UTF-8 on the redirected pipe (it would use the
 # OEM code page otherwise), child Pythons too, and the exit code of the last
@@ -144,9 +153,9 @@ _PS_UTF8_PREFIX = (
 _PS_UTF8_SUFFIX = "\nif ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }\n"
 
 
-def _powershell_argv(command: str) -> list:
+def _powershell_argv(command: str, track_cwd: bool = False) -> list:
     """powershell.exe argv for a command; -EncodedCommand passes it verbatim."""
-    script = _PS_UTF8_PREFIX + command + _PS_UTF8_SUFFIX
+    script = _PS_UTF8_PREFIX + command + (_PS_CWD if track_cwd else "") + _PS_UTF8_SUFFIX
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     return ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
 
@@ -234,6 +243,59 @@ def _has_marker(text: str, marker: str) -> bool:
     tag = rf"(?:<promise>\s*)?{re.escape(marker)}(?:\s*</promise>)?"
     return bool(re.search(rf"(?m)^[^\w\n]*{tag}[^\w\n]*$", text) or re.search(rf"(?<!\w){tag}\W*\Z", text))
 
+
+# Commands that only read, run without asking (unless --confirm-reads); extend
+# the list with $AIC_READ_ONLY_COMMANDS. Options that write or run something are denied.
+_READ_ONLY_COMMANDS = frozenset(
+    "ls cat head tail wc grep egrep fgrep rg find pwd cd echo printf stat du df which type tree diff cmp sort "
+    "uniq cut tr nl column jq basename dirname realpath readlink whoami id uname printenv ps od hexdump "
+    "strings md5sum sha1sum sha256sum test [ true false git".split()
+    + os.environ.get("AIC_READ_ONLY_COMMANDS", "").split())
+_READ_ONLY_DENY = {"find": ("-exec", "-ok", "-delete", "-fprint", "-fls"), "sort": ("-o", "--output", "--compress"),
+                   "rg": ("--pre",), "tree": ("-o", "--output"), "git": ("--output", "-O", "--open-files-in-pager", "--ext-diff")}
+_GIT_READ_ONLY = frozenset("status diff log show blame ls-files grep rev-parse describe shortlog branch".split())
+_GIT_BRANCH_LIST = frozenset("-a -r -v -vv --all --list --show-current".split())
+
+
+def _read_only_words(words: list[str]) -> bool:
+    name, args = words[0], words[1:]
+    if name not in _READ_ONLY_COMMANDS:  # so are ./ls and VAR=x ls
+        return False
+    if name == "git" and not (args and args[0] in _GIT_READ_ONLY
+                              and (args[0] != "branch" or set(args[1:]) <= _GIT_BRANCH_LIST)):
+        return False
+    if name == "uniq" and sum(not a.startswith("-") for a in args) > 1:  # uniq IN OUT writes OUT
+        return False
+    deny = _READ_ONLY_DENY.get(name, ())
+    short = "".join(d[1] for d in deny if len(d) == 2)  # -o also hides in -no
+    return not any(a.startswith(deny) or (short and re.match(rf"-[^-]*[{short}]", a)) for a in args)
+
+
+def _is_read_only(command: str) -> bool:
+    """True when every command of *command*'s pipelines and lists only reads:
+    no substitution, no redirection other than to /dev/null, no background
+    job. Anything it cannot tell is not read-only."""
+    if re.search(r"`|\$\(|<\(|>\(", command):
+        return False
+    text = re.sub(r"(?<=\s)(?:\d|&)?>\s*/dev/null(?=\s|$|[;&|])|(?<=\s)\d?>&\d(?=\s|$|[;&|])", " ",
+                  command.replace("\\\n", " ").replace("\n", ";"))
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split, lex.commenters = True, ""  # a '#' mid-word is no comment to the shell
+        tokens = list(lex)
+    except ValueError:
+        return False
+    words: list[str] = []
+    for token in tokens + [";"]:
+        if token in ("|", "||", "&&", ";"):
+            if words and not _read_only_words(words):
+                return False
+            words = []
+        elif token and set(token) <= set("();<>|&"):
+            return False
+        else:
+            words.append(token)
+    return bool(tokens)
 
 # Process exit status per run()/run_loop() outcome (--nogui).
 _EXIT_CODES = {"complete": 0, "loop_complete": 0, "error": 1, "max_steps": 2, "max_iterations": 2, "stopped": 130}
@@ -705,7 +767,7 @@ class ConsoleSink(EventSink):
                 self._line(f"[USER REQUEST] {text}", colors.BOLD + colors.YELLOW)
                 self._line("=" * 60)
             elif kind == "CMD_EXEC":
-                prefix = "" if payload.get("function_name") in AICommander.FILE_TOOLS else "$ "
+                prefix = "" if payload.get("function_name") in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS else "$ "
                 self._line(f"{prefix}{payload.get('command', '')}", colors.BOLD + colors.YELLOW)
             elif kind == "CMD_COMPLETE":
                 self._line(f"[exit {payload.get('exit_code')}]", colors.BOLD)
@@ -836,6 +898,8 @@ class AICommander:
     PROJECT_FILES = ("AGENTS.md", "CLAUDE.md")  # the first one found is added to the system prompt
     MAX_PROJECT_FILE_CHARS = 16000
     FILE_TOOLS = ("read_file", "edit_file", "write_file")
+    AGENT_TOOLS = ("todo", "task_complete")  # handled by the agent itself, never need approval
+    _TODO_MARKS = {"pending": "[ ]", "in_progress": "[>]", "done": "[x]"}
 
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
                  show_thinking: bool = True, command_timeout: int = 120,
@@ -844,11 +908,13 @@ class AICommander:
                  max_steps: int = 500, compress_algorithm: str = "context-compressor-llm",
                  compress_target: float = 0.4, fast: bool = False, reasoning_effort: str | None = None,
                  sandbox_enabled: bool = False, sandbox_write_dir: str = "",
-                 session_file: str = "", instance_number: int = 1, verify_command: str = ""):
+                 session_file: str = "", instance_number: int = 1, verify_command: str = "",
+                 auto_approve_reads: bool = True):
         self.base_url = api_base.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.auto_approve = auto_approve
+        self.auto_approve_reads = auto_approve_reads  # read-only commands and read_file run without asking
         self.show_thinking = show_thinking
         self.command_timeout = command_timeout
         self.max_prompt_len = max_prompt_len
@@ -868,6 +934,12 @@ class AICommander:
         self.instance_number = instance_number
         self.verify_command = verify_command  # must exit 0 before a completion signal is accepted
         self.loop_iteration = 0  # > 0 while run_loop() drives the runs
+        self.start_cwd = _safe_cwd() or os.path.expanduser("~")
+        self.cwd = self.start_cwd  # where the next command starts: follows the last command's `cd`
+        self.todos: list[dict[str, str]] = []  # the model's task list (the todo tool)
+        self.jobs: dict[int, tuple] = {}  # background jobs still to report: n -> (Popen, log path, command)
+        self._job_count = self._output_count = 0
+        self._scratch: str | None = None  # temp dir for the cwd file, saved outputs and job logs
 
         self.conversation_history: list[dict[str, Any]] = []
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -896,8 +968,12 @@ class AICommander:
                 "type": "object", "properties": props, "required": required}}}
         path = {"type": "string", "description": "File path, relative to the working directory or absolute"}
         self.tool_schemas = [
-            tool("execute_bash", "Execute a shell command in the terminal (bash on Linux/macOS, PowerShell on Windows)",
-                 ["command"], command={"type": "string", "description": "The bash command to execute"}),
+            tool("execute_bash", f"Execute a shell command ({_SHELL_NAME}). The working directory carries over "
+                                 f"between calls.", ["command"],
+                 command={"type": "string", "description": "The command to execute"},
+                 background={"type": "boolean", "description": "Run it in the background and return at once "
+                             "(servers, watchers, long builds): its output goes to a log file and you are told "
+                             "when it exits (default false)"}),
             tool("read_file", "Read a text file. Lines come back numbered as 'N<TAB>text'; the number prefix is "
                               "not part of the file. Long files are cut: continue with offset.", ["path"], path=path,
                  offset={"type": "integer", "description": "First line to return, 1-based (default 1)"},
@@ -912,7 +988,22 @@ class AICommander:
             tool("write_file", "Create or overwrite a file with the given content (parent directories are "
                                "created).", ["path", "content"], path=path,
                  content={"type": "string", "description": "The complete new file content, as text (for a JSON file: the JSON text)"}),
+            tool("todo", "Replace your task list: send every item each time, with exactly one in_progress. It "
+                         "is shown back to you after the context is compacted.", ["items"],
+                 items={"type": "array", "items": {"type": "object", "required": ["text", "status"], "properties": {
+                     "text": {"type": "string"},
+                     "status": {"type": "string", "enum": list(self._TODO_MARKS)}}}}),
         ]
+        finish = ("Finish the task, once everything is done and verified. Call it on its own, never alongside "
+                  "other tool calls.")
+        summary = {"type": "string", "description": "A short report for the user: what was done and how it "
+                                                    "was verified"}
+        self.tool_schemas.append(tool("task_complete", finish, ["summary"], summary=summary))
+        self.loop_tool_schemas = self.tool_schemas[:-1] + [tool(  # --loop: is the whole objective done?
+            "task_complete", finish, ["summary", "objective_complete"], summary=summary,
+            objective_complete={"type": "boolean", "description": "True only if the ENTIRE objective of the "
+                                "prompt is complete and verified with nothing left to do; false when this "
+                                "iteration's item is done but work remains"})]
 
     def _log(self, message: str, style: str = ""):
         self.sink.emit("LOG", {"text": message, "style": style})
@@ -985,7 +1076,8 @@ class AICommander:
             "reason": reason,
             "model": self.model,
             "api_base": self.base_url,
-            "cwd": _safe_cwd(),
+            "cwd": self.cwd,
+            "todos": list(self.todos),
             "instance_number": self.instance_number,
             "step_count": self.step_count,
             "usage": dict(self.usage_totals),
@@ -1125,6 +1217,10 @@ class AICommander:
                     self.usage_totals[key] = usage[key]
         self.initial_prompt = data.get("initial_prompt") or ""
         self.task_summary = data.get("task_summary") or ""
+        if isinstance(data.get("cwd"), str) and os.path.isdir(data["cwd"]):
+            self.cwd = data["cwd"]
+        if isinstance(data.get("todos"), list):
+            self._set_todos(data["todos"])
         if notify:
             self._log(f"[SESSION] Restored {len(restored)} message(s) from {os.path.basename(self.session_file)} "
                       f"(session {self.session_id}, step {self.step_count})", style="green")
@@ -1142,7 +1238,7 @@ class AICommander:
     def discard_session(self, reason: str = "discarded"):
         """Forget the conversation (/clear, /new) and overwrite the session file,
         so the next startup does not resurrect it."""
-        self.conversation_history = []
+        self.conversation_history, self.todos, self.cwd = [], [], self.start_cwd
         self.step_count = 0
         self.initial_prompt = self.task_summary = ""
         self.usage_totals = dict.fromkeys(self.usage_totals, 0)
@@ -1201,7 +1297,7 @@ class AICommander:
     def _context_compress(self, force: bool = False):
         """Compress the history when it exceeds the prompt budget, dispatching to
         ``_compress_<algorithm>``. *force* compresses even under budget (used
-        after the server rejected a prompt as too long)."""
+        after the server rejected a prompt as too long). True when it compressed."""
         budget = self._prompt_budget()
         total_tokens = self._estimate_input_tokens(self.conversation_history)
         if force:
@@ -1216,6 +1312,7 @@ class AICommander:
                       f"Falling back to 'truncate'.", style="yellow")
             algorithm = self._compress_truncate
         algorithm(budget, total_tokens)
+        return True
 
     def _compress_truncate(self, budget: int, total_tokens: int):
         """Condense old tool outputs, then drop the oldest unprotected messages,
@@ -1481,22 +1578,22 @@ Remember to not exceed 5000 characters, its very important that the summary to b
                    if self.sandbox_enabled else
                    f"You are running inside an OS-level sandbox (currently disabled). When the sandbox is active, "
                    f"writes are restricted to {self.sandbox_write_dir}, /tmp and /dev.")
-        return f"""You are an expert planning and execution assistant. Fulfill the user's request by breaking it into manageable steps and executing them with your tools, one call at a time, waiting for each result: execute_bash runs shell commands; read_file, edit_file and write_file view and change files (prefer them over cat/sed/heredocs for reading and editing files).
+        return f"""You are an expert planning and execution assistant. Fulfill the user's request by breaking it into manageable steps and executing them with your tools, one call at a time, waiting for each result: execute_bash runs shell commands; read_file, edit_file and write_file view and change files (prefer them over cat/sed/heredocs for reading and editing files); todo keeps your task list; task_complete ends the task.
 
 **Workflow:**
-1. Analyze the request; if complex, break it into a numbered task list.
-2. Restate your plan every ~5 steps and update the task list as you progress.
-3. Execute one step with a tool, then evaluate the result.
-4. If a step fails, adjust your approach and explain. If all steps are done and the goal is met, emit the exact phrase '{self.COMPLETION_MARKER}' on its own line.
-5. Only emit '{self.COMPLETION_MARKER}' once you are certain every necessary action is complete and verified. Never say it prematurely, and do not write it when merely talking about it.{self._verify_note()}
+1. Analyze the request; if complex, break it into steps and track them with the todo tool: keep exactly one item in_progress and mark items done as you finish them. The list is shown back to you after the context is compacted.
+2. Execute one step with a tool, then evaluate the result.
+3. If a step fails, adjust your approach and explain. When all steps are done and the goal is met, call task_complete with a short summary for the user.
+4. Call task_complete only once you are certain every necessary action is complete and verified, and on its own, never alongside other tool calls.{self._verify_note()}
 
 **Working Directory:**
 - Create a working directory named after the task (e.g. `work/<short-task-slug>/`, under the current directory or /tmp — wherever writes are allowed) and keep ALL temporary files there: scripts, patches, downloads, test output, generated artifacts. Never scatter temporary files in the project root; only the task's real deliverables belong outside the working directory.
 
 **Runtime Constraints (execute_bash):**
-- Output is capped at {self.max_output_bytes} bytes. If truncated, the literal sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}` is appended. If you see it, you are missing data — do NOT assume success or failure. Re-run with output redirected to a file and read in chunks via `sed -n 'start,end p' file`, or use `head -c N`/`tail -c N`. Prefer targeted commands (grep, wc, stat) over dumping large outputs.
-- Commands are killed after {self.command_timeout}s. For long operations use `nohup ... &` and check later, split into smaller steps, or set your own `timeout`.
-- Commands run in a PTY (a plain pipe on Windows); use non-interactive flags (`-y`, `--no-interactive`) where available. Pagers are disabled (PAGER=cat).
+- Commands run in {_SHELL_NAME} on a PTY (a plain pipe on Windows); use non-interactive flags (`-y`, `--no-interactive`) where available. Pagers are disabled (PAGER=cat).
+- The working directory carries over between execute_bash calls: a `cd` persists, but shell variables, `export`s and functions do not. Relative paths in the file tools resolve against it too.
+- Output is capped at {self.max_output_bytes} bytes. Longer output keeps its start and its end: the middle is cut, the cut marker names a file holding the full output, and the literal sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}` is appended. If you see it, you are missing data — do NOT assume success or failure: grep or `sed -n 'start,end p'` the saved file instead of re-running the command. Prefer targeted commands (grep, wc, stat) over dumping large outputs.
+- Commands are killed after {self.command_timeout}s. For servers, watchers and long builds, call execute_bash with background=true: it returns at once with a log file to read, and you are told when the job exits. Otherwise split the work into smaller steps or set your own `timeout`.
 - {sandbox}
 
 **Command Results:**
@@ -1511,25 +1608,26 @@ Remember to not exceed 5000 characters, its very important that the summary to b
 - Keep working until the task is genuinely complete. Do NOT stop early or produce a summary-only final response — take concrete action with tools.
 - If you respond without calling tools, the system injects a continuation prompt; you must keep making progress.
 - Troubleshoot errors and try alternative approaches until the objective is met.
-- The ONLY way to finish is to emit '{self.COMPLETION_MARKER}' AFTER verifying all objectives via actual command execution and result inspection. Partial completion is not completion.
+- The ONLY way to finish is the task_complete tool, called AFTER verifying all objectives via actual command execution and result inspection. Partial completion is not completion.
 - Do not ask the user for clarification unless you have exhausted autonomous options.
-- Before emitting '{self.COMPLETION_MARKER}', verify your last actions (check file contents, run tests, confirm services).{self._loop_note()}
+- Before calling task_complete, verify your last actions (check file contents, run tests, confirm services).{self._loop_note()}
 
-Think carefully; response quality is the highest priority. You have unlimited thinking tokens.{self._project_instructions()}"""
+Think carefully; response quality is the highest priority.{self._project_instructions()}"""
 
     def get_fast_system_prompt(self) -> str:
         """A smaller, faster system prompt for --fast mode."""
-        return f"""You are an expert bash assistant. Complete the user's task with your tools, one call at a time, acting on each result: execute_bash for commands; read_file, edit_file and write_file for files.
+        return f"""You are an expert bash assistant. Complete the user's task with your tools, one call at a time, acting on each result: execute_bash for commands; read_file, edit_file and write_file for files; todo for your task list.
 
 Workflow:
-- Break complex tasks into steps and track them.
+- Break complex tasks into steps and track them with the todo tool.
 - If a step fails, fix it and retry.
-- When the task is fully done and verified, emit '{self.COMPLETION_MARKER}' on its own line and stop.{self._verify_note()}
+- When the task is fully done and verified, call task_complete (on its own) with a short summary.{self._verify_note()}
 
 Rules:
 - Create a working directory named after the task (e.g. `work/<short-task-slug>/`) and keep temporary files there, not in the project root.
-- Output is capped at {self.max_output_bytes} bytes; if truncated the sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}` is appended. If you see it, you are missing data — do not assume success or failure; re-run a more targeted command.
-- Commands are killed after {self.command_timeout}s.
+- Commands run in {_SHELL_NAME}; the working directory carries over between calls (a `cd` persists).
+- Output is capped at {self.max_output_bytes} bytes; longer output keeps its start and end, names a file holding the full output, and ends with the sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}`. If you see it, you are missing data — do not assume success or failure; grep the saved file.
+- Commands are killed after {self.command_timeout}s; run servers and long jobs with background=true.
 - Only report conclusions from real tool output; never fabricate results.
 - Web search by printing JSON results to stdout: `python3 -c "import json; from ddgs import DDGS; print(json.dumps(list(DDGS().text('QUERY', max_results=10)), ensure_ascii=False, indent=2))"` (replace QUERY). Use wget/curl and the w3m browser to fetch page contents.
 {self._ddgs_note()}
@@ -1538,8 +1636,8 @@ Rules:
     def _verify_note(self) -> str:
         if not self.verify_command:
             return ""
-        return (f"\n   The completion signal is checked: `{self.verify_command}` runs automatically and must exit 0, "
-                f"otherwise its output comes back to you and the task continues.")
+        return (f"\n   Completion is checked: when you call task_complete, `{self.verify_command}` runs automatically "
+                f"and must exit 0, otherwise its output comes back to you and the task continues.")
 
     def _loop_note(self) -> str:
         if not self.loop_iteration:
@@ -1550,7 +1648,7 @@ Rules:
 - Start by reading the current state: the plan/progress files the prompt names (or IMPLEMENTATION_PLAN.md if present), AGENTS.md, and `git status` / `git log --oneline -10` in a git repository.
 - Pick the single most important unfinished item, implement it and verify it (tests, build).
 - Before finishing, update the plan/progress file (create IMPLEMENTATION_PLAN.md if the prompt names none) with what you did and what remains, and append short, non-obvious build/test learnings to AGENTS.md, so the next iteration can continue.
-- End the iteration with '{self.COMPLETION_MARKER}' on its own line. If, and only if, the ENTIRE objective of the prompt is complete and verified with nothing left to do, end with '{self.LOOP_COMPLETE_MARKER}' on its own line instead."""
+- End the iteration by calling task_complete. Set objective_complete to true if, and only if, the ENTIRE objective of the prompt is complete and verified with nothing left to do."""
 
     def _project_instructions(self) -> str:
         """The first PROJECT_FILES file in the working directory, for the system prompt."""
@@ -1575,36 +1673,85 @@ Rules:
 
     # --- Command execution ---------------------------------------------------
 
-    def execute_bash_command(self, command: str) -> tuple[str, int]:
+    def execute_bash_command(self, command: str, cwd: str | None = None) -> tuple[str, int]:
         """Run *command* with a timeout and return (output, exit_code).
 
-        POSIX runs it in a PTY of its own session, so the whole process tree
-        can be killed; Windows uses PowerShell over pipes. Output streams to the
-        sink as CMD_OUTPUT and the returned text is cleaned and truncated.
+        It starts in *cwd*, or else in self.cwd, which then follows the shell's
+        final directory (a `cd` carries over to the next command). POSIX runs
+        it in a PTY of its own session, so the whole process tree can be
+        killed; Windows uses PowerShell over pipes. Output streams to the sink
+        as CMD_OUTPUT and the returned text is cleaned and truncated.
         """
         self._command_started = time.monotonic()
-        if _IS_WINDOWS:
-            return self._execute_bash_command_windows(command)
+        cwd_file = ""
+        if cwd is None:
+            cwd, scratch = self._checked_cwd(), self._scratch_dir()
+            cwd_file = os.path.join(scratch, "cwd") if scratch else ""
+        try:
+            if _IS_WINDOWS:
+                return self._execute_bash_command_windows(command, cwd, cwd_file)
+            return self._execute_posix(command, cwd, cwd_file)
+        finally:
+            if cwd_file:
+                with contextlib.suppress(OSError, UnicodeDecodeError):
+                    with open(cwd_file, encoding="utf-8") as f:
+                        new = f.read().rstrip("\r\n")
+                    if new and os.path.isdir(new):
+                        self.cwd = new
+
+    def _checked_cwd(self) -> str:
+        if not os.path.isdir(self.cwd):
+            self._log(f"[INFO] {self.cwd} is gone; commands start in {self.start_cwd} again.", style="yellow")
+            self.cwd = self.start_cwd
+        return self.cwd
+
+    def _scratch_dir(self) -> str:
+        """This agent's temp directory (cwd file, saved outputs, job logs),
+        removed at exit; "" when none can be made."""
+        if self._scratch is None:
+            self._scratch = ""
+            for base in (None, "/tmp"):  # /tmp: a $TMPDIR outside the sandbox
+                with contextlib.suppress(OSError):
+                    self._scratch = tempfile.mkdtemp(prefix="aic-", dir=base)
+                    break
+            if self._scratch:
+                atexit.register(self._cleanup)
+        return self._scratch
+
+    def _cleanup(self) -> None:
+        for proc, _log, _command in self.jobs.values():
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    if _IS_WINDOWS:
+                        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=5)
+                    else:
+                        os.killpg(proc.pid, signal.SIGTERM)
+        if self._scratch:
+            shutil.rmtree(self._scratch, ignore_errors=True)
+
+    def _execute_posix(self, command: str, cwd: str, cwd_file: str) -> tuple[str, int]:
         try:
             pid, fd = pty.fork()
         except OSError as exc:
             return self._finish_command(bytearray(f"Failed to start a shell: {exc}\n".encode()), command, 1, False)
         if pid == 0:  # child (a session leader on the PTY)
             try:
-                os.environ.update(_COMMAND_ENV)
+                os.environ.update(_COMMAND_ENV, PWD=cwd, AIC_CWD_FILE=cwd_file)
+                os.chdir(cwd)
                 with contextlib.suppress(OSError):  # a wide window: fewer wrapped lines
                     fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
-                os.execv("/bin/sh", ["/bin/sh", "-c", _SHELL_PRELUDE + command])
+                os.execv(_POSIX_SHELL, [_POSIX_SHELL, "-c",
+                                        _SHELL_PRELUDE + (_CWD_TRAP if cwd_file else "") + command])
             except BaseException as exc:
                 with contextlib.suppress(Exception):
-                    os.write(2, f"cannot run /bin/sh: {exc}\n".encode())
+                    os.write(2, f"cannot run {_POSIX_SHELL} in {cwd}: {exc}\n".encode())
             finally:
                 os._exit(127)
 
         output = bytearray()
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         held = ""  # escape sequence split across reads, completed by the next chunk
-        limit = 5 * self.max_output_bytes  # raw bytes after which the command is killed
+        limit = self._output_kill_limit()
         deadline = time.monotonic() + self.command_timeout
         # --nogui: forward the user's keystrokes to the command (only from a real terminal).
         watch_stdin = not isinstance(self.sink, TUISink) and sys.stdin is not None and sys.stdin.isatty()
@@ -1636,6 +1783,7 @@ Rules:
                         if len(output) > limit:
                             self._log_error(f"[OUTPUT LIMIT] Command output exceeded {limit} bytes. Stopping command.")
                             exit_code = self._kill_process_group(pid)
+                            output += f"\n[killed: the output passed {limit} bytes]\n".encode()
                             break
                 if watch_stdin and sys.stdin.fileno() in ready:
                     try:
@@ -1713,14 +1861,46 @@ Rules:
                 time.sleep(0.02)
         return -1
 
+    def _output_kill_limit(self) -> int:
+        """Raw output bytes after which a command is killed (`yes`, a runaway log)."""
+        return max(5 * self.max_output_bytes, 1 << 20)
+
     def _finalize_command_output(self, output_buffer: bytearray) -> str:
-        """Decode, clean and truncate (by bytes) the output returned to the model."""
+        """Decode and clean the output for the model. Past max_output_bytes it
+        keeps the first 30% and the last 70% (where errors and test summaries
+        end up), cut at lines where it can, and saves the full text to a file
+        named in the cut marker."""
         text = _clean_command_output(bytes(output_buffer).decode("utf-8", errors="replace"))
-        data = text.encode("utf-8")
-        if len(data) > self.max_output_bytes:
-            text = (data[:self.max_output_bytes].decode("utf-8", errors="ignore")
-                    + "\n" + self.OUTPUT_TRUNCATION_SENTINEL)
-        return text
+        data, cap = text.encode("utf-8"), self.max_output_bytes
+        if len(data) <= cap:
+            return text
+        head = data[:cap * 3 // 10].decode("utf-8", errors="ignore")
+        tail = data[len(data) - (cap - cap * 3 // 10):].decode("utf-8", errors="ignore")
+        if "\n" in head[len(head) // 2:]:
+            head = head[:head.rindex("\n") + 1]
+        if "\n" in tail[:len(tail) // 2]:
+            tail = tail[tail.index("\n") + 1:]
+        cut = len(data) - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
+        path = self._save_output(text)
+        where = f"; the full output ({len(data)} bytes) is in {path}" if path else ""
+        return (head.rstrip("\n") + f"\n[... {cut} bytes cut{where} ...]\n" + tail.rstrip("\n")
+                + "\n" + self.OUTPUT_TRUNCATION_SENTINEL)
+
+    def _save_output(self, text: str) -> str:
+        """Save a long command output to the scratch dir (the last 20 are kept); its path or ""."""
+        scratch = self._scratch_dir()
+        if not scratch:
+            return ""
+        self._output_count += 1
+        path = os.path.join(scratch, f"output-{self._output_count}.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            return ""
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(scratch, f"output-{self._output_count - 20}.txt"))
+        return path
 
     def _finish_command(self, output_buffer: bytearray, command: str, exit_code: int,
                         timed_out: bool) -> tuple[str, int]:
@@ -1732,17 +1912,18 @@ Rules:
                                       f"and was killed.", final_output)
         return final_output, exit_code
 
-    def _execute_bash_command_windows(self, command: str) -> tuple[str, int]:
+    def _execute_bash_command_windows(self, command: str, cwd: str, cwd_file: str) -> tuple[str, int]:
         """Windows runner: PowerShell over pipes (there is no PTY)."""
         try:
-            proc = subprocess.Popen(_powershell_argv(command), stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            proc = subprocess.Popen(_powershell_argv(command, bool(cwd_file)), stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=cwd,
+                                    env={**os.environ, "AIC_CWD_FILE": cwd_file},
                                     creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         except OSError as exc:
             return self._finish_command(bytearray(f"Failed to start shell: {exc}\n".encode()), command, 1, False)
         output = bytearray()
         lock = threading.Lock()
-        limit = 5 * self.max_output_bytes
+        limit = self._output_kill_limit()
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
         def reader():
@@ -1783,6 +1964,9 @@ Rules:
             if over:
                 self._log_error(f"[OUTPUT LIMIT] Command output exceeded {limit} bytes. Stopping command.")
                 terminate()
+                thread.join(timeout=2)
+                with lock:
+                    output.extend(f"\n[killed: the output passed {limit} bytes]\n".encode())
                 break
             time.sleep(0.05)
         thread.join(timeout=2)
@@ -1852,7 +2036,7 @@ Rules:
         path = args.get("path")
         if not isinstance(path, str) or not path.strip():
             return name, f"ERROR: {name} requires a 'path' string argument.", None
-        full, summary = os.path.abspath(os.path.expanduser(path)), f"{name} {path}"
+        full, summary = os.path.abspath(os.path.join(self.cwd, os.path.expanduser(path))), f"{name} {path}"
         if name == "read_file":
             return summary, "", lambda: self._read_file(full, args.get("offset"), args.get("limit"))
         exists = os.path.isfile(full)
@@ -1912,7 +2096,8 @@ Rules:
         self.sink.emit("CMD_EXEC", {"command": summary, "function_name": name})
         if preview:
             self.sink.emit("CMD_OUTPUT", {"text": preview, "command": summary})
-        approved, suggestion = self.get_user_confirmation(summary + ("\n\n" + preview if preview else ""))
+        approved, suggestion = ((True, None) if name == "read_file" and self.auto_approve_reads
+                                else self.get_user_confirmation(summary + ("\n\n" + preview if preview else "")))
         if not approved:
             self._log("[INFO] Not approved by user.")
             if suggestion:
@@ -2053,7 +2238,7 @@ Rules:
                 params["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking,
                                                                  **({"reasoning_effort": effort} if effort else {})}}
         if use_tools:
-            params["tools"] = self.tool_schemas
+            params["tools"] = self.loop_tool_schemas if self.loop_iteration else self.tool_schemas
             params["tool_choice"] = "auto"
         self._emit_token_usage(self._estimate_input_tokens(messages), 0, estimate=True)
 
@@ -2285,16 +2470,122 @@ Rules:
         self.save_session("task_summary")
 
     def _continuation_prompt(self) -> str:
-        return (f"{_CONTINUATION_PREFIX} If the task is truly complete, you MUST emit the completion signal "
-                f"\"{self.COMPLETION_MARKER}\" on its own line. Otherwise, continue by using the appropriate tools to "
-                f"make progress. Do NOT simply describe what needs to be done - take the next concrete step "
-                f"using execute_bash or other available tools. Remember: you must keep going until the task is "
-                f"fully finished, then emit \"{self.COMPLETION_MARKER}\".")
+        return (f"{_CONTINUATION_PREFIX} If the task is truly complete, you MUST call task_complete with a "
+                f"summary. Otherwise, continue by using the appropriate tools to make progress. Do NOT simply "
+                f"describe what needs to be done - take the next concrete step using execute_bash or other "
+                f"available tools. Remember: you must keep going until the task is fully finished, then call "
+                f"task_complete.")
 
-    def _run_tool_calls(self, calls: list[dict[str, Any]], malformed: list[dict[str, Any]]):
+    def _set_todos(self, items: list) -> None:
+        self.todos = []
+        for item in items:
+            item = item if isinstance(item, dict) else {"text": item}
+            text = " ".join(str(item.get("text") or "").split())
+            if text:
+                status = str(item.get("status") or "").lower().replace("-", "_").replace(" ", "_")
+                status = {"completed": "done", "complete": "done", "active": "in_progress"}.get(status, status)
+                self.todos.append({"text": text, "status": status if status in self._TODO_MARKS else "pending"})
+
+    def _todo_text(self) -> str:
+        return "\n".join(f"{self._TODO_MARKS[t['status']]} {t['text']}" for t in self.todos) or "(empty)"
+
+    def _todo(self, args: Any) -> str:
+        """The todo tool: replace the task list and show it."""
+        items = args.get("items") if isinstance(args, dict) else None
+        if isinstance(items, str):  # models send the list as JSON text, too
+            with contextlib.suppress(json.JSONDecodeError):
+                items = json.loads(items)
+        if not isinstance(items, list):
+            return ("ERROR: todo needs 'items': the complete task list, as objects with 'text' and 'status' "
+                    "(pending, in_progress or done).")
+        self._set_todos(items)
+        done = sum(t["status"] == "done" for t in self.todos)
+        summary, text = f"todo ({done}/{len(self.todos)} done)", self._todo_text()
+        self._command_started = time.monotonic()
+        self.sink.emit("CMD_EXEC", {"command": summary, "function_name": "todo"})
+        self.sink.emit("CMD_OUTPUT", {"text": text + "\n", "command": summary})
+        self.sink.emit("CMD_COMPLETE", {"command": summary, "exit_code": 0, "output": text, "duration": 0.0})
+        return f"Task list updated ({done}/{len(self.todos)} done):\n{text}"
+
+    @staticmethod
+    def finish_summary(msg: dict) -> str:
+        """The summary of an assistant turn's task_complete call, or ""."""
+        for tc in msg.get("tool_calls") or []:
+            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            if fn.get("name") == "task_complete":
+                try:
+                    args = fn.get("arguments")
+                    args = args if isinstance(args, dict) else json.loads(args or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    return ""
+                return str(args.get("summary") or "").strip() if isinstance(args, dict) else ""
+        return ""
+
+    def _start_job(self, command: str) -> str:
+        """Start *command* in the background, logging to a file; its exit is reported by _report_jobs."""
+        self._command_started, label = time.monotonic(), f"{command} &"
+
+        def done(result: str, code: int) -> str:
+            self.sink.emit("CMD_OUTPUT", {"text": result + "\n", "command": label})
+            self.sink.emit("CMD_COMPLETE", {"command": label, "exit_code": code, "output": result, "duration": 0.0})
+            return result
+        scratch = self._scratch_dir()
+        if not scratch:
+            return done("ERROR: no writable temp directory for the job's log; run it with nohup ... & instead.", 1)
+        self._job_count += 1
+        n, log = self._job_count, os.path.join(scratch, f"job-{self._job_count}.log")
+        argv = _powershell_argv(command) if _IS_WINDOWS else [_POSIX_SHELL, "-c", _SHELL_PRELUDE + command]
+        cwd = self._checked_cwd()
+        try:
+            with open(log, "wb") as out:
+                proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
+                                        stderr=subprocess.STDOUT, start_new_session=not _IS_WINDOWS,
+                                        env={**os.environ, **_COMMAND_ENV, "PWD": cwd},
+                                        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        except OSError as exc:
+            return done(f"ERROR: the background job could not start: {exc}", 1)
+        self.jobs[n] = (proc, log, command)
+        stop = f"taskkill /PID {proc.pid} /T /F" if _IS_WINDOWS else f"kill -- -{proc.pid}"
+        return done(f"Started background job {n} (pid {proc.pid}) in {cwd}. Its output goes to {log} (read it "
+                    f"with tail or grep); you will be told when it exits. Stop it with: {stop}", 0)
+
+    def _report_jobs(self) -> None:
+        """Tell the model about background jobs that exited since the last step."""
+        for n, (proc, log, command) in list(self.jobs.items()):
+            code = proc.poll()
+            if code is None:
+                continue
+            del self.jobs[n]
+            code = 128 - code if code < 0 else code  # killed by signal N -> 128+N, like a shell
+            try:
+                with open(log, "rb") as f:
+                    f.seek(max(0, os.path.getsize(log) - 2000))
+                    tail = _clean_command_output(f.read().decode("utf-8", errors="replace"))
+            except OSError:
+                tail = ""
+            tail = "\n".join(tail.splitlines()[-20:])
+            self._log(f"[JOB {n}] exited with code {code}: {command}", style="cyan")
+            self.conversation_history.append({"role": "user", "content": (
+                f"[Background job {n} exited with code {code}: {command}]\nLast lines of {log}:\n{tail}")})
+
+    def _compaction_note(self) -> None:
+        """After a compaction, restate what the summary may have lost: where
+        commands start and the task list."""
+        notes = []
+        if self.cwd != self.start_cwd:
+            notes.append(f"Commands start in {self.cwd}.")
+        if self.todos:
+            notes.append(f"Your current task list (todo tool):\n{self._todo_text()}")
+        last = _content_text(self.conversation_history[-1].get("content"))
+        if notes and not last.startswith("[CONTEXT COMPACTED]"):
+            self.conversation_history.append({"role": "user", "content": "[CONTEXT COMPACTED] " + "\n".join(notes)})
+
+    def _run_tool_calls(self, calls: list[dict[str, Any]], malformed: list[dict[str, Any]]) -> dict | None:
         """Answer every tool call of one assistant turn, in order. User
         suggestions given while rejecting go after all results, keeping the
-        tool results adjacent to their assistant turn."""
+        tool results adjacent to their assistant turn. Returns the arguments
+        of an accepted (and verified) task_complete call, else None."""
+        finish = None
         if malformed:
             self._log(f"[INFO] {len(malformed)} tool call(s) had malformed JSON arguments; "
                       f"asking the model to re-issue them.")
@@ -2316,9 +2607,22 @@ Rules:
                         rest["tool_call_id"], "Not executed: the user stopped the agent before this command ran."))
                 break
             tcid, command, name = call["tool_call_id"], call.get("command"), call.get("function_name")
-            if name in self.FILE_TOOLS:
-                args = call.get("arguments")
-                result = self._run_file_tool(name, args if isinstance(args, dict) else {}, suggestions)
+            args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+            if name in self.FILE_TOOLS or name in self.AGENT_TOOLS:
+                if name == "todo":
+                    result = self._todo(call.get("arguments"))
+                elif name != "task_complete":
+                    result = self._run_file_tool(name, args, suggestions)
+                elif len(calls) + len(malformed) > 1:
+                    result = ("Not accepted: call task_complete on its own, after you have seen the results of "
+                              "your other tool calls.")
+                else:
+                    result = (self._verify() if self.verify_command else None) or "Task completion accepted."
+                    if not result.startswith("[VERIFY FAILED]"):
+                        finish = args
+                        summary = str(args.get("summary") or "").strip()
+                        if summary:
+                            self._log(summary, style="cyan")
                 self.conversation_history.append(self._tool_result(tcid, result))
                 self.save_session("tool_result")
                 continue
@@ -2331,9 +2635,15 @@ Rules:
                 self.conversation_history.append(self._tool_result(tcid, result))
                 self.save_session("tool_result")
                 continue
-            self.sink.emit("CMD_EXEC", {"command": command, "tool_call_id": tcid, "function_name": name})
-            approved, suggestion = self.get_user_confirmation(command)
-            if approved:
+            background = args.get("background") in (True, "true")  # some models send booleans as strings
+            label = f"{command} &" if background else command
+            self.sink.emit("CMD_EXEC", {"command": label, "tool_call_id": tcid, "function_name": name})
+            approved, suggestion = ((True, None) if self.auto_approve_reads and not background
+                                    and _is_read_only(command) else self.get_user_confirmation(label))
+            if approved and background:
+                result = self._start_job(command)
+            elif approved:
+                cwd = self.cwd
                 try:
                     output, code = self.execute_bash_command(command)
                     result = f"Command executed with exit code {code}.\nOutput:\n{output}"
@@ -2342,6 +2652,8 @@ Rules:
                 except Exception as exc:
                     result = f"Command execution failed: {exc}"
                     self._log_error(result)
+                if self.cwd != cwd:
+                    result += f"\n[working directory is now {self.cwd}]"
             else:
                 self._log("[INFO] Command not approved by user.")
                 result = "Command execution skipped by user."
@@ -2353,14 +2665,15 @@ Rules:
             self.conversation_history.append({"role": "user", "content": f"I suggest you {suggestion}"})
         if suggestions:
             self.save_session("tool_result")
+        return finish
 
     def _verify(self) -> str | None:
         """Run --verify after a completion signal: None when it passes, otherwise
         the feedback that sends the model back to work."""
         self._log(f"[VERIFY] Checking the completion signal with: {self.verify_command}", style="cyan")
         self.sink.emit("CMD_EXEC", {"command": self.verify_command, "function_name": "verify"})
-        try:
-            output, code = self.execute_bash_command(self.verify_command)
+        try:  # where the user started it, wherever the agent cd'd to
+            output, code = self.execute_bash_command(self.verify_command, cwd=self.start_cwd)
         except CommandTimeoutError as exc:
             output, code = exc.output, f"timeout after {self.command_timeout}s"
         if code == 0:
@@ -2393,6 +2706,7 @@ Rules:
             self.conversation_history.append(request)
         else:
             self.conversation_history = [{"role": "system", "content": self.get_system_prompt()}, request]
+            self.todos, self.cwd = [], self.start_cwd
         self._current_request = request
         self.save_session("user_request")  # the request survives even if the first call dies
 
@@ -2405,8 +2719,10 @@ Rules:
                 self.sink.emit("STATUS_UPDATE", {"step": step, "max_steps": self.max_steps, "phase": "llm_call"})
                 if self.debug:
                     self._dump_conversation_history()
+                self._report_jobs()
                 self._drain_suggestions()
-                self._context_compress(force=overflow_retries > 0)
+                if self._context_compress(force=overflow_retries > 0):
+                    self._compaction_note()
                 # Compression can split an assistant/tool pair; repair before saving/sending.
                 self.conversation_history = self._sanitize_tool_pairing(self.conversation_history)
                 self.save_session("before_llm_call")
@@ -2482,7 +2798,11 @@ Rules:
                 loop_done = bool(self.loop_iteration) and _has_marker(content, self.LOOP_COMPLETE_MARKER)
                 done = loop_done or _has_marker(content, self.COMPLETION_MARKER)
                 if calls or malformed:
-                    self._run_tool_calls(calls, malformed)
+                    finish = self._run_tool_calls(calls, malformed)
+                    if finish is not None:  # task_complete, already verified
+                        loop_done = bool(self.loop_iteration) and finish.get("objective_complete") in (True, "true")
+                        completed, status = True, "loop_complete" if loop_done else "complete"
+                        break
                 elif not done:
                     self.conversation_history.append({"role": "user", "content": self._continuation_prompt()})
                     self.save_session("continuation_prompt")
@@ -2612,9 +2932,14 @@ if _TEXTUAL_AVAILABLE:
             return None
         if not isinstance(args, dict):
             return None
+        name = (tool_call.get("function") or {}).get("name")
+        if name in AICommander.AGENT_TOOLS:
+            return name
         if isinstance(args.get("path"), str):
-            return f"{(tool_call.get('function') or {}).get('name')} {args['path']}"
-        return args["command"] if isinstance(args.get("command"), str) else None
+            return f"{name} {args['path']}"
+        if not isinstance(args.get("command"), str):
+            return None
+        return args["command"] + (" &" if args.get("background") in (True, "true") else "")
 
     class _Line:
         """A logical log line: its text plus style runs [(end_offset, style)].
@@ -3909,7 +4234,8 @@ if _TEXTUAL_AVAILABLE:
                 max_steps=a.max_steps, compress_algorithm="truncate" if a.fast else a.compress_alg,
                 compress_target=a.compress_target, fast=a.fast, reasoning_effort=a.reasoning_effort,
                 sandbox_enabled=a.sandbox_enabled, sandbox_write_dir=a.sandbox_write_dir,
-                session_file=session_file, instance_number=instance_number, verify_command=a.verify)
+                session_file=session_file, instance_number=instance_number, verify_command=a.verify,
+                auto_approve_reads=not a.confirm_reads)
             self.agent.max_tokens = getattr(a, "max_tokens", None) or self.agent.max_tokens
             self.sink.stop_event = self.agent.stop_event
             self.agent_log = OutputLog(id=f"agent-log-{self.uid}", classes="agent-log")
@@ -3996,12 +4322,13 @@ if _TEXTUAL_AVAILABLE:
                     log.write_line(text, _C_USER)
                 elif role == "assistant":
                     text = text.replace(AICommander.COMPLETION_MARKER, "").rstrip()
-                    if text:
-                        log.write_line(text, _C_ANSWER)
+                    for line in (text, AICommander.finish_summary(msg)):
+                        if line:
+                            log.write_line(line, _C_ANSWER)
                     for tc in msg.get("tool_calls") or []:
                         command = _tool_command(tc)
                         if command:
-                            if command.partition(" ")[0] not in AICommander.FILE_TOOLS:
+                            if command.partition(" ")[0] not in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS:
                                 command = f"$ {command}"
                             commands[tc.get("id")] = command
                             log.write_line(command, _C_CMD)
@@ -4168,7 +4495,8 @@ if _TEXTUAL_AVAILABLE:
                 log.write_line(text, _C_USER)
             elif kind == "CMD_EXEC":
                 self.current_command, self._cmd_started = p.get("command", ""), time.monotonic()
-                label = ("" if p.get("function_name") in AICommander.FILE_TOOLS else "$ ") + self.current_command
+                label = ("" if p.get("function_name") in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS
+                         else "$ ") + self.current_command
                 log.write_line(label, _C_CMD)
                 console.begin_fold(label, _C_CMD, rule=True)
                 self.set_phase("running")
@@ -4577,7 +4905,8 @@ if _TEXTUAL_AVAILABLE:
                 ("AUTO-APPROVE" if tab.auto_approve else "approve: ask",
                  "bold #ffffff on #af0000" if tab.auto_approve else ""),
                 ("sandbox ✓" if self.args.sandbox_enabled else "sandbox ✗", ""),
-                (f"{self.args.model} · {_safe_cwd().replace(os.path.expanduser('~'), '~', 1)} · "
+                (f"{self.args.model} · "
+                 f"{(tab.agent.cwd if tab.agent else _safe_cwd()).replace(os.path.expanduser('~'), '~', 1)} · "
                  f"{os.path.basename(tab.session_file) if tab.session_file else 'no session'}", ""),
             ]
             status = Text(no_wrap=True, overflow="ellipsis")
@@ -4716,8 +5045,8 @@ if _TEXTUAL_AVAILABLE:
         def _last_answer(self) -> str:
             for msg in reversed(self.agent.conversation_history if self.agent else []):
                 text = _content_text(msg.get("content")).replace(AICommander.COMPLETION_MARKER, "").strip()
-                if msg.get("role") == "assistant" and text:
-                    return text
+                if msg.get("role") == "assistant" and (text or AICommander.finish_summary(msg)):
+                    return text or AICommander.finish_summary(msg)
             return ""
 
         def _copy_answer(self) -> None:
@@ -4936,6 +5265,8 @@ def main():
                         help="API key (default: $AIC_API_KEY or $OPENAI_API_KEY; prefer these: a key on the "
                              "command line is visible to every process, the agent's commands included)")
     parser.add_argument("--auto-approve", action="store_true", help="Auto-approve command execution")
+    parser.add_argument("--confirm-reads", action="store_true",
+                        help="Ask before read-only commands (ls, cat, grep, git status...) and read_file too")
     parser.add_argument("--no-thinking", action="store_true", help="Hide thinking tokens from output")
     parser.add_argument("--timeout", type=int, default=120, help="Command timeout in seconds (default: 120)")
     parser.add_argument("--max-prompt-len", type=int, default=DEFAULT_MAX_PROMPT_LEN,
@@ -5042,7 +5373,8 @@ def main():
             compress_algorithm="truncate" if args.fast else args.compress_alg,
             compress_target=args.compress_target, fast=args.fast, reasoning_effort=args.reasoning_effort,
             sandbox_enabled=args.sandbox_enabled, sandbox_write_dir=args.sandbox_write_dir,
-            session_file=args.session_file, instance_number=args.instance_number, verify_command=args.verify)
+            session_file=args.session_file, instance_number=args.instance_number, verify_command=args.verify,
+            auto_approve_reads=not args.confirm_reads)
         commander.max_tokens = args.max_tokens
         commander.persist_history = commander.load_session()  # resume where the last run stopped
         atexit.register(commander.save_session, "process_exit")

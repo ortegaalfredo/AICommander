@@ -40,7 +40,10 @@ import argparse
 import json
 import os
 import queue
+import re
+import shlex
 import shutil
+import subprocess
 import sys
 import threading
 
@@ -220,22 +223,22 @@ class TestRunner:
 
     def test_output_truncation(self):
         c = self.make_commander(max_output_bytes=100)
-        output, code = c.execute_bash_command("python3 -c \"print('x'*1000)\"")
+        output, code = c.execute_bash_command("python3 -c \"print('a'*500 + 'z'*500)\"")
         self.check(
             "output truncation: sentinel appended",
             output.endswith(c.OUTPUT_TRUNCATION_SENTINEL),
             f"output did not end with sentinel; len={len(output)}",
         )
-        self.check(
-            "output truncation: capped at max_output_bytes",
-            len(output) <= 100 + len(c.OUTPUT_TRUNCATION_SENTINEL) + 1,
-            f"output too long: {len(output)}",
-        )
-        self.check(
-            "output truncation: retains leading command output",
-            output.startswith("x" * 100),
-            f"unexpected output head: {output[:20]!r}",
-        )
+        head, marker, tail = (output.split("\n") + ["", "", ""])[:3]
+        self.check("output truncation: keeps 30% head and 70% tail", head == "a" * 30 and tail == "z" * 69,  # 70 bytes with the newline
+                   repr(output))
+        path = re.search(r"is in (\S+) \.\.\.\]", marker)
+        self.check("output truncation: the marker names the saved full output",
+                   path and open(path.group(1)).read() == "a" * 500 + "z" * 500 + "\n", repr(marker))
+        out, _ = c.execute_bash_command("seq 1 100")
+        lines = out.splitlines()
+        self.check("output truncation: cut at whole lines", lines[0] == "1" and lines[-2] == "100"
+                   and all(ln.isdigit() for ln in lines[:-1] if not ln.startswith("[...")), repr(out))
         cmd_complete = [e for e in c.sink.events if e[0] == "CMD_COMPLETE"]
         self.check("output truncation: CMD_COMPLETE emitted", len(cmd_complete) >= 1)
         if cmd_complete:
@@ -896,7 +899,7 @@ class TestRunner:
                 debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
                 request=[], session=base, session_file=session_file, instance_number=number,
                 session_msg="[SESSION] test", sandbox_enabled=False, sandbox_msg="[SANDBOX] off",
-                sandbox_write_dir=os.getcwd(), loop="", max_iterations=10, verify="")
+                sandbox_write_dir=os.getcwd(), loop="", max_iterations=10, verify="", confirm_reads=True)
 
         def release_all():  # what the process exit does to the locks
             for path in [p for p in aic._SESSION_LOCK_FDS if p.startswith(tmp)]:
@@ -1548,9 +1551,10 @@ class TestRunner:
     def test_output_truncation_multibyte(self):
         c = self.make_commander(max_output_bytes=100)
         out, _ = c.execute_bash_command("python3 -c \"print('é' * 400)\"")
-        body = out[:-len(c.OUTPUT_TRUNCATION_SENTINEL)]
-        self.check("truncation: capped in bytes, not characters", len(body.encode("utf-8")) <= 101,
-                   f"{len(body.encode('utf-8'))} bytes")
+        lines = out.split("\n")
+        body = lines[0] + lines[2]
+        self.check("truncation: capped in bytes, not characters", len(body.encode("utf-8")) <= 100
+                   and "\ufffd" not in body and lines[1].startswith("[..."), f"{len(body.encode('utf-8'))} bytes")
 
     def test_command_timeout_keeps_partial_output(self):
         c = self.make_commander(command_timeout=1)
@@ -1849,7 +1853,7 @@ class TestRunner:
             debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
             request=[], session_file="", instance_number=1, session_msg="[SESSION] off",
             sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd(),
-            loop="", max_iterations=10, verify="")
+            loop="", max_iterations=10, verify="", confirm_reads=True)
         script = [
             [fake_openai.content_chunk("Hello there. TASK"), fake_openai.content_chunk("COMPLETE"),
              fake_openai.usage_chunk(10, 3)],
@@ -2042,7 +2046,7 @@ class TestRunner:
             self.check("files: the agent loop runs file tools",
                        open(target).read() == "hi\n" and tool["content"].startswith("OK: created"), tool["content"])
             self.check("files: tool schemas offered", {t["function"]["name"] for t in fake.calls[0]["tools"]}
-                       == {"execute_bash", "read_file", "edit_file", "write_file"})
+                       == {"execute_bash", "read_file", "edit_file", "write_file", "todo", "task_complete"})
 
     def test_verify_gate(self):
         import tempfile
@@ -2082,6 +2086,159 @@ class TestRunner:
             c3, _ = self.make_fake_commander()
             self.check("loop: a missing prompt file is an error",
                        c3.run_loop(os.path.join(tmp, "missing.md")) == "error")
+
+    def test_shell_and_cwd(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "sub")
+            c = self.make_commander()
+            out, code = c.execute_bash_command("[[ 1 == 1 ]] && arr=(a b) && echo ${arr[1]}")
+            self.check("shell: bash syntax works", code == 0 and out.strip() == "b", repr(out))
+            c.execute_bash_command(f"cd {shlex.quote(tmp)} && mkdir sub && cd sub")
+            out, _ = c.execute_bash_command("pwd")
+            self.check("cwd: a cd carries over", c.cwd == sub and out.strip() == sub, f"{c.cwd} {out!r}")
+            _, code = c.execute_bash_command("cd /; exit 3")
+            self.check("cwd: followed on failure, exit code intact", code == 3 and c.cwd == "/", f"{code} {c.cwd}")
+            c.execute_bash_command(f"cd {shlex.quote(sub)}")
+            r = c._run_file_tool("write_file", {"path": "f.txt", "content": "x"}, [])
+            self.check("cwd: file tools resolve relative paths against it",
+                       os.path.isfile(os.path.join(sub, "f.txt")), r)
+            out, _ = c.execute_bash_command("pwd", cwd=tmp)
+            self.check("cwd: an explicit cwd is not followed", out.strip() == tmp and c.cwd == sub, repr(out))
+            c.execute_bash_command(f"rm -rf {shlex.quote(sub)}")
+            out, _ = c.execute_bash_command("pwd")
+            self.check("cwd: a vanished directory falls back to the start",
+                       c.cwd == c.start_cwd and out.strip() == c.start_cwd, f"{c.cwd} {out!r}")
+            c2, _ = self.make_fake_commander([self._call("execute_bash", {"command": f"cd {shlex.quote(tmp)}"}),
+                                              self._done()])
+            c2.run("go")
+            tool = next(m for m in c2.conversation_history if m.get("role") == "tool")
+            self.check("cwd: the model is told the directory changed",
+                       tool["content"].endswith(f"[working directory is now {tmp}]"), repr(tool["content"]))
+            self.check("cwd: saved in the session", c2.session_snapshot()["cwd"] == tmp)
+            c2.persist_history = False
+            c2.client = fake_openai.FakeOpenAIClient([self._done()])
+            c2.run("fresh")
+            self.check("cwd: a fresh conversation starts where aic started", c2.cwd == c2.start_cwd, c2.cwd)
+
+    def test_read_only_commands(self):
+        ro = aic._is_read_only
+        safe = ["ls -la", "git status", "grep -rn 'a|b' src | head -5", "cat x 2>/dev/null || echo none",
+                "cd sub && ls", "find . -name '*.py'", "git log --oneline -5", "sort a | uniq -c",
+                "wc -l a b 2>&1", "git branch -a"]
+        unsafe = ["rm x", "ls > out", "ls >| out", "echo $(rm x)", "cat `x`", "ls; rm -rf x", "ls\nrm x",
+                  "find . -delete", "find . -exec rm {} +", "git push", "git branch -D x", "sort -o out x",
+                  "./ls", "FOO=1 ls", "ls &", "uniq a b", "cat a#b; rm x", "ls | sh", "tee x", "python3 -c 1",
+                  "git -c core.pager=x log", "git diff --output=x", "cat <(rm x)", "'unterminated", "",
+                  "sort -no out x", "git grep -iO x", "tree -ao out"]
+        self.check("read-only: plain reads qualify", all(ro(cmd) for cmd in safe), [cmd for cmd in safe if not ro(cmd)])
+        self.check("read-only: writes, substitutions and unknowns do not", not any(ro(cmd) for cmd in unsafe),
+                   [cmd for cmd in unsafe if ro(cmd)])
+        two_calls = [[fake_openai.tool_call_chunk(0, id="a", name="execute_bash", arguments='{"command": "ls"}'),
+                      fake_openai.tool_call_chunk(1, id="b", name="execute_bash",
+                                                  arguments='{"command": "rm -f no-such-file"}'),
+                      fake_openai.usage_chunk(1, 1)], self._done()]
+        for reads, expected in ((True, ["rm -f no-such-file"]), (False, ["ls", "rm -f no-such-file"])):
+            c, _ = self.make_fake_commander([list(t) for t in two_calls], auto_approve=False,
+                                            auto_approve_reads=reads)
+            asked = []
+            c.sink.confirm = lambda command, asked=asked: asked.append(command) or "n"
+            c.run("look")
+            self.check(f"read-only: {'only writes ask' if reads else '--confirm-reads asks for all'}",
+                       asked == expected, repr(asked))
+
+    def test_todo_and_task_complete(self):
+        todo = {"items": [{"text": "one", "status": "done"}, {"text": "two", "status": "in_progress"}, "three"]}
+        c, fake = self.make_fake_commander([
+            self._call("todo", todo),
+            [fake_openai.tool_call_chunk(0, id="x", name="execute_bash", arguments='{"command": "true"}'),
+             fake_openai.tool_call_chunk(1, id="y", name="task_complete", arguments='{"summary": "early"}'),
+             fake_openai.usage_chunk(1, 1)],
+            self._call("task_complete", {"summary": "All done."}, id="c3")])
+        status = c.run("task")
+        results = {m["tool_call_id"]: m["content"] for m in c.conversation_history if m.get("role") == "tool"}
+        self.check("todo: the list is stored and shown", c.todos[2] == {"text": "three", "status": "pending"}
+                   and results.get("c1", "").endswith("(1/3 done):\n[x] one\n[>] two\n[ ] three"), repr(results))
+        self.check("finish: refused alongside other calls", results.get("y", "").startswith("Not accepted"))
+        self.check("finish: task_complete ends the run", status == "complete" and len(fake.calls) == 3,
+                   f"status={status} calls={len(fake.calls)}")
+        self.check("finish: the summary is shown and replayable",
+                   any(e[0] == "LOG" and e[1]["text"] == "All done." for e in c.sink.events)
+                   and AICommander.finish_summary(c.conversation_history[-2]) == "All done.")
+        self.check("todo: saved in the session", c.session_snapshot()["todos"] == c.todos)
+        r = c._todo({"items": json.dumps([{"text": "x", "status": "done"}])})
+        self.check("todo: a list sent as JSON text is accepted", c.todos == [{"text": "x", "status": "done"}], r)
+        c._set_todos([{"text": "a", "status": "completed"}, {"text": "b", "status": "In-Progress"},
+                      {"text": "c", "status": ["odd"]}])
+        self.check("todo: status spellings normalized", [t["status"] for t in c.todos]
+                   == ["done", "in_progress", "pending"], repr(c.todos))
+        c.cwd = "/"
+        c.discard_session("cleared")
+        self.check("todo: /clear forgets the task list and the cwd", c.todos == [] and c.cwd == c.start_cwd)
+        self.check("prompt: no claim of unlimited thinking", "unlimited" not in c.get_system_prompt())
+
+        # After a compaction the task list is shown to the model again.
+        c2, fake2 = self.make_fake_commander([self._done()], model="gpt-test", compress_algorithm="truncate")
+        c2.todos = [{"text": "keep me", "status": "in_progress"}]
+        history = [{"role": "system", "content": c2.get_system_prompt()}, {"role": "user", "content": "start"}]
+        for i in range(4):
+            history += [{"role": "assistant", "content": None, "tool_calls": [{"id": f"t{i}", "type": "function",
+                         "function": {"name": "execute_bash", "arguments": '{"command": "ls"}'}}]},
+                        {"role": "tool", "tool_call_id": f"t{i}", "content": "A" * 4000}]
+        c2.conversation_history, c2.persist_history = history, True
+        c2.max_prompt_len = c2._estimate_input_tokens(history[:2]) + 1500
+        c2.run("next")
+        sent = fake2.calls[0]["messages"] if fake2.calls else []
+        self.check("todo: shown again after compaction",
+                   sent and sent[-1]["content"].startswith("[CONTEXT COMPACTED]") and "[>] keep me" in sent[-1]["content"],
+                   repr(sent[-1:])[:300])
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            flag = os.path.join(tmp, "flag")
+            c3, fake3 = self.make_fake_commander([self._call("task_complete", {"summary": "a"}),
+                                                  self._call("task_complete", {"summary": "b"}, id="c2")],
+                                                 verify_command=f"test -f {flag} || {{ touch {flag}; exit 1; }}")
+            status = c3.run("task")
+            first = next(m for m in c3.conversation_history if m.get("role") == "tool")
+            self.check("finish: --verify gates task_complete", status == "complete" and len(fake3.calls) == 2
+                       and first["content"].startswith("[VERIFY FAILED]"), f"status={status}")
+            prompt = os.path.join(tmp, "PROMPT.md")
+            with open(prompt, "w") as f:
+                f.write("Build the thing.\n")
+            c4, fake4 = self.make_fake_commander([
+                self._call("task_complete", {"summary": "item 1", "objective_complete": False}),
+                self._call("task_complete", {"summary": "all", "objective_complete": True})])
+            status = c4.run_loop(prompt, 5)
+            tools = {t["function"]["name"]: t for t in fake4.calls[0]["tools"]} if fake4.calls else {}
+            self.check("finish: objective_complete ends a --loop", status == "loop_complete"
+                       and len(fake4.calls) == 2 and "objective_complete"
+                       in tools.get("task_complete", {}).get("function", {}).get("parameters", {}).get("properties", {}),
+                       f"status={status} calls={len(fake4.calls)}")
+
+    def test_background_jobs(self):
+        c, fake = self.make_fake_commander([
+            self._call("execute_bash", {"command": "sleep 0.3; echo job-done; exit 4", "background": True}),
+            self._call("execute_bash", {"command": "sleep 1"}, id="c2"),
+            self._done()])
+        c.run("bg")
+        started = next(m for m in c.conversation_history if m.get("role") == "tool")
+        self.check("jobs: a background call returns at once", started["content"].startswith("Started background job 1"),
+                   started["content"])
+        notes = [m for m in fake.calls[2]["messages"] if "[Background job 1 exited with code 4" in str(m.get("content"))] \
+            if len(fake.calls) > 2 else []
+        self.check("jobs: the exit is reported with the last output", notes and "job-done" in notes[0]["content"],
+                   repr(notes))
+        c2 = self.make_commander()
+        c2._start_job("sleep 30")
+        proc = c2.jobs[1][0]
+        c2._cleanup()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        self.check("jobs: killed and cleaned up at exit", proc.returncode is not None
+                   and not os.path.isdir(c2._scratch))
 
     def test_project_instructions(self):
         import tempfile
@@ -2265,6 +2422,10 @@ def main():
     runner.test_ralph_loop()
     runner.test_project_instructions()
     runner.test_headless_cli()
+    runner.test_shell_and_cwd()
+    runner.test_read_only_commands()
+    runner.test_todo_and_task_complete()
+    runner.test_background_jobs()
 
     if not args.skip_live:
         print("\n=== Live integration tests (network) ===")

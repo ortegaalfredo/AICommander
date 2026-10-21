@@ -72,9 +72,14 @@ It supports two presentation modes:
   environment variables and JSON-lines events (`--json`).
 - **Web search** — using the duck-duck-go `ddgs` Python package (installed via requirements.txt).
 - **Approval gate** — review each command before it runs, or auto-approve.
+  Read-only commands (`ls`, `cat`, `grep`, `git status`, ...) and `read_file`
+  run without asking unless `--confirm-reads` is given.
 - **Command timeouts** — prevent runaway commands (configurable).
-- **Output limits** — command output is capped and truncated with a sentinel so
-  the model never receives unbounded text.
+- **Output limits** — command output is capped so the model never receives
+  unbounded text: the start and the end are kept (that is where errors and test
+  summaries are), and the full output is saved to a file the model can grep.
+- **Background jobs** — servers, watchers and long builds run in the
+  background; the agent is told when they exit.
 - **Context compression** — two pluggable algorithms keep the conversation
   history within the model's prompt budget.
 - **OS-level sandbox** — optional [Landlock](https://landlock.io/) sandbox on
@@ -188,6 +193,7 @@ panel. In `--nogui` mode a request is required on the command line.
 | `--model` | Model name (required; default `$AIC_MODEL`). |
 | `--api-key` | API key (required; default `$AIC_API_KEY` or `$OPENAI_API_KEY`). Prefer the variables: a key on the command line is visible to every process, the agent's own commands included. |
 | `--auto-approve` | Auto-approve command execution (for testing). |
+| `--confirm-reads` | Ask before read-only commands and `read_file` too (by default they run without asking). |
 | `--no-thinking` | Hide thinking tokens from output. |
 | `--timeout` | Command timeout in seconds (default: `120`). |
 | `--max-prompt-len` | Maximum prompt length in tokens (default: `80000`). |
@@ -261,16 +267,33 @@ empty thinking and progressively stop thinking. It is cleared when you send a
 new request, and if an endpoint refuses it, AI-Commander retries without it
 and stops sending it for the session.
 
-The agent has four tools. `read_file`, `edit_file` (exact string
+The agent has six tools. `read_file`, `edit_file` (exact string
 replacement) and `write_file` view and change files without shell quoting, so
 weaker models stop breaking files with `sed` and heredocs; each goes through
-the approval gate, which shows edits as a diff. `execute_bash(command)` runs
-everything else in a pseudo-terminal (PTY). The PTY gives the command a real terminal
-environment (so interactive tools and `tput`-style programs work) and lets the
-agent capture output, enforce a timeout, and kill the whole process group when
-needed. Output is streamed live to the console panel and the final result is
-truncated to `--max-output-bytes` with the literal sentinel
-`output too long: truncated` appended when the limit is exceeded.
+the approval gate, which shows edits as a diff. `todo` keeps the agent's task
+list (shown back to it after the context is compacted, and saved in the
+session), and `task_complete(summary)` ends the task.
+
+`execute_bash(command)` runs everything else with `bash` (`/bin/sh` if bash
+is missing; PowerShell on Windows) in a pseudo-terminal (PTY). The PTY gives
+the command a real terminal environment (so interactive tools and
+`tput`-style programs work) and lets the agent capture output, enforce a
+timeout, and kill the whole process group when needed. The working directory
+carries over between calls: a `cd` persists (shell variables and `export`s do
+not), relative paths in the file tools resolve against it, and it is saved in
+the session. `--verify` always runs where AI-Commander was started.
+
+Output is streamed live to the console panel. Past `--max-output-bytes` the
+result keeps the first 30% and the last 70%, cut at whole lines, with a marker
+naming a temporary file that holds the full output, and the literal sentinel
+`output too long: truncated` appended. A command whose output passes 1 MiB
+(or 5x `--max-output-bytes`, whichever is larger) is killed.
+
+With `background: true`, `execute_bash` starts the command in the background
+and returns at once with its pid and log file; when the job exits, its exit
+code and last lines are reported to the agent at its next step. Jobs still
+running when AI-Commander exits are killed, and the temporary files (saved
+outputs, job logs) are removed.
 
 ---
 
@@ -431,8 +454,17 @@ command (syntax highlighted) in a dialog:
 
 The file tools go through the same gate: `edit_file` and `write_file` show
 the change as a unified diff (in `--nogui` mode the diff is printed before the
-question), and `read_file` asks too, like `cat` would. An edit whose
-`old_string` is missing or ambiguous is refused before you are asked.
+question). An edit whose `old_string` is missing or ambiguous is refused
+before you are asked.
+
+Commands that only read run without asking: every command of the pipeline or
+list must be one of `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`,
+`cd`, `pwd`, `echo`, `stat`, `du`, `diff`, `sort`, `uniq`, `cut`, `jq`,
+`git status/diff/log/show/blame/ls-files/grep`, ... (extend the list with
+`$AIC_READ_ONLY_COMMANDS`), with no `$(...)`, backticks, redirection other
+than to `/dev/null`, background `&`, or writing option (`find -exec/-delete`,
+`sort -o`, ...). Anything else asks. `read_file` runs without asking too.
+`--confirm-reads` turns this off, so every call asks.
 
 For a moment after the dialog opens its keys are ignored, so typing that was
 meant for the prompt can never approve a command by accident. In `--nogui`
@@ -459,10 +491,10 @@ on disk, so the system prompt tells the agent to:
 - do the single most important unfinished item and verify it;
 - record what it did and what remains in the plan file (`IMPLEMENTATION_PLAN.md`
   unless the prompt names one) and append build/test learnings to `AGENTS.md`;
-- end the iteration with `TASKCOMPLETE`, or with `LOOPCOMPLETE` once the whole
-  objective is done.
+- end the iteration with `task_complete`, setting `objective_complete` once
+  the whole objective is done.
 
-The loop stops on `LOOPCOMPLETE`, when an iteration fails (API error), when you
+The loop stops on `objective_complete` (or a `LOOPCOMPLETE` line), when an iteration fails (API error), when you
 stop it, or after `--max-iterations` (default 10, `0` = unlimited). An
 iteration that hits `--max-steps` just ends, and the next one starts fresh.
 Combine it with `--verify` so "done" has to pass your tests.
@@ -481,12 +513,15 @@ being repeated in each request.
 
 ### The verification gate
 
-The completion marker only counts on a line of its own or at the end of the
-reply, so "I'll say TASKCOMPLETE once the tests pass" does not end the run.
-With `--verify CMD`, a completion signal is checked by running `CMD` (with the
-normal timeout and output limits, no approval needed): exit 0 accepts it;
-anything else sends the output back to the model as `[VERIFY FAILED]` and the
-run continues.
+The agent finishes by calling `task_complete` with a summary for you, on its
+own: a `task_complete` sent alongside other tool calls is refused, so the
+agent has seen their results before it finishes. For models that write it
+instead, a `TASKCOMPLETE` line still ends the run; it only counts on a line of
+its own or at the end of the reply, so "I'll say TASKCOMPLETE once the tests
+pass" does not. With `--verify CMD`, completion is checked by running `CMD`
+(with the normal timeout and output limits, no approval needed): exit 0
+accepts it; anything else sends the output back to the model as
+`[VERIFY FAILED]` and the run continues.
 
 ---
 
