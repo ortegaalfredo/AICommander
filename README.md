@@ -11,7 +11,7 @@ in control through an approval gate.
 It supports two presentation modes:
 
 - **Default (TUI)** — a [Textual](https://textual.textualize.io/)-based,
-  Norton-Commander-style terminal UI: agent output and console/shell panes, a
+  Norton-Commander-style terminal UI: an agent pane and a Status/Shell/Tools pane, a
   multi-line prompt, a status line and a function-key bar, with full mouse
   support (select to copy, right/middle-click to paste, resizable panes,
   foldable output, clickable links) and `Ctrl+F` search.
@@ -87,12 +87,16 @@ It supports two presentation modes:
   `/dev/pts`.
 - **Two presentation modes** — full TUI or plain CLI (`--nogui`).
 - **Agent tabs** — the TUI runs any number of independent agents side by
-  side, each with its own conversation, session file, console and shell
-  (`Ctrl+T` opens one, `Ctrl+G` or a click switches).
+  side, each with its own conversation, session file, Status, Shell and Tools
+  panes (`Ctrl+T` opens one, `Ctrl+G` or a click switches). After a restart the
+  tab that was on screen is shown again.
+- **Status pane** — the files the agent changed (click one for its diff), the
+  running command and background jobs with their latest output, and what the
+  model's context holds.
 - **Mouse copy & paste** — drag to select text in any pane (copied
   automatically, re-joining soft-wrapped lines), double-click a word,
   triple-click a line, right/middle-click to paste.
-- **Find, folding and links** — `Ctrl+F` searches the agent log or console;
+- **Find, folding and links** — `Ctrl+F` searches the agent log, the Tools pane or a diff;
   thinking, command output and session summaries fold to one clickable line; `Ctrl+click`
   opens URLs and file paths.
 - **Multi-line prompt with history** — Enter sends, Ctrl+J/Shift+Enter adds a
@@ -305,16 +309,17 @@ The default Textual interface is a Norton-Commander-style split screen:
 
 - **Agent tabs**: the strip above the left pane has one tab per agent; `+`
   (or `Ctrl+T`) opens another. Every tab is an independent agent with its own
-  conversation, session file and lock, approval mode, console and shell, and
+  conversation, session file and lock, approval mode, Status, Shell and Tools panes, and
   agents in background tabs keep working. Selecting a tab (a click, or
-  `Ctrl+G` then its number) switches the agent pane, the console/shell pane and
+  `Ctrl+G` then its number) switches the agent pane, the right pane and
   the status line to it; the prompt keeps a draft per tab. A tab shows `◆` when
   its agent waits for approval (the dialog opens when you select it) and `●`
   when a run finished while you were elsewhere (a background tab waiting for
   approval pulses). The `×` of the current tab (or
   `/closetab`) closes it: its agent stops, its shell exits and its session is
-  discarded (asked twice if there is a conversation). The sandbox is shared:
-  it is applied once, to the whole process, at startup.
+  discarded (asked twice if there is a conversation). After a restart the tab
+  that was on screen is selected again, each on the right-pane tab it showed.
+  The sandbox is shared: it is applied once, to the whole process, at startup.
 - **Left pane — Agent**: the model's streamed answer (live, word-wrapped and
   re-wrapped when the terminal is resized), its thinking in dim italics
   (folded to `▸ ✻ thinking · N lines` once it ends; click to unfold), each
@@ -322,11 +327,30 @@ The default Textual interface is a Norton-Commander-style split screen:
   messages. The pane title shows an LLM-generated summary of the task, and its
   bottom border the agent's task list (from its `todo` tool): progress and the
   current item, e.g. `☑ 2/5 · ▸ Run the tests`. Each update of the list is a
-  single folded `▸ todo · 2/5 done` line in the pane (click to unfold);
-  `/todo` prints the whole list.
-- **Right pane — Console / Shell** of the current agent tab: two tabs (click
-  them or press `F3`; each agent tab remembers its choice).
-  *Console* shows every command the agent runs with its live output and exit
+  single folded `▸ todo · 2/5 done` line in the pane (click to unfold).
+  A click on the bottom border slides the whole list open under the pane
+  (done, current and pending items; a click or `Esc` closes it); `/todo`
+  prints it in the pane.
+- **Right pane — Status / Shell / Tools** of the current agent tab: three tabs
+  (click them or press `F3` to cycle; each agent tab remembers its choice). A
+  hidden tab with news is marked: `Tools ●` for new output, `Status (2)` for
+  files changed out of sight.
+  *Status* (the default) has three sections; a click on a title folds one:
+  **Changes** lists the files the agent changed in this conversation with
+  their `+added −removed` lines — made with its file tools, or with commands
+  inside a git repository (found by comparing `git status` and `HEAD` around
+  each command; `AIC_TRACK_CHANGES=0` turns that off). A click shows the diff
+  against the file before the agent first touched it; `Esc` goes back. The
+  list is saved with the session and `/clear` empties it.
+  **Jobs** shows the running command with its last lines of output, and the
+  background jobs with their latest output and a `stop` button (finished ones
+  with their exit code).
+  **Context** shows how the prompt splits into system prompt, user messages,
+  replies, reasoning and tool results against the budget, and the last reply
+  (tokens, cache hits, speed, finish reason, tool calls), warning when it was
+  cut off or announced tool calls that never arrived. A click lists every
+  message the model gets.
+  *Tools* shows every command the agent runs with its live output and exit
   code; the output folds to its `▸ $ command · N lines` header once the
   command completes, and so does a session summary (click to unfold).
   *Shell* is an embedded, colored interactive shell with scrollback. It
@@ -339,7 +363,7 @@ The default Textual interface is a Norton-Commander-style split screen:
   command, waiting for approval, retrying) with elapsed time, step count,
   context usage against the prompt budget, cumulative tokens, tokens/second,
   the approval mode, sandbox state, model, working directory and session file.
-- **Function-key bar**: `1 Help · 2 Auto · 3 Shell · 4 Copy · 5 Paste ·
+- **Function-key bar**: `1 Help · 2 Auto · 3 Panes · 4 Copy · 5 Paste ·
   6 Focus · 7 Zoom · 8 Clear · 9 Stop · 10 Quit`; the labels are clickable.
 
 The agent runs in a background thread and communicates with the UI through a
@@ -362,6 +386,7 @@ controls, so they are **not** added to prompt history:
 | `/todo` | — | Print the agent's task list (its progress is always in the agent pane's bottom border). |
 | `/loop [file]` | — | Start a [ralph loop](#ralph-loop-mode) over a prompt file (default `PROMPT.md`), up to `--max-iterations`. |
 | `/stop` | — | Stop the running agent (same as `F9`). |
+| `/pause` | `/resume` | Pause the agent after its current step without ending the run (the running command or reply finishes first); `/pause` again or `/resume` goes on with the same conversation, step count and reasoning. Messages typed while paused are delivered on resume. |
 | `/newtab` | — | Open a new agent tab (same as `Ctrl+T`). |
 | `/closetab` | — | Close the current agent tab, discarding its conversation (twice if it has one). |
 | `/tab N` | — | Select agent tab N (same as `Alt+N`). |
@@ -379,7 +404,7 @@ controls, so they are **not** added to prompt history:
 | `Tab` | Complete a `/command`; otherwise move to the next pane. |
 | `F1` | Help. |
 | `F2` | Toggle auto-approve. |
-| `F3` | Switch the right pane between Console and Shell. |
+| `F3` | Cycle the right pane: Status → Shell → Tools. |
 | `F4` / `F5` | Copy (the selection, or the last answer) / paste. |
 | `F6` | Move the focus to the next pane (also the way out of the Shell). |
 | `F7` | Zoom the focused pane to full screen; `Escape` restores it. |
@@ -387,7 +412,7 @@ controls, so they are **not** added to prompt history:
 | `F9` | Stop the agent (a pending LLM response is cut off immediately). |
 | `Ctrl+C` | Copy the selection; otherwise stop a running agent; press twice while idle to quit. |
 | `F10` / `Ctrl+Q` | Quit (every tab's session and the history are saved). |
-| `Ctrl+F` | Find in the agent log, or in the console when it has the focus: incremental and case-insensitive; `Enter`/`↑` previous match, `↓` next, `Esc` closes. A match inside folded output unfolds it. |
+| `Ctrl+F` | Find in the agent log, or in the Tools pane or a diff when it has the focus: incremental and case-insensitive; `Enter`/`↑` previous match, `↓` next, `Esc` closes. A match inside folded output unfolds it. |
 | `Ctrl+T` | Open a new agent tab. |
 | `Ctrl+G` | Go to an agent tab: a list opens; `1`…`9` or `↑`/`↓` `Enter` select, `Ctrl+G` again (or `Tab`) the next tab, `N` a new tab, `X` closes the highlighted one, `Esc` cancels. Plain control keys work in every terminal, unlike Alt/Ctrl+digit, which terminals such as Tilix and GNOME Terminal keep for themselves. |
 | `Y` / `N` / `A` | In the approval dialog: approve / reject / always approve. |

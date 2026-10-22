@@ -8,7 +8,7 @@ plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.4.1"
+__version__ = "2.5.0"
 
 import argparse
 import asyncio
@@ -701,7 +701,8 @@ class EventSink:
     Event kinds: LOG, ERROR, USER_REQUEST, LLM_STREAM, THINKING_STREAM,
     CONSOLE_STREAM (internal calls such as the summarizer), CMD_EXEC,
     CMD_OUTPUT, CMD_COMPLETE, APPROVAL_REQUEST, STATUS_UPDATE, TOKEN_USAGE,
-    TASK_TITLE, TODO (the task list: items), SYSTEM and SHUTDOWN.
+    TASK_TITLE, TODO (the task list: items), CHANGES (a file the agent changed:
+    path, count), SYSTEM and SHUTDOWN.
     """
 
     def emit(self, kind: str, payload: dict):
@@ -945,6 +946,17 @@ class AICommander:
         self.cwd = self.start_cwd  # where the next command starts: follows the last command's `cd`
         self.todos: list[dict[str, str]] = []  # the model's task list (the todo tool)
         self.jobs: dict[int, tuple] = {}  # background jobs still to report: n -> (Popen, log path, command)
+        self.job_history: dict[int, tuple] = {}  # every job, for the TUI: n -> (Popen, log path, command, start)
+        # Files the agent changed: path -> {"before": text before its first change (None: it did
+        # not exist, False: binary or too large), "via": "file" or "bash"}. Bash edits are found
+        # with git status around each command (AIC_TRACK_CHANGES=0 turns that off).
+        self.changes: dict[str, dict] = {}
+        self.track_changes = _env_bool("AIC_TRACK_CHANGES", True)
+        self._dirty_text: dict[str, tuple] = {}  # modified files' text before a command: path -> (stat, text)
+        self._git_modes: dict[str, str] = {}  # repo root -> how its untracked files are listed
+        self.last_reply: dict[str, Any] = {}  # the last agent-loop reply: finish reason, tokens, speed
+        self.selected_at = 0.0  # when the TUI last showed this session's tab (the latest reopens on screen)
+        self.pane = ""  # the TUI's right-panel tab for this session (status, shell or tools)
         self._job_count = self._output_count = 0
         self._scratch: str | None = None  # temp dir for the cwd file, saved outputs and job logs
 
@@ -958,6 +970,8 @@ class AICommander:
         # scripted fake client disable it so it cannot consume scripted turns.
         self.task_summary_enabled = True
         self.stop_event = threading.Event()
+        self.resume_event = threading.Event()  # cleared while paused (see pause)
+        self.resume_event.set()
         self.suggestion_queue: queue.Queue = queue.Queue()
         self._session_write_lock = threading.RLock()
         self._active_streams: set = set()
@@ -1012,6 +1026,23 @@ class AICommander:
                                 "prompt is complete and verified with nothing left to do; false when this "
                                 "iteration's item is done but work remains"})]
 
+    def pause(self, paused: bool = True):
+        """Hold the run before its next LLM call (the current step finishes) or
+        let it go on; its conversation, step count and reasoning stay as they are."""
+        (self.resume_event.clear if paused else self.resume_event.set)()
+
+    @property
+    def paused(self) -> bool:
+        return not self.resume_event.is_set()
+
+    def _wait_if_paused(self, step: int):
+        if self.paused and not self.stop_event.is_set():
+            self.sink.emit("STATUS_UPDATE", {"step": step, "max_steps": self.max_steps, "phase": "paused"})
+            self._log("[PAUSED] The agent is paused; resume it to go on.", style="yellow")
+            self.resume_event.wait()
+            if not self.stop_event.is_set():
+                self._log("[RESUMED]", style="yellow")
+
     def _log(self, message: str, style: str = ""):
         self.sink.emit("LOG", {"text": message, "style": style})
 
@@ -1021,6 +1052,7 @@ class AICommander:
     def request_stop(self):
         """Stop the run: commands are killed and a pending LLM stream is closed."""
         self.stop_event.set()
+        self.resume_event.set()  # a paused run wakes up to stop
         for stream in list(self._active_streams):
             with contextlib.suppress(Exception):
                 stream.close()
@@ -1085,6 +1117,11 @@ class AICommander:
             "api_base": self.base_url,
             "cwd": self.cwd,
             "todos": list(self.todos),
+            "selected_at": self.selected_at,
+            "pane": self.pane,
+            "changes": {path: {**c, "before": c["before"] if not isinstance(c["before"], str)
+                               or len(c["before"]) <= 256 * 1024 else False}
+                        for path, c in list(self.changes.items())},
             "instance_number": self.instance_number,
             "step_count": self.step_count,
             "usage": dict(self.usage_totals),
@@ -1227,6 +1264,13 @@ class AICommander:
         if isinstance(data.get("cwd"), str) and os.path.isdir(data["cwd"]):
             self.cwd = data["cwd"]
         self.todos = self.normalize_todos(data.get("todos")) or []
+        selected = data.get("selected_at")
+        self.selected_at = float(selected) if isinstance(selected, (int, float)) else 0.0
+        self.pane = str(data.get("pane") or "")
+        changes = data.get("changes")
+        self.changes = {path: {"before": c.get("before"), "via": str(c.get("via") or "file")}
+                        for path, c in (changes.items() if isinstance(changes, dict) else ())
+                        if isinstance(c, dict) and isinstance(c.get("before"), (str, type(None), bool))}
         if notify:
             self._log(f"[SESSION] Restored {len(restored)} message(s) from {os.path.basename(self.session_file)} "
                       f"(session {self.session_id}, step {self.step_count})", style="green")
@@ -1245,6 +1289,8 @@ class AICommander:
         """Forget the conversation (/clear, /new) and overwrite the session file,
         so the next startup does not resurrect it."""
         self.conversation_history, self.todos, self.cwd = [], [], self.start_cwd
+        self.changes, self._dirty_text, self.last_reply = {}, {}, {}
+        self.job_history = {n: job for n, job in self.job_history.items() if job[0].poll() is None}
         self.step_count = 0
         self.initial_prompt = self.task_summary = ""
         self.usage_totals = dict.fromkeys(self.usage_totals, 0)
@@ -1724,14 +1770,23 @@ Rules:
                 atexit.register(self._cleanup)
         return self._scratch
 
+    @staticmethod
+    def _kill_proc(proc) -> None:
+        if proc.poll() is None:
+            with contextlib.suppress(Exception):
+                if _IS_WINDOWS:
+                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=5)
+                else:
+                    os.killpg(proc.pid, signal.SIGTERM)
+
+    def kill_job(self, n: int) -> None:
+        """Stop background job *n* (the TUI's Status pane); the model hears of its exit as usual."""
+        if n in self.job_history:
+            self._kill_proc(self.job_history[n][0])
+
     def _cleanup(self) -> None:
         for proc, _log, _command in self.jobs.values():
-            if proc.poll() is None:
-                with contextlib.suppress(Exception):
-                    if _IS_WINDOWS:
-                        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=5)
-                    else:
-                        os.killpg(proc.pid, signal.SIGTERM)
+            self._kill_proc(proc)
         if self._scratch:
             shutil.rmtree(self._scratch, ignore_errors=True)
 
@@ -2089,6 +2144,7 @@ Rules:
             os.makedirs(os.path.dirname(full), exist_ok=True)
             with open(full, "w", encoding="utf-8", newline="") as f:
                 f.write(after)
+            self._note_change(full, before if exists else None, "file")
             return f"OK: {done} (+{added} -{removed} lines)."
         return f"{summary} (+{added} -{removed})", preview or "(no changes)\n", apply
 
@@ -2376,6 +2432,12 @@ Rules:
         cap = params.get("max_tokens")
         truncated = finish_reason == "length" or bool(
             cap and usage is not None and (getattr(usage, "completion_tokens", 0) or 0) >= cap)
+        if stream_display:  # an agent-loop reply, for the Status pane
+            self.last_reply = {"finish_reason": finish_reason, "tool_calls": len(tool_calls), "truncated": truncated,
+                               "seconds": time.monotonic() - started,
+                               **({"prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                                   "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                                   "cached_tokens": self._extract_cached_tokens(usage)} if usage is not None else {})}
         # reasoning_content lets the loop detect reasoning-only turns.
         return self._assistant_response("".join(content) or None, tool_calls or None, "".join(thinking) or None,
                                         truncated=truncated)
@@ -2529,6 +2591,115 @@ Rules:
                 return str(args.get("summary") or "").strip() if isinstance(args, dict) else ""
         return ""
 
+    # --- Changed files (the TUI's Status pane) ------------------------------------
+
+    _SNAPSHOT_LIMIT = 1 << 20  # larger files are listed as changed, without a diff
+
+    @classmethod
+    def file_snapshot(cls, path: str):
+        """A file's text for a diff: None when it does not exist, False when it is
+        binary, too large or unreadable."""
+        try:
+            if os.path.getsize(path) > cls._SNAPSHOT_LIMIT:
+                return False
+            with open(path, "rb") as f:
+                return f.read().decode("utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError):
+            return False
+
+    def _note_change(self, path: str, before, via: str) -> None:
+        path = os.path.normpath(path)
+        if path not in self.changes:
+            self.changes[path] = {"before": before, "via": via}
+        self.sink.emit("CHANGES", {"path": path, "count": len(self.changes)})
+
+    @staticmethod
+    def _git(root: str, *args: str) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(["git", "--no-optional-locks", "-C", root, *args], capture_output=True,
+                                  timeout=10, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def _git_state(self, cwd: str, snapshot: bool = True, untracked: str = "") -> tuple[str, dict, str, str] | None:
+        """Before a bash command: (repo root, {path: (mtime, size) or None} of every
+        file git reports as modified or untracked, HEAD, how untracked files were
+        listed); None outside a repository. Untracked files are listed one by one,
+        or by directory when there are too many."""
+        if not self.track_changes:
+            return None
+        top = self._git(cwd, "rev-parse", "--show-toplevel", "HEAD")
+        if not top or not top.stdout.strip():  # (no HEAD yet in a new repository: exit 128, root still printed)
+            return None
+        root, _, head = top.stdout.decode("utf-8", "replace").strip().partition("\n")
+        root, head = os.path.normpath(root), head.strip() if top.returncode == 0 else ""
+        for mode in [untracked] if untracked else dict.fromkeys([self._git_modes.get(root, "all"), "normal"]):
+            status = self._git(root, "status", "--porcelain", "-z", f"--untracked-files={mode}")
+            if not status or status.returncode:
+                return None
+            entries, state, skip = status.stdout.decode("utf-8", "replace").split("\0"), {}, False
+            if len(entries) <= 5000:
+                self._git_modes[root] = mode
+                break
+        else:
+            return None  # too many to watch cheaply
+        for entry in entries:
+            if skip or len(entry) < 4:
+                skip = False
+                continue
+            skip = entry[0] in "RC"  # a rename's original path follows
+            if entry.endswith("/"):
+                continue  # an untracked directory (listed by directory)
+            path = os.path.normpath(os.path.join(root, entry[3:]))
+            state[path] = self._stat(path)
+            if snapshot and entry[:2] != "??" and path not in self.changes and state[path]:
+                cached = self._dirty_text.get(path)
+                if not cached or cached[0] != state[path]:  # its text now, in case the command changes it
+                    self._dirty_text[path] = (state[path], self.file_snapshot(path))
+        return root, state, head, mode
+
+    @staticmethod
+    def _stat(path: str) -> tuple | None:
+        try:
+            st = os.stat(path)
+            return st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    def _note_git_changes(self, before: tuple[str, dict, str, str] | None) -> None:
+        """After a bash command: record the files it changed, as git status shows them
+        (and the files of any commits it made)."""
+        after = self._git_state(before[0], snapshot=False, untracked=before[3]) if before else None
+        if not after:
+            return
+        (root, old, head, _), new = before, after[1]
+        paths = [p for p in new if p not in old] + [p for p in old if new.get(p, self._stat(p)) != old[p]]
+        if head and after[2] != head:
+            names = self._git(root, "diff", "--name-only", "-z", head, after[2] or "HEAD")
+            paths += [os.path.normpath(os.path.join(root, n)) for n in
+                      (names.stdout.decode("utf-8", "replace").split("\0") if names and not names.returncode else ())
+                      if n and os.path.normpath(os.path.join(root, n)) not in old]
+        for path in dict.fromkeys(paths):
+            if path in self.changes:
+                continue
+            if path in old:  # it already differed from HEAD: its text before the command, if kept
+                cached = self._dirty_text.get(path)
+                before_text = cached[1] if cached and cached[0] == old[path] else None if old[path] is None else False
+            else:  # it matched the commit before the command (or did not exist)
+                shown = self._git(root, "show", f"{head}:" + os.path.relpath(path, root).replace(os.sep, "/"))
+                before_text = None if not head or not shown or shown.returncode else (
+                    False if len(shown.stdout) > self._SNAPSHOT_LIMIT else self._decode_or_false(shown.stdout))
+            self._note_change(path, before_text, "bash")
+
+    @staticmethod
+    def _decode_or_false(data: bytes):
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+
     def _start_job(self, command: str) -> str:
         """Start *command* in the background, logging to a file; its exit is reported by _report_jobs."""
         self._command_started, label = time.monotonic(), f"{command} &"
@@ -2553,6 +2724,7 @@ Rules:
         except OSError as exc:
             return done(f"ERROR: the background job could not start: {exc}", 1)
         self.jobs[n] = (proc, log, command)
+        self.job_history[n] = (proc, log, command, time.time())
         stop = f"taskkill /PID {proc.pid} /T /F" if _IS_WINDOWS else f"kill -- -{proc.pid}"
         return done(f"Started background job {n} (pid {proc.pid}) in {cwd}. Its output goes to {log} (read it "
                     f"with tail or grep); you will be told when it exits. Stop it with: {stop}", 0)
@@ -2652,6 +2824,7 @@ Rules:
                 result = self._start_job(command)
             elif approved:
                 cwd = self.cwd
+                git = self._git_state(cwd)
                 try:
                     output, code = self.execute_bash_command(command)
                     result = f"Command executed with exit code {code}.\nOutput:\n{output}"
@@ -2660,6 +2833,7 @@ Rules:
                 except Exception as exc:
                     result = f"Command execution failed: {exc}"
                     self._log_error(result)
+                self._note_git_changes(git)
                 if self.cwd != cwd:
                     result += f"\n[working directory is now {self.cwd}]"
             else:
@@ -2724,6 +2898,9 @@ Rules:
         completed, status = False, "stopped"
         try:
             while step < self.max_steps and not self.stop_event.is_set():
+                self._wait_if_paused(step)
+                if self.stop_event.is_set():
+                    break
                 step += 1
                 self.step_count = step
                 self.sink.emit("STATUS_UPDATE", {"step": step, "max_steps": self.max_steps, "phase": "llm_call"})
@@ -2883,7 +3060,7 @@ if _TEXTUAL_AVAILABLE:
     _URL_RE = re.compile(r"https?://[^\s<>\"'`)\]]+")
     _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _SLASH_COMMANDS = ("/help", "/autoapprove", "/aa", "/approve", "/reject", "/suggest ", "/clear", "/new",
-                       "/session", "/reload", "/copy", "/todo", "/loop ", "/stop", "/newtab", "/closetab", "/tab ",
+                       "/session", "/reload", "/copy", "/todo", "/loop ", "/stop", "/pause", "/resume", "/newtab", "/closetab", "/tab ",
                        "/quit", "/exit")
     # Palette (Norton Commander blues).
     _C_USER, _C_ANSWER, _C_THINK = "bold #ffff5f", "#87d7ff", "italic #b2b28a"
@@ -3319,6 +3496,10 @@ if _TEXTUAL_AVAILABLE:
             return a, b
 
         async def _on_click(self, event: events.Click) -> None:
+            if event.y == self.outer_size.height - 1 and self.border_subtitle and self.has_class("agent-log"):
+                if event.chain == 1:  # the task list in the bottom border: slide the full list open
+                    await self.app.run_action("todos")
+                return
             hit = self._offset_at(event)
             if event.chain < 2:  # a click (not a drag): Ctrl opens a link, a fold header toggles
                 if hit is None or event.screen_offset != self._down_at:
@@ -3403,7 +3584,8 @@ if _TEXTUAL_AVAILABLE:
 
         def start(self, log: OutputLog) -> None:
             self.target, self.display = log, True
-            self.border_title = f"Find in the {'agent log' if log.has_class('agent-log') else 'console'}"
+            self.border_title = ("Find in the " + ("agent log" if log.has_class("agent-log") else
+                                                   "diff" if log.has_class("diff") else "Tools pane"))
             self.focus()
             self.select_all()
             self._search()
@@ -3907,6 +4089,383 @@ if _TEXTUAL_AVAILABLE:
                 self.animate("split", 50 * (total - 1) / total, duration=0.2, easing="out_cubic",
                              on_complete=lambda: setattr(self.parent.query_one("#left-panel").styles, "width", "1fr"))
 
+    class TodoPanel(Static):
+        """The agent's whole task list, sliding up under the agent log when its
+        bottom border is clicked; a click on it or Esc slides it shut."""
+
+        DEFAULT_CSS = """
+        TodoPanel { display: none; height: 0; overflow-y: auto; padding: 0 1; background: #0b2f5e;
+                    border: round #87d7ff; border-title-color: #ffff5f; border-title-style: bold;
+                    border-subtitle-color: #6f8fc0; }
+        """
+        _MARKS = {"done": ("✓ ", "bold #5fd75f", "#8a9bb8 strike"), "in_progress": ("▸ ", "bold #ffd75f", "bold #ffffff"),
+                  "pending": ("○ ", "#87d7ff", "#c8d0e0")}
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.shown = False
+            self._rows = 0
+
+        def set_items(self, todos: list) -> None:
+            """Fill the panel with *todos*; an open panel resizes to fit them."""
+            done = sum(t["status"] == "done" for t in todos)
+            self.border_title = f"Tasks · {done}/{len(todos)} done"
+            self.border_subtitle = "click or Esc to close"
+            text, width = Text(), max(8, (self.parent.size.width if self.parent else 80) - 4)
+            self._rows = 0
+            for i, t in enumerate(todos):
+                mark, mark_style, style = self._MARKS[t["status"]]
+                text.append(("\n" if i else "") + mark, mark_style).append(t["text"], style)
+                self._rows += max(1, -(-(cell_len(t["text"]) + 2) // width))
+            self.update(text)
+            if self.shown:
+                self.styles.animate("height", self._target(), duration=0.15, easing="out_cubic")
+
+        def _target(self) -> int:
+            return min(self._rows + 2, max(4, (self.parent.size.height if self.parent else 20) // 2))
+
+        def show(self, todos: list) -> None:
+            self.shown, self.display = True, True
+            self.set_items(todos)
+            self.styles.animate("height", self._target(), duration=0.2, easing="out_cubic")
+
+        def hide(self) -> None:
+            if self.shown:
+                self.shown = False
+                self.styles.animate("height", 0, duration=0.15, easing="in_cubic",
+                                    on_complete=lambda: setattr(self, "display", self.shown))
+
+        def on_click(self, event: events.Click) -> None:
+            event.stop()
+            self.hide()
+
+    class _Rows(Static):
+        """Text whose clickable spans are (row, x0, x1, callback); x1 None spans the row."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.spans: list[tuple] = []
+
+        def on_click(self, event: events.Click) -> None:
+            for row, x0, x1, callback in self.spans:
+                if event.y == row and x0 <= event.x < (x1 if x1 is not None else 1 << 30):
+                    event.stop()
+                    callback()
+                    return
+
+    _PANES = ("status", "shell", "tools")  # the right panel's tabs, in F3 order
+
+    def _prompt_messages(agent: AICommander) -> list[dict]:
+        """The messages the model gets with the next call (as if a message followed a final reply)."""
+        hist = list(agent.conversation_history)
+        return agent._validate_messages(hist + [{"role": "user", "content": ""}])[:-1] if hist else []
+    _CTX_PARTS = (("system", "#af87ff"), ("user", "#ffff5f"), ("replies", "#87d7ff"), ("reasoning", "#b2b28a"),
+                  ("tool results", "#5fd787"))
+
+    class StatusPane(Vertical, can_focus=True):
+        """The Status tab of the right panel: the files the agent changed (a click
+        shows the diff), the command and background jobs running, and what the
+        model's context holds (a click lists every message). A click on a
+        section title folds the section."""
+
+        def __init__(self, tab: AgentTab, **kwargs):
+            super().__init__(**kwargs)
+            self.tab = tab
+            self.diff_path: str | None = None
+            self.folded: set[str] = set()
+            self._measured: dict[str, tuple] = {}  # path -> (stat, (added, removed, label) or None)
+            self._job_ends: dict[int, float] = {}
+            self._ctx_cache: tuple = (None, None)
+            self._next = 0.0
+
+        def compose(self) -> ComposeResult:
+            yield _Rows(classes="head head-changes")
+            with VerticalScroll(classes="changes"):
+                yield _Rows(classes="changes-rows")
+            yield OutputLog(classes="diff")
+            yield _Rows(classes="head head-jobs")
+            yield _Rows(classes="jobs")
+            yield _Rows(classes="head head-context")
+            yield _Rows(classes="context")
+
+        def toggle(self, section: str) -> None:
+            self.folded ^= {section}
+            self.update(force=True)
+
+        def update(self, force: bool = False) -> None:
+            """Redraw (at most twice a second unless forced) while the pane is on screen."""
+            now = time.monotonic()
+            if not self.is_mounted or (not force and now < self._next):
+                return
+            self._next = now + 0.5
+            width = max(20, self.size.width)
+            self._update_changes(width)
+            self._update_jobs(width)
+            self._update_context(width)
+
+        def _head(self, section: str, title: str, detail: str, extra: tuple | None = None) -> None:
+            head = self.query_one(f".head-{section}", _Rows)
+            text = Text(no_wrap=True, overflow="ellipsis")
+            text.append(f" {'▸' if section in self.folded else '▾'} {title}", "bold #ffff5f")
+            text.append((" " if title.endswith("›") else " · ") + detail if detail else "", "#87d7ff")
+            head.spans = []
+            if extra:
+                label, callback = extra
+                text.append("  ")
+                head.spans.append((0, text.cell_len, text.cell_len + len(label), callback))
+                text.append(label, "bold #000000 on #87d7ff")
+            head.spans.append((0, 0, None, lambda: self.toggle(section)))
+            head.update(text)
+
+        # Changes --------------------------------------------------------------
+
+        def _show_path(self, path: str) -> str:
+            base = self.tab.agent.start_cwd
+            if path.startswith(base.rstrip(os.sep) + os.sep):
+                return os.path.relpath(path, base)
+            return path.replace(os.path.expanduser("~"), "~", 1)
+
+        def changed_files(self) -> list[tuple[str, dict, tuple]]:
+            """(path, change, (added, removed, label)) of every file that still differs."""
+            rows = []
+            for path, change in list(self.tab.agent.changes.items()):
+                stat = AICommander._stat(path)
+                cached = self._measured.get(path)
+                if not cached or cached[0] != stat:
+                    cached = self._measured[path] = (stat, self._measure(change["before"], path))
+                if cached[1] is not None:
+                    rows.append((path, change, cached[1]))
+            return rows
+
+        @staticmethod
+        def _measure(before, path: str) -> tuple | None:
+            """(added, removed, label) of a change; None when the file is as it was."""
+            after = AICommander.file_snapshot(path)
+            if after == before:
+                return None
+            label = "new" if before is None else "deleted" if after is None else ""
+            if before is False or after is False:
+                return None, None, label or "binary or large"
+            lines = list(difflib.unified_diff((before or "").splitlines(), (after or "").splitlines(), lineterm="", n=0))
+            return (sum(ln.startswith("+") for ln in lines[2:]), sum(ln.startswith("-") for ln in lines[2:]), label)
+
+        def _update_changes(self, width: int) -> None:
+            files, folded = self.changed_files(), "changes" in self.folded
+            if self.diff_path is not None:
+                self._head("changes", "Changes ›", self._show_path(self.diff_path), ("‹ back (Esc)", self.close_diff))
+            else:
+                self._head("changes", "Changes",
+                           f"{len(files)} file{'s' * (len(files) != 1)}" if files else "none yet")
+            self.query_one(".changes").display = not folded and self.diff_path is None
+            self.query_one(".diff").display = not folded and self.diff_path is not None
+            body = self.query_one(".changes-rows", _Rows)
+            text, body.spans = Text(no_wrap=True, overflow="ellipsis"), []
+            if not files:
+                text.append(" The files the agent changes appear here; a click shows the diff.", _C_DIM)
+            for row, (path, change, (added, removed, label)) in enumerate(files):
+                tail = Text()
+                if added is not None:
+                    tail.append(f" +{added}", "#5fd787").append(f" −{removed}", "#ff8787")
+                for note in (label, "bash" if change["via"] == "bash" else ""):
+                    if note:
+                        tail.append(f" · {note}", _C_DIM)
+                shown, room = self._show_path(path), max(8, width - tail.cell_len - 4)
+                if cell_len(shown) > room:
+                    shown = "…" + shown[-(room - 1):]
+                color = {"new": "#5fd787", "deleted": "#ff8787"}.get(label, "#ffd75f")
+                text.append("\n" if row else "").append(" ● ", color).append(shown.ljust(room), "#e5e5e5")
+                text.append_text(tail)
+                body.spans.append((row, 0, None, lambda p=path: self.open_diff(p)))
+            body.update(text)
+
+        def open_diff(self, path: str) -> None:
+            change = self.tab.agent.changes.get(path)
+            if change is None:
+                return
+            self.diff_path = path
+            log = self.query_one(".diff", OutputLog)
+            log.clear()
+            before, after = change["before"], AICommander.file_snapshot(path)
+            if before is False or after is False:
+                log.write_line("Binary, unreadable or larger than 1 MB: no diff to show.", _C_DIM)
+            else:
+                for line in list(difflib.unified_diff((before or "").splitlines(), (after or "").splitlines(),
+                                                      lineterm=""))[2:]:
+                    log.write_line(line, "#5fd787" if line.startswith("+") else "#ff8787" if line.startswith("-")
+                                   else "#87d7ff" if line.startswith("@@") else "#c8d0e0")
+            self.update(force=True)
+            log.scroll_home(animate=False)
+            log.focus()
+
+        def close_diff(self) -> bool:
+            if self.diff_path is None:
+                return False
+            self.diff_path = None
+            self.update(force=True)
+            self.focus()
+            return True
+
+        # Jobs -----------------------------------------------------------------
+
+        @staticmethod
+        def _tail(text: str, count: int) -> list[str]:
+            return [ln.strip() for ln in _clean_command_output(text).splitlines() if ln.strip()][-count:]
+
+        def _update_jobs(self, width: int) -> None:
+            tab, now = self.tab, time.time()
+            spin = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
+            text, body = Text(no_wrap=True, overflow="ellipsis"), self.query_one(".jobs", _Rows)
+            body.spans, lines = [], []
+            if tab.phase == "running" and tab.busy():
+                lines.append([(f" {spin} ", "#ffd75f"), (f"{_fmt_secs(time.monotonic() - tab._cmd_started)} · ", _C_DIM),
+                              (tab.current_command, "bold #e5e5e5")])
+                lines += [[("     " + ln, _C_DIM)] for ln in self._tail(tab.cmd_tail, 3)]
+            jobs = sorted(list(tab.agent.job_history.items()), key=lambda j: (j[1][0].poll() is not None, -j[0]))
+            running, finished = 0, 0
+            for n, (proc, log, command, started) in jobs:
+                code = proc.poll()
+                if code is None:
+                    running += 1
+                    stop = lambda n=n: (tab.agent.kill_job(n), self.app.notify(f"Stopping job {n}…", timeout=2))
+                    body.spans.append((len(lines), max(0, width - 6), None, stop))
+                    lines.append([(f" {spin} ", "#87d7ff"), (f"job {n} · {_fmt_secs(now - started)} · ", _C_DIM),
+                                  (command[:max(4, width - 30)], "#e5e5e5"), ("PAD", ""), (" stop ", "bold #ffffff on #af0000")])
+                    try:
+                        with open(log, "rb") as f:
+                            f.seek(max(0, os.path.getsize(log) - 4096))
+                            lines += [[("     " + ln, _C_DIM)] for ln in self._tail(f.read().decode("utf-8", "replace"), 2)]
+                    except OSError:
+                        pass
+                elif finished < 3:
+                    finished += 1
+                    ended = self._job_ends.setdefault(n, now)
+                    code = 128 - code if code < 0 else code
+                    lines.append([(" ✓ " if code == 0 else " ✗ ", _C_OK if code == 0 else _C_FAIL),
+                                  (f"job {n} · exit {code} · ran {_fmt_secs(ended - started)} · ", _C_DIM),
+                                  (command, "#c8d0e0")])
+            for i, parts in enumerate(lines):
+                line, button = Text(), None
+                for chunk, style in parts:
+                    if chunk == "PAD":  # what follows (the stop button) goes to the right edge
+                        button = Text()
+                    (line if button is None else button).append("" if chunk == "PAD" else chunk, style)
+                room = width - (button.cell_len + 1 if button else 0)
+                line.truncate(room, overflow="ellipsis")
+                if button:
+                    line.pad_right(room - line.cell_len + 1)
+                    line.append_text(button)
+                text.append("\n" if i else "").append_text(line)
+            if not lines:
+                text.append(" Nothing running. The current command and background jobs show here.", _C_DIM)
+            busy = (tab.phase == "running" and tab.busy()) + running
+            self._head("jobs", "Jobs", f"{busy} running" if busy else "idle")
+            body.display = "jobs" not in self.folded
+            body.update(text)
+
+        # Context ----------------------------------------------------------------
+
+        def context_parts(self) -> dict[str, int]:
+            """Estimated tokens per kind of message in the prompt the model gets."""
+            agent = self.tab.agent
+            hist = agent.conversation_history
+            key = (id(hist), len(hist), id(hist[-1]) if hist else 0)
+            if self._ctx_cache[0] != key:
+                parts = dict.fromkeys((name for name, _ in _CTX_PARTS), 0)
+                for msg in _prompt_messages(agent):
+                    tokens, role = agent._estimate_message_tokens(msg), msg.get("role")
+                    reasoning = len(msg.get("reasoning_content") or "") // 3
+                    parts["reasoning"] += reasoning
+                    parts[{"system": "system", "user": "user", "assistant": "replies"}.get(role, "tool results")] += \
+                        tokens - reasoning
+                self._ctx_cache = (key, parts)
+            return self._ctx_cache[1]
+
+        def _update_context(self, width: int) -> None:
+            agent, body = self.tab.agent, self.query_one(".context", _Rows)
+            parts, budget = self.context_parts(), max(1, agent._prompt_budget())
+            used = sum(parts.values())
+            self._head("context", "Context", f"{_fmt_tokens(used)} of {_fmt_tokens(budget)} · "
+                                             f"{min(999, used * 100 // budget)}%")
+            text, bar = Text(no_wrap=True, overflow="ellipsis"), max(10, width - 2)
+            text.append(" ")
+            filled = 0
+            for name, color in _CTX_PARTS:
+                cells = min(bar - filled, round(parts[name] * bar / budget))
+                text.append("█" * cells, color)
+                filled += cells
+            text.append("░" * (bar - filled), "#4f74b3")
+            text.append("\n")
+            for name, color in _CTX_PARTS:
+                text.append(" ■ ", color).append(f"{name} {_fmt_tokens(parts[name])}", "#c8d0e0")
+            reply, warn = agent.last_reply, ""
+            text.append("\n last reply: ", _C_DIM)
+            if not reply:
+                text.append("none yet", _C_DIM)
+            else:
+                prompt = reply.get("prompt_tokens") or 0
+                bits = [f"{reply.get('completion_tokens', '?')} tok out",
+                        *([f"{self.tab.tok_rate:.0f} tok/s"] if self.tab.tok_rate else []),
+                        f"finish {reply.get('finish_reason') or '?'}",
+                        f"{reply['tool_calls']} tool call{'s' * (reply['tool_calls'] != 1)}"]
+                if prompt:
+                    bits.insert(1, f"cache {(reply.get('cached_tokens') or 0) * 100 // prompt}%")
+                text.append(" · ".join(bits), "#c8d0e0")
+                if reply.get("truncated"):
+                    warn = "cut off at the output limit"
+                elif reply.get("finish_reason") == "tool_calls" and not reply["tool_calls"]:
+                    warn = "the server said tool_calls but none arrived"
+            if warn:
+                text.append(f"\n ⚠ {warn}", "bold #ff8787")
+            text.append("\n click for every message the model gets", _C_DIM)
+            body.spans = [(row, 0, None, lambda: self.app.push_screen(ContextScreen(self.tab.agent)))
+                          for row in range(5)]
+            body.display = "context" not in self.folded
+            body.update(text)
+
+    class ContextScreen(ModalScreen):
+        """Every message of the prompt the model gets next (folded; a click unfolds one)."""
+
+        CSS = """
+        ContextScreen { align: center middle; background: #000000 50%; }
+        ContextScreen OutputLog { width: 96%; height: 90%; border: double #5fd7ff; background: #0b2f5e;
+                                  border-title-color: #ffff5f; border-subtitle-color: #6f8fc0; }
+        """
+        BINDINGS = [Binding("escape,q", "close", show=False)]
+        _ROLE_STYLES = {"system": "bold #af87ff", "user": "bold #ffff5f", "assistant": "bold #87d7ff",
+                        "tool": "bold #5fd787"}
+
+        def __init__(self, agent: AICommander):
+            super().__init__()
+            self.agent = agent
+
+        def compose(self) -> ComposeResult:
+            yield OutputLog()
+
+        def on_mount(self) -> None:
+            log, agent = self.query_one(OutputLog), self.agent
+            messages = _prompt_messages(agent)
+            log.border_title = (f"What the model gets · {len(messages)} messages · "
+                                f"~{_fmt_tokens(agent._estimate_input_tokens(messages))} tokens")
+            log.border_subtitle = "a click unfolds a message · Esc closes"
+            for i, msg in enumerate(messages):
+                content = _content_text(msg.get("content"))
+                calls = [(tc.get("function") or {}) for tc in msg.get("tool_calls") or []]
+                preview = " ".join(content.split())[:90] or ", ".join(f"→ {fn.get('name')}" for fn in calls)
+                log.begin_fold(f"#{i:<3} {msg.get('role', '?'):<9} {_fmt_tokens(agent._estimate_message_tokens(msg)):>6}"
+                               f"  {preview}", self._ROLE_STYLES.get(msg.get("role"), "#c8d0e0"))
+                if msg.get("reasoning_content"):
+                    log.write_line("[reasoning] " + msg["reasoning_content"][:3000], _C_THINK)
+                if content:
+                    log.write_line(content[:6000] + (f"\n… ({len(content) - 6000} more characters)"
+                                                     if len(content) > 6000 else ""), "#e5e5e5")
+                for fn in calls:
+                    log.write_line(f"→ {fn.get('name')} {str(fn.get('arguments'))[:3000]}", _C_CMD)
+                log.end_fold()
+            log.focus()
+
+        def action_close(self) -> None:
+            self.dismiss()
+
     class _ClickBar(Static):
         """A one-row bar of clickable items: subclasses build (text, items)."""
 
@@ -3933,7 +4492,7 @@ if _TEXTUAL_AVAILABLE:
 
     class FKeyBar(_ClickBar):
         """Norton Commander style function-key bar."""
-        ITEMS = (("1", "Help", "help"), ("2", "Auto", "toggle_auto"), ("3", "Shell", "toggle_pane"),
+        ITEMS = (("1", "Help", "help"), ("2", "Auto", "toggle_auto"), ("3", "Panes", "toggle_pane"),
                  ("4", "Copy", "copy"), ("5", "Paste", "paste"), ("6", "Focus", "cycle_focus"),
                  ("7", "Zoom", "zoom"), ("8", "Clear", "clear"), ("9", "Stop", "stop"), ("10", "Quit", "quit"))
 
@@ -3950,13 +4509,20 @@ if _TEXTUAL_AVAILABLE:
             return text
 
     class PaneTabs(_ClickBar):
-        """The Console / Shell tab strip of the right panel (of the current agent tab)."""
+        """The Status / Shell / Tools tab strip of the right panel (of the current
+        agent tab); a hidden tab with news is marked."""
 
         def build(self, width: int) -> Text:
             self._spans = []
             text = Text(no_wrap=True, overflow="crop")
-            active = self.app.tab.pane if self.app.tab else "console"
-            for pane, label in (("console", " Console "), ("shell", " Shell ")):
+            tab = self.app.tab
+            active = tab.pane if tab else "status"
+            for pane in _PANES:
+                label = f" {pane.title()} "
+                if tab and pane != active and pane == "status" and tab.unseen_changes():
+                    label = f" Status ({tab.unseen_changes()}) "
+                elif tab and pane != active and pane == "tools" and tab.tools_unseen:
+                    label = " Tools ● "
                 style = "bold #000000 on #06989a" if pane == active else "#e5e5e5 on #0b2f5e"
                 self._add(text, label, style, f"show_pane('{pane}')")
                 text.append(" ")
@@ -4178,23 +4744,29 @@ if _TEXTUAL_AVAILABLE:
                   "right-click copies the selection, or pastes · middle-click pastes · the wheel scrolls · "
                   "drag the bar between the panels to resize them, double-click it to even them · "
                   "Ctrl+click opens a URL or file path · a click on a ▸/▾ line folds or unfolds it "
-                  "(thinking, command output and session summaries fold when they end)"),
-        ("Find", "Ctrl+F searches the agent log, or the console when it has the focus · Enter or ↑ goes to "
+                  "(thinking, command output and session summaries fold when they end) · "
+                  "a click on the task list in the agent panel's bottom border shows the whole list"),
+        ("Find", "Ctrl+F searches the agent log, or the Tools pane or a diff when it has the focus · Enter or ↑ goes to "
                  "the previous match, ↓ the next · Esc closes"),
         ("Clipboard", "Ctrl+C copies the selection · Ctrl+V pastes in the prompt · F4 copies the selection or the "
                       "last answer · F5 pastes · copies reach the desktop clipboard directly on X11/Xwayland, "
                       "through OSC 52 in terminals that support it, and wl-copy or pbcopy when present"),
         ("Agent", "F2 toggles auto-approve · F9 or Ctrl+C stops the agent · F8 twice clears the conversation"),
-        ("Tabs", "every tab is an independent agent with its own conversation, session file, console and shell "
+        ("Tabs", "every tab is an independent agent with its own conversation, session file, Status, Shell and Tools "
                  "(the sandbox is shared) · Ctrl+T or the + opens a tab · Ctrl+G picks one: 1-9 or ↑↓ Enter, "
                  "Ctrl+G again the next tab, X closes · a click on the tab strip selects · "
                  "the × of the current tab or /closetab closes it (twice if it has a "
                  "conversation, which is discarded) · ◆ waits for approval, ● finished while away · saved tabs "
                  "reopen on the next start"),
-        ("Panes", "F3 switches Console ⇄ Shell · F6 or Tab moves to the next pane · F7 zooms the focused pane "
-                  "(Esc restores) · in the Shell every key goes to the shell: leave it with F6 or the mouse"),
+        ("Panes", "F3 cycles the right panel: Status → Shell → Tools (a tab with news is marked) · F6 or Tab "
+                  "moves to the next pane · F7 zooms the focused pane (Esc restores) · in the Shell every key "
+                  "goes to the shell: leave it with F6 or the mouse"),
+        ("Status", "Changes: the files the agent changed (with its file tools, or with commands, found with git "
+                   "in a repository); a click shows the diff, Esc goes back · Jobs: the running command and the "
+                   "background jobs, with their latest output (stop ends a job) · Context: what the prompt holds, "
+                   "and the last reply; a click lists every message · a click on a section title folds it"),
         ("Quit", "F10 · Ctrl+Q · Ctrl+C twice while idle"),
-        ("Commands", "/help  /aa (/autoapprove)  /clear (/new)  /session  /reload  /copy  /todo  /stop  "
+        ("Commands", "/help  /aa (/autoapprove)  /clear (/new)  /session  /reload  /copy  /todo  /stop  /pause (/resume)  "
                      "/quit (/exit)  "
                      "·  /loop [file] runs a ralph loop over a prompt file (default PROMPT.md)  "
                      "·  /newtab  /closetab  /tab N  "
@@ -4252,9 +4824,14 @@ if _TEXTUAL_AVAILABLE:
             self.agent_log = OutputLog(id=f"agent-log-{self.uid}", classes="agent-log")
             self.console_log = OutputLog(id=f"console-log-{self.uid}", max_lines=5000)
             self.shell = ShellWidget(id=f"shell-widget-{self.uid}")
+            self.status = StatusPane(self, id=f"status-pane-{self.uid}")
             for widget in self.widgets:
                 widget.display = False
-            self.pane = "console"  # what the right panel shows for this tab: "console" or "shell"
+            self.pane = "status"  # what the right panel shows for this tab: one of _PANES
+            self.tools_unseen = False  # tool output arrived while the Tools tab was hidden
+            self.reopen_at = 0.0  # when its saved session says the tab was last on screen
+            self.changes_seen = 0  # changed files already seen on the Status tab
+            self.cmd_tail = ""  # the running command's latest output (the Status tab's Jobs)
             self.thread: threading.Thread | None = None
             self._idle_callbacks: list = []
             self.phase, self._phase_since = "idle", time.monotonic()
@@ -4273,11 +4850,23 @@ if _TEXTUAL_AVAILABLE:
 
         @property
         def widgets(self) -> tuple:
-            return self.agent_log, self.console_log, self.shell
+            return self.agent_log, self.console_log, self.shell, self.status
 
         @property
         def right_pane(self) -> Widget:
-            return self.shell if self.pane == "shell" else self.console_log
+            return {"status": self.status, "shell": self.shell}.get(self.pane, self.console_log)
+
+        def unseen_changes(self) -> int:
+            return max(0, len(self.agent.changes) - self.changes_seen)
+
+        def owns_focus(self, focused: Widget | None) -> str | None:
+            """"agent" or "right" when *focused* is in this tab's agent log or right panel."""
+            if focused is None:
+                return None
+            if focused is self.agent_log:
+                return "agent"
+            chain = focused.ancestors_with_self
+            return "right" if any(w in chain for w in (self.console_log, self.shell, self.status)) else None
 
         @property
         def auto_approve(self) -> bool:
@@ -4291,6 +4880,8 @@ if _TEXTUAL_AVAILABLE:
             """The tab bar's status glyph."""
             if self.pending_approval is not None:
                 return "◆ "
+            if self.busy() and self.agent.paused:
+                return "⏸ "
             if self.busy():
                 return _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)] + " "
             return "● " if self.unseen else ""
@@ -4309,6 +4900,8 @@ if _TEXTUAL_AVAILABLE:
                 restored = False
                 log.write_line(f"[SESSION] Could not restore the session: {exc}", _C_FAIL)
             if restored:
+                self.reopen_at = self.agent.selected_at  # the latest is the tab on screen at the last exit
+                self.pane = self.agent.pane if self.agent.pane in _PANES else self.pane
                 self.step = self.agent.step_count
                 self.total_tokens = self.agent.usage_totals.get("billable_tokens", 0)
                 self.render_history()
@@ -4377,9 +4970,11 @@ if _TEXTUAL_AVAILABLE:
             current = next((t["text"] for t in todos if t["status"] == "in_progress"),
                            next((t["text"] for t in todos if t["status"] == "pending"), ""))
             current = current if len(current) <= 60 else current[:59] + "…"
-            self.agent_log.border_subtitle = (escape_markup(f"☑ {done}/{len(todos)} · "
+            self.agent_log.border_subtitle = (escape_markup(f"☑ {done}/{len(todos)} ▴ · "
                                                             + (f"▸ {current}" if current else "all done"))
                                               if todos else "")
+            if self.app.tab is self:
+                self.app.sync_todo_panel(todos)
 
         def write_todos(self, todos: list, fold: bool = True) -> None:
             """The list in the agent log; folded, it is one line (▸ todo · 2/5 done) a click unfolds."""
@@ -4405,6 +5000,7 @@ if _TEXTUAL_AVAILABLE:
 
         def start(self, prompt: str, loop_file: str = "") -> None:
             self.agent.stop_event.clear()
+            self.agent.pause(False)
             self.agent.persist_history = True
             self.step = 0
             self._run_started = time.monotonic()
@@ -4440,6 +5036,8 @@ if _TEXTUAL_AVAILABLE:
 
         def tick(self) -> None:
             self._drain_events()
+            if self.pane == "status" and self is self.app.tab:
+                self.status.update()
             if self.thread is not None and not self.thread.is_alive():
                 self._drain_events()
                 self._on_finished()
@@ -4503,6 +5101,12 @@ if _TEXTUAL_AVAILABLE:
                 self._agent_write(text, "think" if kind == "THINKING_STREAM" else "text")
             elif kind == "CMD_OUTPUT":
                 self.console_log.write(text, "#d0d0d0")
+                self.cmd_tail = (self.cmd_tail + text)[-4096:]
+                self.tools_unseen = self.pane != "tools"
+            elif kind == "CHANGES":
+                if self.pane == "status" and self is self.app.tab:  # seen as it happens
+                    self.changes_seen = len(self.agent.changes)
+                self.status.update(force=True)
             elif kind == "CONSOLE_STREAM":
                 if p.get("label"):
                     self.console_log.begin_fold(p["label"].strip("[]").title(), "#ffd75f", rule=True)
@@ -4548,6 +5152,8 @@ if _TEXTUAL_AVAILABLE:
                          else "$ ") + self.current_command
                 log.write_line(label, _C_CMD)
                 console.begin_fold(label, _C_CMD, rule=True)
+                self.cmd_tail = ""
+                self.tools_unseen = self.pane != "tools"
                 self.set_phase("running")
             elif kind == "APPROVAL_REQUEST":
                 self.set_phase("approval")
@@ -4634,13 +5240,20 @@ if _TEXTUAL_AVAILABLE:
         PromptArea .text-area--cursor-line { background: #000000; }
         #status-bar { height: 1; background: #06989a; color: #000000; }
         #fkeys { height: 1; background: #000000; }
+        StatusPane { border: solid #6f8fc0; height: 1fr; background: #12488b; }
+        StatusPane:focus-within { border: double #87d7ff; }
+        StatusPane .head { height: 1; background: #0b2f5e; }
+        StatusPane .changes { height: 1fr; }
+        StatusPane OutputLog, StatusPane OutputLog:focus { border: none; height: 1fr; display: none; }
+        StatusPane .jobs { height: auto; max-height: 40%; }
+        StatusPane .context { height: auto; }
         FindBar { display: none; height: 3; background: #000000; color: #f2f2f2; border: round #ffd75f;
                   border-title-color: #ffd75f; border-subtitle-color: #6f8fc0; }
         """
         BINDINGS = [
             Binding("f1", "help", "Help", priority=True),
             Binding("f2", "toggle_auto", "Auto-approve", priority=True),
-            Binding("f3", "toggle_pane", "Console/Shell", priority=True),
+            Binding("f3", "toggle_pane", "Status/Shell/Tools", priority=True),
             Binding("f4", "copy", "Copy", priority=True),
             Binding("f5", "paste", "Paste", priority=True),
             Binding("f6", "cycle_focus", "Next pane", priority=True),
@@ -4653,6 +5266,7 @@ if _TEXTUAL_AVAILABLE:
             Binding("ctrl+t", "new_tab", "New tab", priority=True),
             Binding("ctrl+g", "tab_switcher", "Go to tab", priority=True),
             Binding("ctrl+f", "find", "Find", show=False),  # not priority: the shell keeps Ctrl+F
+            Binding("escape", "escape", show=False),
             # Not a priority binding: the focused widget and the screen copy a
             # selection first; only an unhandled Ctrl+C stops or quits.
             Binding("ctrl+c", "interrupt", "Stop / quit", show=False),
@@ -4668,7 +5282,7 @@ if _TEXTUAL_AVAILABLE:
             self._approval_screen: ApprovalScreen | None = None
             self._last_ctrl_c = self._last_clear = 0.0
             self._last_close: tuple = (None, 0.0)
-            self._last_status = self._last_tabs = None
+            self._last_status = self._last_tabs = self._last_panes = None
             self._ctx_cache = (None, 0)
             self._last_autocopy = None
             self._shutting_down = False
@@ -4680,6 +5294,7 @@ if _TEXTUAL_AVAILABLE:
                 with Vertical(id="left-panel"):
                     yield AgentTabs(id="agent-tabs")
                     yield Vertical(id="agent-stack")
+                    yield TodoPanel(id="todo-panel")
                 yield Splitter()
                 with Vertical(id="right-panel"):
                     yield PaneTabs(id="tabs")
@@ -4718,7 +5333,7 @@ if _TEXTUAL_AVAILABLE:
             atexit.register(self.save_sessions, "process_exit")
             first = await self._open_tab(self.args.session_file, self.args.instance_number, self.args.session_msg)
             await self._restore_tabs()
-            self.select_tab(first)
+            self.select_tab(max(self.tabs, key=lambda t: t.reopen_at))  # the tab on screen at the last exit
             self.prompt.focus()
             self.set_interval(1 / 20, self._tick)
             request = " ".join(self.args.request or [])
@@ -4749,7 +5364,7 @@ if _TEXTUAL_AVAILABLE:
             tab = AgentTab(self, session_file, instance_number, session_msg)
             self.tabs.append(tab)
             await self.query_one("#agent-stack").mount(tab.agent_log)
-            await self.query_one("#switcher").mount(tab.console_log, tab.shell)
+            await self.query_one("#switcher").mount(tab.status, tab.console_log, tab.shell)
             tab.start_up()
             if select:
                 self.select_tab(tab)
@@ -4768,14 +5383,16 @@ if _TEXTUAL_AVAILABLE:
             focus = None
             if old is not None:
                 old.draft = self.prompt.text
-                focus = ("agent" if self.focused is old.agent_log else
-                         "right" if self.focused in (old.console_log, old.shell) else None)
+                focus = old.owns_focus(self.focused)
                 for widget in old.widgets:
                     widget.display = False
                 self.prompt.set_text(tab.draft)
                 self.prompt._hist_pos = None
             self.tab, tab.unseen = tab, False
+            tab.agent.selected_at = time.time()
             tab.agent_log.display = tab.right_pane.display = True
+            self.sync_todo_panel()
+            self._seen_pane(tab)
             self.query_one("#tabs", PaneTabs).refresh()
             if focus:
                 self.call_after_refresh((tab.agent_log if focus == "agent" else tab.right_pane).focus)
@@ -4924,6 +5541,10 @@ if _TEXTUAL_AVAILABLE:
             if tabs != self._last_tabs or any(t.pending_approval is not None for t in self.tabs if t is not tab):
                 self._last_tabs = tabs  # (a tab waiting for approval pulses)
                 bar.refresh()
+            panes = self.query_one("#tabs", PaneTabs)
+            if (marks := panes.build(panes.size.width or 80).plain) != self._last_panes:
+                self._last_panes = marks  # a hidden Status or Tools tab got news
+                panes.refresh()
             now = time.monotonic()
             busy = tab.busy()
             elapsed = _fmt_secs(now - tab._phase_since)
@@ -4932,6 +5553,9 @@ if _TEXTUAL_AVAILABLE:
                 phase = ("●", "ready")
             elif tab.phase == "approval":
                 phase = ("◆", "waiting for your approval")
+            elif tab.agent.paused:
+                phase = ("⏸", f"paused {elapsed} · /pause resumes" if tab.phase == "paused"
+                         else "pausing after this step")
             elif tab.phase == "retry":
                 phase = ("↻", tab.retry_text or "retrying")
             elif tab.phase == "running":
@@ -4998,6 +5622,7 @@ if _TEXTUAL_AVAILABLE:
                 "/clear": self._clear_conversation, "/new": self._clear_conversation,
                 "/session": self._report_session, "/reload": self._reload_session,
                 "/copy": lambda: self._copy_answer(), "/todo": self._report_todos, "/stop": self.action_stop,
+                "/pause": self.action_pause, "/resume": lambda: self.action_pause(resume=True),
                 "/loop": lambda: self.tab.start_loop(arg or "PROMPT.md"),
                 "/newtab": lambda: self.call_later(self.action_new_tab), "/closetab": self.action_close_tab,
                 "/tab": lambda: self.action_select_tab(int(arg)) if arg.isdigit() else self.agent_log.write_line(
@@ -5032,6 +5657,9 @@ if _TEXTUAL_AVAILABLE:
                 tab.agent.discard_session("cleared")
                 tab.agent_log.clear()
                 tab.console_log.clear()
+                tab.changes_seen, tab.tools_unseen = 0, False
+                tab.status.close_diff()
+                tab.status.update(force=True)
                 tab.step, tab.total_tokens, tab.tok_rate = 0, 0, 0.0
                 tab.set_title("")
                 tab.show_todos([])
@@ -5164,9 +5792,9 @@ if _TEXTUAL_AVAILABLE:
         def show_pane(self, pane: str, focus: bool = True) -> None:
             tab = self.tab
             tab.right_pane.display = False
-            tab.pane = pane
+            tab.pane = tab.agent.pane = pane
             tab.right_pane.display = True
-            self.query_one("#tabs", PaneTabs).refresh()
+            self._seen_pane(tab)
             if focus and pane == "shell":
                 self.call_after_refresh(tab.shell.focus)
             elif isinstance(self.focused, ShellWidget):
@@ -5175,8 +5803,16 @@ if _TEXTUAL_AVAILABLE:
         def action_show_pane(self, pane: str) -> None:
             self.show_pane(pane)
 
+        def _seen_pane(self, tab: AgentTab) -> None:
+            if tab.pane == "status":
+                tab.changes_seen = len(tab.agent.changes)
+                tab.status.update(force=True)
+            elif tab.pane == "tools":
+                tab.tools_unseen = False
+            self.query_one("#tabs", PaneTabs).refresh()
+
         def action_toggle_pane(self) -> None:
-            self.show_pane("console" if self.tab.pane == "shell" else "shell")
+            self.show_pane(_PANES[(_PANES.index(self.tab.pane) + 1) % len(_PANES)])
 
         def action_copy(self) -> None:
             text = self.screen.get_selected_text()
@@ -5193,11 +5829,12 @@ if _TEXTUAL_AVAILABLE:
 
         def action_cycle_focus(self) -> None:
             order = [self.prompt, self.tab.agent_log, self.tab.right_pane]
-            current = next((i for i, w in enumerate(order) if w is self.focused), -1)
+            chain = self.focused.ancestors_with_self if self.focused else []
+            current = next((i for i, w in enumerate(order) if w in chain), -1)
             order[(current + 1) % len(order)].focus()
 
         def action_find(self) -> None:
-            self.query_one(FindBar).start(self.console_log if self.focused is self.console_log else self.agent_log)
+            self.query_one(FindBar).start(self.focused if isinstance(self.focused, OutputLog) else self.agent_log)
 
         def open_link(self, link: str) -> None:
             """Ctrl+click: a URL opens in the browser, an existing path[:line] in
@@ -5226,8 +5863,30 @@ if _TEXTUAL_AVAILABLE:
             if self.screen.maximized is not None:
                 self.screen.minimize()
                 return
-            widget = self.focused if isinstance(self.focused, (OutputLog, ShellWidget)) else self.agent_log
+            widget = self.focused if isinstance(self.focused, (OutputLog, ShellWidget, StatusPane)) else self.agent_log
             self.screen.maximize(widget, container=False)
+
+        def action_todos(self) -> None:
+            """Slide the full task list open under the agent log, or shut again."""
+            panel = self.query_one(TodoPanel)
+            if panel.shown:
+                panel.hide()
+            elif self.agent.todos:
+                panel.show(list(self.agent.todos))
+
+        def action_escape(self) -> None:
+            """Esc slides the task list shut, or leaves a diff on the Status tab."""
+            panel = self.query_one(TodoPanel)
+            if panel.shown:
+                panel.hide()
+            elif self.tab.pane == "status":
+                self.tab.status.close_diff()
+
+        def sync_todo_panel(self, todos: list | None = None) -> None:
+            """Keep an open task list in step with the current tab's (closed when it has none)."""
+            panel, todos = self.query_one(TodoPanel), list(self.agent.todos if todos is None else todos)
+            if panel.shown:
+                panel.set_items(todos) if todos else panel.hide()
 
         def action_clear(self) -> None:
             now = time.monotonic()
@@ -5237,6 +5896,20 @@ if _TEXTUAL_AVAILABLE:
             else:
                 self._last_clear = now
                 self.notify("Press F8 again to clear the conversation.", timeout=2)
+
+        def action_pause(self, resume: bool = False) -> None:
+            """/pause: hold the agent after its current step, /pause again or /resume to go on."""
+            tab = self.tab
+            if not tab.busy():
+                self.notify("The agent is not running.", timeout=2)
+            elif resume or tab.agent.paused:
+                if tab.agent.paused:
+                    tab.agent.pause(False)
+                    tab.set_phase("thinking")
+            else:
+                tab.agent.pause()
+                self.agent_log.write_line("Pausing after the current step… (/pause again or /resume to go on; "
+                                          "messages you type now are delivered on resume)", "#ffd75f")
 
         def action_stop(self) -> None:
             if self.tab.busy():

@@ -990,8 +990,8 @@ class TestRunner:
                 await until(pilot, lambda: tab1.shell._pid is not None, 5)
                 await pilot.press("ctrl+g", "2")  # from inside the shell
                 await pilot.pause(0.1)
-                r["each tab remembers its right pane"] = (app.tab is tab2 and tab2.pane == "console"
-                                                          and tab2.console_log.display and not tab1.shell.display)
+                r["each tab remembers its right pane"] = (app.tab is tab2 and tab2.pane == "status"
+                                                          and tab2.status.display and not tab1.shell.display)
                 await pilot.press("f3")
                 shells = await until(pilot, lambda: tab2.shell._pid is not None, 5)
                 r["each tab has its own shell"] = shells and tab2.shell._pid != tab1.shell._pid
@@ -1044,6 +1044,9 @@ class TestRunner:
                 fake(tab3, [answer("third-answer")])
                 await pilot.press(*"hello", "enter")
                 await until(pilot, lambda: not tab3.busy())
+                await pilot.press("f3", "f3")  # Status -> Shell -> Tools
+                await pilot.pause(0.1)
+                r["the tab on screen is the last selected"] = tab3.agent.selected_at > tab1.agent.selected_at > 0
                 await pilot.press("f10")
                 await pilot.pause(0.3)
             r["quit"] = not app.is_running
@@ -1054,8 +1057,14 @@ class TestRunner:
             r = {}
             async with app.run_test(size=(140, 36)) as pilot:
                 await pilot.pause(0.3)
-                r["restart reopens the saved tabs"] = (len(app.tabs) == 2 and app.tab is app.tabs[0]
-                                                       and app.tabs[1].session_file == base + "2")
+                r["restart reopens the saved tabs"] = len(app.tabs) == 2 and app.tabs[1].session_file == base + "2"
+                saved = [aic.read_session_file(p)[0] for p in (base, base + "2")]
+                r["the session files say which tab was on screen last"] = (
+                    saved[1].get("selected_at", 0) > saved[0].get("selected_at", 0) > 0)
+                r["restart shows the tab that was on screen"] = len(app.tabs) == 2 and app.tab is app.tabs[1]
+                r["each tab gets its right-panel tab back"] = (
+                    len(app.tabs) == 2 and app.tabs[1].pane == "tools" and app.tabs[1].console_log.display
+                    and app.tabs[0].pane == "shell")
                 if len(app.tabs) == 2:
                     r["reopened tab shows its conversation"] = "third-answer" in app.tabs[1].agent_log.plain_text
                     r["first tab restored too"] = "first-answer" in app.tabs[0].agent_log.plain_text
@@ -1962,7 +1971,27 @@ class TestRunner:
                     await pilot.pause(0.05)
                 await pilot.pause(0.2)
                 subtitle = to_content(app.agent_log.border_subtitle or "").plain
-                results["border shows progress and the current item"] = subtitle == "☑ 1/3 · ▸ fix [b]two[/b]"
+                results["border shows progress and the current item"] = subtitle == "☑ 1/3 ▴ · ▸ fix [b]two[/b]"
+                panel, log_widget = app.query_one(aic.TodoPanel), app.agent_log
+                border = (log_widget.outer_size.width - 5, log_widget.outer_size.height - 1)
+                await pilot.click(log_widget, offset=border)
+                await pilot.pause(0.5)
+                shown = panel.render().plain if panel.display else ""
+                results["clicking the border slides the list open"] = (
+                    panel.shown and panel.outer_size.height == 5 and "✓ one" in shown and "▸ fix [b]two[/b]" in shown
+                    and "○ three" in shown and panel.border_title == "Tasks · 1/3 done")
+                app.tab.show_todos(items + [{"text": "four", "status": "pending"}])
+                await pilot.pause(0.4)
+                results["the open list follows updates"] = (panel.outer_size.height == 6
+                                                            and "○ four" in panel.render().plain)
+                await pilot.click(panel)
+                await pilot.pause(0.4)
+                results["a click on the list closes it"] = not panel.shown and not panel.display
+                await pilot.click(log_widget, offset=border)
+                await pilot.pause(0.4)
+                await pilot.press("escape")
+                await pilot.pause(0.4)
+                results["Esc closes it"] = not panel.shown and not panel.display
                 log = app.agent_log.plain_text
                 results["one folded log line"] = "▸ todo · 1/3 done · 3 lines" in log and "exit 0" not in log
                 await pilot.press(*"/todo", "enter")
@@ -1986,6 +2015,187 @@ class TestRunner:
             aic.clipboard_write_native, aic.clipboard_read_native = native
         for name, ok in results.items():
             self.check(f"tui todo: {name}", ok, repr(results) if not ok else "")
+
+    def test_tui_pause(self):
+        """/pause holds the run after its current step without ending it; typed
+        messages wait for /resume, which goes on with the same conversation."""
+        if not aic._TEXTUAL_AVAILABLE:
+            self.check("tui pause: skipped (textual missing)", True)
+            return
+        import asyncio
+        import time
+        args = argparse.Namespace(
+            api_base="http://localhost:1/v1", model="test-model", api_key="test-key", auto_approve=True,
+            no_thinking=False, timeout=30, max_prompt_len=80000, max_output_bytes=10240, max_steps=10,
+            debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
+            request=[], session_file="", instance_number=1, session_msg="[SESSION] off",
+            sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd(),
+            loop="", max_iterations=10, verify="", confirm_reads=False)
+        script = [self._call("execute_bash", {"command": "sleep 2; echo first-step"}),
+                  self._call("execute_bash", {"command": "echo second-step"}, id="c2"), self._done()]
+
+        async def until(pilot, condition, timeout=10):
+            end = time.monotonic() + timeout
+            while not condition() and time.monotonic() < end:
+                await pilot.pause(0.05)
+            return condition()
+
+        async def scenario():
+            app = aic.CommanderApp(args, aic.PromptHistory(None))
+            results = {}
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause(0.2)
+                tab, fake = app.tab, fake_openai.FakeOpenAIClient(script)
+                tab.agent.client, tab.agent.task_summary_enabled = fake, False
+                await pilot.press(*"go", "enter")
+                await until(pilot, lambda: tab.phase == "running")
+                await pilot.press(*"/pause", "enter")
+                results["the running command finishes, then the run holds"] = (
+                    await until(pilot, lambda: tab.phase == "paused") and tab.busy() and len(fake.calls) == 1
+                    and "first-step" in tab.console_log.plain_text)
+                await pilot.pause(0.3)
+                results["nothing is sent while paused"] = len(fake.calls) == 1 and tab.busy()
+                await pilot.press(*"also check the logs", "enter")
+                await pilot.press(*"/resume", "enter")
+                results["resume finishes the same run"] = await until(pilot, lambda: not tab.busy())
+                await pilot.pause(0.2)  # the last events reach the panes
+                sent = fake.calls[1]["messages"] if len(fake.calls) > 1 else []
+                results["the conversation went on, with the queued message"] = (
+                    len(fake.calls) == 3 and tab.step == 3 and sent[1]["content"] == "go"
+                    and any("also check the logs" in str(m.get("content")) for m in sent)
+                    and "second-step" in tab.console_log.plain_text)
+                await pilot.press(*"/pause", "enter")
+                await pilot.pause(0.1)
+                results["/pause on an idle agent changes nothing"] = not tab.agent.paused
+            return results
+
+        native = aic.clipboard_write_native, aic.clipboard_read_native
+        aic.clipboard_write_native, aic.clipboard_read_native = (lambda text: False), (lambda: None)
+        try:
+            results = asyncio.run(scenario())
+        finally:
+            aic.clipboard_write_native, aic.clipboard_read_native = native
+        for name, ok in results.items():
+            self.check(f"tui pause: {name}", ok, repr(results) if not ok else "")
+
+    def test_tui_status(self):
+        """The Status tab: changed files (file tools and, via git, commands) with
+        diffs, jobs, the context, folding, tab badges, the session and /clear."""
+        if not aic._TEXTUAL_AVAILABLE or not shutil.which("git"):
+            self.check("tui status: skipped (textual or git missing)", True)
+            return
+        import asyncio
+        import subprocess
+        import tempfile
+        import time
+        repo = tempfile.mkdtemp()
+        git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+        with open(os.path.join(repo, "config.yml"), "w") as f:
+            f.write("port: 8001\ncache: 4096\n")
+        for cmd in (["init", "-q"], ["add", "."], ["commit", "-qm", "init"]):
+            subprocess.run(git + cmd, cwd=repo, check=True)
+        session = os.path.join(repo, ".aicsession")
+        args = argparse.Namespace(
+            api_base="http://localhost:1/v1", model="test-model", api_key="test-key", auto_approve=True,
+            no_thinking=False, timeout=30, max_prompt_len=80000, max_output_bytes=10240, max_steps=10,
+            debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
+            request=[], session_file=session, instance_number=1, session_msg="[SESSION] test",
+            sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd(),
+            loop="", max_iterations=10, verify="", confirm_reads=False)
+        script = [self._call("write_file", {"path": "notes.md", "content": "one\ntwo\n"}),
+                  self._call("execute_bash", {"command": "sed -i s/8001/8003/ config.yml"}, id="c2"),
+                  self._call("execute_bash", {"command": "sleep 1; echo bg-line", "background": True}, id="c3"),
+                  self._done()]
+
+        async def until(pilot, condition, timeout=10):
+            end = time.monotonic() + timeout
+            while not condition() and time.monotonic() < end:
+                await pilot.pause(0.05)
+            return condition()
+
+        async def scenario():
+            app = aic.CommanderApp(args, aic.PromptHistory(None))
+            r = {}
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause(0.2)
+                tab = app.tab
+                status, bar = tab.status, app.query_one("#tabs")
+                tab.agent.client, tab.agent.task_summary_enabled = fake_openai.FakeOpenAIClient(script), False
+                tab.agent.cwd = tab.agent.start_cwd = repo
+                r["Status is the default tab, then Shell and Tools"] = (
+                    tab.pane == "status" and status.display and bar.build(80).plain.startswith(" Status   Shell   Tools "))
+                await pilot.press(*"go", "enter")
+                await until(pilot, lambda: not tab.busy())
+                await pilot.pause(0.6)
+                rows = status.query_one(".changes-rows").render().plain
+                r["file-tool and command changes are listed"] = (
+                    "notes.md" in rows and "+2 −0 · new" in rows and "config.yml" in rows and "+1 −1 · bash" in rows)
+                r["Tools is marked when it has news"] = "Tools ●" in bar.render().plain
+                await pilot.click(status.query_one(".changes-rows"), offset=(3, 1))
+                await pilot.pause(0.2)
+                diff = status.query_one(".diff").plain_text
+                r["a click shows the diff"] = (status.diff_path == os.path.join(repo, "config.yml")
+                                               and "-port: 8001" in diff and "+port: 8003" in diff)
+                await pilot.press("escape")
+                await pilot.pause(0.2)
+                r["Esc goes back to the list"] = status.diff_path is None and status.query_one(".changes").display
+                jobs = status.query_one(".jobs")
+                r["a background job shows with its output"] = "job 1" in jobs.render().plain
+                await until(pilot, lambda: "✓ job 1 · exit 0" in jobs.render().plain, 5)
+                r["a finished job shows its exit"] = "✓ job 1 · exit 0" in jobs.render().plain
+                context = status.query_one(".context").render().plain
+                r["the context shows its parts and the last reply"] = (
+                    "system" in context and "tool results" in context and "last reply:" in context
+                    and "of 64.0k" in status.query_one(".head-context").render().plain)
+                await pilot.click(status.query_one(".context"), offset=(3, 1))
+                r["a click on the context lists every message"] = await until(
+                    pilot, lambda: type(app.screen).__name__ == "ContextScreen", 3)
+                await pilot.press("escape")
+                await pilot.pause(0.2)
+                await pilot.click(status.query_one(".head-jobs"), offset=(4, 0))
+                await pilot.pause(0.2)
+                r["a click on a section title folds it"] = not jobs.display and "▸ Jobs" in \
+                    status.query_one(".head-jobs").render().plain
+                await pilot.press("f3")
+                await pilot.pause(0.1)
+                await pilot.press("f3")
+                await pilot.pause(0.1)
+                r["F3 cycles to Shell, then Tools, which clears its mark"] = (
+                    tab.pane == "tools" and tab.console_log.display and "Tools ●" not in bar.build(80).plain)
+                tab.agent.client = fake_openai.FakeOpenAIClient(
+                    [self._call("write_file", {"path": "more.md", "content": "x\n"}), self._done()])
+                await pilot.press(*"more", "enter")
+                await until(pilot, lambda: not tab.busy())
+                await pilot.pause(0.2)
+                r["Status counts files changed out of sight"] = "Status (1)" in bar.build(80).plain
+                saved = aic.read_session_file(session)[0].get("changes") or {}
+                r["the changes are saved with the session"] = (
+                    saved.get(os.path.join(repo, "config.yml"), {}).get("before") == "port: 8001\ncache: 4096\n"
+                    and saved.get(os.path.join(repo, "notes.md"), {}).get("before") is None)
+                await pilot.press("f3")
+                await pilot.pause(0.1)
+                await pilot.press(*"/clear", "enter")
+                await pilot.pause(0.5)
+                r["/clear forgets them"] = (not tab.agent.changes and tab.pane == "status"
+                                            and "none yet" in status.query_one(".head-changes").render().plain)
+            return r
+
+        native = aic.clipboard_write_native, aic.clipboard_read_native
+        aic.clipboard_write_native, aic.clipboard_read_native = (lambda text: False), (lambda: None)
+        try:
+            results = asyncio.run(scenario())
+            saver = self.make_commander(session_file=session)
+            saver.conversation_history = [{"role": "user", "content": "hi"}]
+            saver.changes = {"/x": {"before": "a", "via": "bash"}}
+            saver.save_session("t")
+            fresh = self.make_commander(session_file=session)
+            results["changes come back with the session"] = (
+                fresh.load_session(notify=False) and fresh.changes == {"/x": {"before": "a", "via": "bash"}})
+        finally:
+            aic.clipboard_write_native, aic.clipboard_read_native = native
+            shutil.rmtree(repo, ignore_errors=True)
+        for name, ok in results.items():
+            self.check(f"tui status: {name}", ok, repr(results) if not ok else "")
 
     def test_live_call_llm(self):
         c = self.make_commander()
@@ -2475,6 +2685,8 @@ def main():
     runner.test_tui_end_to_end()
     runner.test_tui_tabs()
     runner.test_tui_todo()
+    runner.test_tui_pause()
+    runner.test_tui_status()
     runner.test_completion_marker()
     runner.test_file_tools()
     runner.test_verify_gate()
