@@ -4155,6 +4155,13 @@ if _TEXTUAL_AVAILABLE:
 
     _PANES = ("status", "shell", "tools")  # the right panel's tabs, in F3 order
 
+    def _crop(text: Text, width: int) -> Text:
+        """*text* with every line cut to *width* cells (a Static wraps long lines otherwise)."""
+        lines = text.split("\n", allow_blank=True)
+        for line in lines:
+            line.truncate(width, overflow="ellipsis")
+        return Text("\n").join(lines)
+
     def _prompt_messages(agent: AICommander) -> list[dict]:
         """The messages the model gets with the next call (as if a message followed a final reply)."""
         hist = list(agent.conversation_history)
@@ -4215,7 +4222,7 @@ if _TEXTUAL_AVAILABLE:
                 head.spans.append((0, text.cell_len, text.cell_len + len(label), callback))
                 text.append(label, "bold #000000 on #87d7ff")
             head.spans.append((0, 0, None, lambda: self.toggle(section)))
-            head.update(text)
+            head.update(_crop(text, max(1, head.size.width or self.size.width)))
 
         # Changes --------------------------------------------------------------
 
@@ -4420,7 +4427,7 @@ if _TEXTUAL_AVAILABLE:
             body.spans = [(row, 0, None, lambda: self.app.push_screen(ContextScreen(self.tab.agent)))
                           for row in range(5)]
             body.display = "context" not in self.folded
-            body.update(text)
+            body.update(_crop(text, width))
 
     class ContextScreen(ModalScreen):
         """Every message of the prompt the model gets next (folded; a click unfolds one)."""
