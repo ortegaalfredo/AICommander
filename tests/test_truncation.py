@@ -2099,7 +2099,7 @@ class TestRunner:
             api_base="http://localhost:1/v1", model="test-model", api_key="test-key", auto_approve=True,
             no_thinking=False, timeout=30, max_prompt_len=80000, max_output_bytes=10240, max_steps=10,
             debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
-            request=[], session_file=session, instance_number=1, session_msg="[SESSION] test",
+            request=[], session=session, session_file=session, instance_number=1, session_msg="[SESSION] test",
             sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd(),
             loop="", max_iterations=10, verify="", confirm_reads=False)
         script = [self._call("write_file", {"path": "notes.md", "content": "one\ntwo\n"}),
@@ -2196,6 +2196,68 @@ class TestRunner:
             shutil.rmtree(repo, ignore_errors=True)
         for name, ok in results.items():
             self.check(f"tui status: {name}", ok, repr(results) if not ok else "")
+
+    def test_tui_clipped_commands(self):
+        """A long tool call takes at most 3 rows of the agent panel, ending in "…"
+        (a click shows all of it); the Tools pane shows it in full."""
+        if not aic._TEXTUAL_AVAILABLE:
+            self.check("tui clip: skipped (textual missing)", True)
+            return
+        import asyncio
+        import tempfile
+        import time
+        tmp = tempfile.mkdtemp()
+        body = "\n".join(f"line {n} of a long heredoc written by the agent" for n in range(40))
+        command = f"cat > notes.txt <<'EOF'\n{body}\nEOF\nwc -l notes.txt"
+        args = argparse.Namespace(
+            api_base="http://localhost:1/v1", model="test-model", api_key="test-key", auto_approve=True,
+            no_thinking=False, timeout=30, max_prompt_len=80000, max_output_bytes=10240, max_steps=10,
+            debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
+            request=[], session_file="", instance_number=1, session_msg="[SESSION] off",
+            sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=tmp,
+            loop="", max_iterations=10, verify="", confirm_reads=False)
+        script = [self._call("execute_bash", {"command": command}), self._done()]
+
+        async def scenario():
+            app = aic.CommanderApp(args, aic.PromptHistory(None))
+            r = {}
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause(0.2)
+                tab, log = app.tab, app.agent_log
+                tab.agent.client, tab.agent.task_summary_enabled = fake_openai.FakeOpenAIClient(script), False
+                tab.agent.cwd = tab.agent.start_cwd = tmp
+                await pilot.press(*"go", "enter")
+                end = time.monotonic() + 10
+                while tab.busy() and time.monotonic() < end:
+                    await pilot.pause(0.05)
+                await pilot.pause(0.3)
+                index = next(i for i, line in enumerate(log._lines) if line.plain.startswith("$ cat > notes.txt"))
+                rows = [k for k, row in enumerate(log._rows) if row[0] == index]
+                top = int(log.scroll_offset.y)
+                last = log.render_line(rows[-1] - top).text.rstrip()
+                r["the agent panel shows 3 rows, the last ending in …"] = len(rows) == 3 and last.endswith("…")
+                r["line breaks show as ⏎"] = "<<'EOF' ⏎ line 0" in log._lines[index].plain
+                r["the Tools pane has the whole command"] = body in tab.console_log.plain_text
+                r["the command itself is not changed"] = tab.agent.conversation_history[2]["tool_calls"][0][
+                    "function"]["arguments"] == json.dumps({"command": command})
+                await pilot.click(log, offset=(4, rows[0] - top + 1))  # (+1: the border)
+                await pilot.pause(0.2)
+                r["a click shows all of it"] = len([row for row in log._rows if row[0] == index]) > 3
+                log.clear()
+                tab.render_history()
+                index = next(i for i, line in enumerate(log._lines) if line.plain.startswith("$ cat > notes.txt"))
+                r["a restored session clips it too"] = len([row for row in log._rows if row[0] == index]) == 3
+            return r
+
+        native = aic.clipboard_write_native, aic.clipboard_read_native
+        aic.clipboard_write_native, aic.clipboard_read_native = (lambda text: False), (lambda: None)
+        try:
+            results = asyncio.run(scenario())
+        finally:
+            aic.clipboard_write_native, aic.clipboard_read_native = native
+            shutil.rmtree(tmp, ignore_errors=True)
+        for name, ok in results.items():
+            self.check(f"tui clip: {name}", ok, repr(results) if not ok else "")
 
     def test_live_call_llm(self):
         c = self.make_commander()
@@ -2414,6 +2476,33 @@ class TestRunner:
             c.run("look")
             self.check(f"read-only: {'only writes ask' if reads else '--confirm-reads asks for all'}",
                        asked == expected, repr(asked))
+
+    def test_todo_reminder(self):
+        """A task list left unchanged for TODO_REMINDER_STEPS steps of tool calls gets a
+        one-line reminder in the last tool result; an update resets the count."""
+        items = [{"text": "write it", "status": "in_progress"}, {"text": "test it", "status": "pending"}]
+        bash = lambda n: self._call("execute_bash", {"command": f"echo {n}"}, id=f"b{n}")
+        c, fake = self.make_fake_commander([
+            self._call("todo", {"items": items}, id="t1"), bash(1), bash(2), bash(3),
+            self._call("todo", {"items": [dict(items[0], status="done"), dict(items[1], status="in_progress")]},
+                       id="t2"),
+            bash(4), bash(5), bash(6), bash(7), bash(8), bash(9), self._call("task_complete", {"summary": "done"}, id="end")])
+        c.run("task")
+        results = {m["tool_call_id"]: m["content"] for m in c.conversation_history if m.get("role") == "tool"}
+        note = '[todo] Your task list still shows "write it" in progress and has not changed for 3 steps.'
+        self.check("todo reminder: after 3 quiet steps, in the last result",
+                   note in results.get("b3", "") and not any("[todo]" in results.get(k, "") for k in ("b1", "b2")),
+                   repr(results.get("b3")))
+        self.check("todo reminder: the model gets it", any(note in str(m.get("content"))
+                                                           for m in fake.calls[4]["messages"]))
+        self.check("todo reminder: an update resets the count",
+                   not any("[todo]" in results.get(k, "") for k in ("b4", "b5"))
+                   and '"test it" in progress' in results.get("b6", ""), repr(results))
+        self.check("todo reminder: once per state of the list",
+                   not any("[todo]" in results.get(k, "") for k in ("b7", "b8", "b9")), repr(results))
+        self.check("todo reminder: the tool says when to update",
+                   "as soon as you finish an item" in next(t["function"]["description"] for t in c.tool_schemas
+                                                           if t["function"]["name"] == "todo"))
 
     def test_todo_and_task_complete(self):
         todo = {"items": [{"text": "one", "status": "done"}, {"text": "two", "status": "in_progress"}, "three"]}
@@ -2687,6 +2776,7 @@ def main():
     runner.test_tui_todo()
     runner.test_tui_pause()
     runner.test_tui_status()
+    runner.test_tui_clipped_commands()
     runner.test_completion_marker()
     runner.test_file_tools()
     runner.test_verify_gate()
@@ -2696,6 +2786,7 @@ def main():
     runner.test_shell_and_cwd()
     runner.test_read_only_commands()
     runner.test_todo_and_task_complete()
+    runner.test_todo_reminder()
     runner.test_background_jobs()
 
     if not args.skip_live:

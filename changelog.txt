@@ -1,6 +1,19 @@
 AI-Commander changelog
 ======================
 
+2.5.1
+-----
+
+- Long tool calls take at most 3 rows in the agent pane, ending in "…"
+  (line breaks show as ⏎; a click shows all of it). Only the display: the
+  command runs as sent, and the Tools pane shows it in full at the top of
+  its fold when it does not fit in the fold's one-row header.
+- The task list stays current: the todo tool tells the model to update it as
+  soon as an item is done, and after 3 steps of tool calls without an update
+  while items are open, a one-line reminder goes in the last tool result
+  (once per state of the list).
+- The Status pane's Context lines no longer wrap in a narrow pane.
+
 2.5.0
 -----
 

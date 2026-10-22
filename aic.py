@@ -8,7 +8,7 @@ plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 import argparse
 import asyncio
@@ -908,6 +908,7 @@ class AICommander:
     FILE_TOOLS = ("read_file", "edit_file", "write_file")
     AGENT_TOOLS = ("todo", "task_complete")  # handled by the agent itself, never need approval
     _TODO_MARKS = {"pending": "[ ]", "in_progress": "[>]", "done": "[x]"}
+    TODO_REMINDER_STEPS = 3  # steps of tool calls without a todo update before the model is reminded
 
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
                  show_thinking: bool = True, command_timeout: int = 120,
@@ -945,6 +946,8 @@ class AICommander:
         self.start_cwd = _safe_cwd() or os.path.expanduser("~")
         self.cwd = self.start_cwd  # where the next command starts: follows the last command's `cd`
         self.todos: list[dict[str, str]] = []  # the model's task list (the todo tool)
+        self._todo_quiet = 0  # steps with tool calls since the last todo update (see _todo_reminder)
+        self._todo_reminded: list | None = None  # the list as it was at the last reminder
         self.jobs: dict[int, tuple] = {}  # background jobs still to report: n -> (Popen, log path, command)
         self.job_history: dict[int, tuple] = {}  # every job, for the TUI: n -> (Popen, log path, command, start)
         # Files the agent changed: path -> {"before": text before its first change (None: it did
@@ -1009,8 +1012,10 @@ class AICommander:
             tool("write_file", "Create or overwrite a file with the given content (parent directories are "
                                "created).", ["path", "content"], path=path,
                  content={"type": "string", "description": "The complete new file content, as text (for a JSON file: the JSON text)"}),
-            tool("todo", "Replace your task list: send every item each time, with exactly one in_progress. It "
-                         "is shown back to you after the context is compacted.", ["items"],
+            tool("todo", "Replace your task list: send every item each time, with exactly one in_progress. Keep "
+                         "it current: as soon as you finish an item, mark it done and the next one in_progress, "
+                         "in the same turn as your next tool call (one update per item, not one at the end). It "
+                         "is shown to the user and shown back to you after the context is compacted.", ["items"],
                  items={"type": "array", "items": {"type": "object", "required": ["text", "status"], "properties": {
                      "text": {"type": "string"},
                      "status": {"type": "string", "enum": list(self._TODO_MARKS)}}}}),
@@ -2849,6 +2854,30 @@ Rules:
             self.save_session("tool_result")
         return finish
 
+    def _todo_reminder(self, calls: list[dict[str, Any]]) -> None:
+        """Models tend to update their task list late and in batches: after
+        TODO_REMINDER_STEPS steps of tool calls without an update while items
+        are open, a one-line reminder goes at the end of the step's last tool result
+        (once per state of the list: a long item is not nagged about again)."""
+        if any(c.get("function_name") == "todo" for c in calls) or all(t["status"] == "done" for t in self.todos):
+            self._todo_quiet = 0
+            return
+        self._todo_quiet += 1
+        if self._todo_quiet < self.TODO_REMINDER_STEPS or self._todo_reminded == self.todos:
+            return
+        for i in range(len(self.conversation_history) - 1, -1, -1):
+            msg = self.conversation_history[i]
+            if msg.get("role") == "assistant":
+                return  # this step left no tool result to carry it
+            if msg.get("role") == "tool":
+                current = next((t["text"] for t in self.todos if t["status"] == "in_progress"), None)
+                state = f'still shows "{current}" in progress' if current else "has no item in progress"
+                self.conversation_history[i] = {**msg, "content": f"{_content_text(msg.get('content'))}\n\n[todo] "
+                    f"Your task list {state} and has not changed for {self._todo_quiet} steps. If you finished "
+                    f"items since, update it with the todo tool now, along with your next action."}
+                self._todo_quiet, self._todo_reminded = 0, [dict(t) for t in self.todos]
+                return
+
     def _verify(self) -> str | None:
         """Run --verify after a completion signal: None when it passes, otherwise
         the feedback that sends the model back to work."""
@@ -2894,7 +2923,7 @@ Rules:
         self._current_request = request
         self.save_session("user_request")  # the request survives even if the first call dies
 
-        step = empty_turns = overflow_retries = 0
+        step = empty_turns = overflow_retries = self._todo_quiet = 0
         completed, status = False, "stopped"
         try:
             while step < self.max_steps and not self.stop_event.is_set():
@@ -2986,6 +3015,7 @@ Rules:
                 done = loop_done or _has_marker(content, self.COMPLETION_MARKER)
                 if calls or malformed:
                     finish = self._run_tool_calls(calls, malformed)
+                    self._todo_reminder(calls)
                     if finish is not None:  # task_complete, already verified
                         loop_done = bool(self.loop_iteration) and finish.get("objective_complete") in (True, "true")
                         completed, status = True, "loop_complete" if loop_done else "complete"
@@ -3131,11 +3161,13 @@ if _TEXTUAL_AVAILABLE:
     class _Line:
         """A logical log line: its text plus style runs [(end_offset, style)].
         Lines of a fold point to its header (owner); a header's folded flag is
-        None (not foldable), True (members hidden) or False (open)."""
-        __slots__ = ("plain", "runs", "rule", "owner", "folded")
+        None (not foldable), True (members hidden) or False (open). A line with
+        clip shows at most that many rows, the last ending in "…"."""
+        __slots__ = ("plain", "runs", "rule", "owner", "folded", "clip")
 
         def __init__(self, rule: bool = False, owner: _Line | None = None):
             self.plain, self.runs, self.rule, self.owner, self.folded = "", [], rule, owner, None
+            self.clip = 0
 
         def append(self, text: str, style) -> None:
             self.plain += text
@@ -3200,9 +3232,14 @@ if _TEXTUAL_AVAILABLE:
                     self._lines[-1].append(part, style)
             self._settle(follow)
 
-        def write_line(self, text: str, style="") -> None:
-            """Write complete line(s), ending any open streamed line first."""
+        def write_line(self, text: str, style="", clip: int = 0) -> None:
+            """Write complete line(s), ending any open streamed line first. With
+            *clip* the text is one line (breaks shown as ⏎) of at most *clip* rows;
+            a click shows the rest."""
             self.close_line()
+            if clip:
+                text = " ⏎ ".join(part.strip() for part in text.splitlines() if part.strip()) or text
+                self._lines[-1].clip = clip
             self.write(text + "\n", style)
 
         def write_rule(self, title: str = "", style="") -> None:
@@ -3316,14 +3353,15 @@ if _TEXTUAL_AVAILABLE:
                 return []
             if line.rule:
                 return [(i, 0, len(line.plain))]
-            return [(i, s, e) for s, e in _wrap_spans(line.plain, self._width or 1_000_000)]
+            rows = [(i, s, e) for s, e in _wrap_spans(line.plain, self._width or 1_000_000)]
+            return rows[:line.clip] if line.clip else rows
 
         def _retail(self, final: bool = False) -> None:
             """Recompute the rows of the open (last) line. Appending text can only
             change its last row (greedy wrapping), so only that row is redone."""
             i = len(self._lines) - 1
             line = self._lines[i]
-            keep = self._tail - 1 if self._tail and self._tail_line is line and not line.rule else 0
+            keep = self._tail - 1 if self._tail and self._tail_line is line and not line.rule and not line.clip else 0
             first = len(self._rows) - self._tail + keep
             start = self._rows[first - 1][2] if keep else 0
             del self._rows[first:]
@@ -3334,6 +3372,8 @@ if _TEXTUAL_AVAILABLE:
                         for a, b in _wrap_spans(line.plain[start:], self._width or 1_000_000)]
             else:
                 rows = []
+            if line.clip:
+                rows = rows[:line.clip]
             self._rows.extend(rows)
             self._tail, self._tail_line = keep + len(rows), line
             for key in [k for k in self._cache if k >= first]:
@@ -3426,6 +3466,10 @@ if _TEXTUAL_AVAILABLE:
             i, start, end = self._rows[row]
             line = self._lines[i]
             text = self._rule_text(line, width) if line.rule else line.text(start, end)
+            if (line.clip and line.plain[end:].strip()
+                    and (row + 1 >= len(self._rows) or self._rows[row + 1][0] != i)):  # the last row shown
+                text.truncate(max(1, width - 2))
+                text.append(" …", _C_DIM)
             for match in _URL_RE.finditer(text.plain):
                 text.stylize("underline", *match.span())
             if span is not None:
@@ -3509,6 +3553,9 @@ if _TEXTUAL_AVAILABLE:
                 if event.ctrl and not line.rule:
                     url = next((m for m in _URL_RE.finditer(line.plain) if m.start() <= char < m.end()), None)
                     self.app.open_link(url.group() if url else line.plain[slice(*self._word_at(i, char))])
+                elif line.clip:  # a clipped line: show all of it
+                    line.clip = 0
+                    self._reflow()
                 elif line.folded is not None:
                     self.toggle_fold(line)
                 return
@@ -4154,6 +4201,14 @@ if _TEXTUAL_AVAILABLE:
                     return
 
     _PANES = ("status", "shell", "tools")  # the right panel's tabs, in F3 order
+    _CMD_ROWS = 3  # rows a tool call takes at most in the agent log (a click shows the rest)
+
+    def _fold_command(console: OutputLog, label: str) -> None:
+        """A command's fold in the Tools pane, headed by it; one too long for the
+        one-row header is also written in full at the top of the fold."""
+        console.begin_fold(label, _C_CMD, rule=True)
+        if "\n" in label.strip() or cell_len(label) > (console.scrollable_content_region.width or 80) - 8:
+            console.write_line(label, _C_CMD)
 
     def _crop(text: Text, width: int) -> Text:
         """*text* with every line cut to *width* cells (a Static wraps long lines otherwise)."""
@@ -4952,12 +5007,12 @@ if _TEXTUAL_AVAILABLE:
                             if command.partition(" ")[0] not in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS:
                                 command = f"$ {command}"
                             commands[tc.get("id")] = command
-                            log.write_line(command, _C_CMD)
+                            log.write_line(command, _C_CMD, clip=_CMD_ROWS)
                 elif role == "tool":
                     command = commands.pop(msg.get("tool_call_id"), None)
                     if command == "":
                         continue
-                    console.begin_fold(command or "tool result", _C_CMD, rule=True)
+                    _fold_command(console, command or "tool result")
                     match = re.match(r"Command executed with exit code (-?\d+)\.\nOutput:\n?(.*)\Z", text, re.S)
                     output = match.group(2) if match else text
                     console.write_line(output[:4000] + ("\n… (truncated)" if len(output) > 4000 else ""), "#d0d0d0")
@@ -5157,8 +5212,8 @@ if _TEXTUAL_AVAILABLE:
                 self.current_command, self._cmd_started = p.get("command", ""), time.monotonic()
                 label = ("" if p.get("function_name") in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS
                          else "$ ") + self.current_command
-                log.write_line(label, _C_CMD)
-                console.begin_fold(label, _C_CMD, rule=True)
+                log.write_line(label, _C_CMD, clip=_CMD_ROWS)
+                _fold_command(console, label)
                 self.cmd_tail = ""
                 self.tools_unseen = self.pane != "tools"
                 self.set_phase("running")

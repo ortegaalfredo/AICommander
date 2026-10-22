@@ -323,7 +323,9 @@ The default Textual interface is a Norton-Commander-style split screen:
 - **Left pane — Agent**: the model's streamed answer (live, word-wrapped and
   re-wrapped when the terminal is resized), its thinking in dim italics
   (folded to `▸ ✻ thinking · N lines` once it ends; click to unfold), each
-  command it runs (`$ command`) with an exit/duration summary, and status
+  command it runs (`$ command`, at most 3 rows: a longer one ends in `…` and a
+  click shows the rest, while the Tools pane always has it in full) with an
+  exit/duration summary, and status
   messages. The pane title shows an LLM-generated summary of the task, and its
   bottom border the agent's task list (from its `todo` tool): progress and the
   current item, e.g. `☑ 2/5 · ▸ Run the tests`. Each update of the list is a
