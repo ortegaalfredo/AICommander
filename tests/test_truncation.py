@@ -1720,6 +1720,76 @@ class TestRunner:
                    len(fake2.calls) == 3 and "reasoning_effort" not in fake2.calls[1]
                    and "reasoning_effort" not in fake2.calls[2], f"calls={len(fake2.calls)}")
 
+    def test_rejected_params_adapt(self):
+        # OpenAI reasoning models take max_completion_tokens, not max_tokens, and only
+        # their default temperature: each rejection adapts the request, for good.
+        class Rejected(Exception):
+            status_code = 400
+        done = [fake_openai.content_chunk("ok"), fake_openai.usage_chunk(1, 1)]
+        c, fake = self.make_fake_commander([
+            Rejected("Unsupported parameter: 'max_tokens' is not supported with this model. "
+                     "Use 'max_completion_tokens' instead."),
+            Rejected("Unsupported value: 'temperature' does not support 0.7 with this model. "
+                     "Only the default (1) value is supported."), done, done], model="o4-mini")
+        c.call_llm_api([{"role": "user", "content": "x"}], use_tools=False)
+        c.call_llm_api([{"role": "user", "content": "x"}], use_tools=False)
+        first, last = fake.calls[0], fake.calls[-1]
+        self.check("params: max_tokens becomes max_completion_tokens, temperature goes",
+                   "max_tokens" in first and "temperature" in first and len(fake.calls) == 4
+                   and last.get("max_completion_tokens") == c.max_tokens and "max_tokens" not in last
+                   and "temperature" not in last, repr([sorted(k) for k in fake.calls]))
+        self.check("params: the cap is still reserved out of the window",
+                   c._prompt_budget() == c.max_prompt_len - c.max_tokens)
+        c2, fake2 = self.make_fake_commander([Rejected("Unrecognized request argument supplied: max_tokens"), done])
+        c2.call_llm_api([{"role": "user", "content": "x"}], use_tools=False)
+        self.check("params: a cap rejected outright is dropped",
+                   "max_tokens" not in fake2.calls[1] and "max_completion_tokens" not in fake2.calls[1]
+                   and "stream_options" in fake2.calls[1], repr(fake2.calls[1].keys()))
+        overflow = Rejected("'max_tokens' is too large: 16000. This model's maximum context length is 32768 tokens")
+        c3, _ = self.make_fake_commander([overflow])
+        try:
+            c3.call_llm_api([{"role": "user", "content": "x"}], use_tools=False)
+            raised = False
+        except Rejected:
+            raised = True
+        self.check("params: a context overflow is not mistaken for a rejected cap",
+                   raised and c3._token_param == "")
+        gptoss = self.make_commander(model="gpt-oss-120b")
+        self.check("params: gpt-oss is not an OpenAI-hosted name",
+                   not gptoss._openai_style() and gptoss._max_tokens_param() == "max_tokens")
+        # Rejections are adaptations, not attempts: five of them still leave the retries.
+        c4, fake4 = self.make_fake_commander([Rejected("max_tokens: use max_completion_tokens"),
+                                              Rejected("max_completion_tokens unsupported"),
+                                              Rejected("temperature unsupported"),
+                                              Rejected("unrecognized: stream_options"), done],
+                                             reasoning_effort="high")
+        c4.call_llm_api([{"role": "user", "content": "x"}], use_tools=False)
+        self.check("params: adaptations do not use up the retry attempts", len(fake4.calls) == 5,
+                   f"calls={len(fake4.calls)}")
+
+    def test_token_calibration(self):
+        # The server's exact prompt size rescales the ~3 chars/token estimate.
+        reply = lambda prompt: [fake_openai.content_chunk("ok"), fake_openai.usage_chunk(prompt, 1)]
+        c, _ = self.make_fake_commander([reply(10), reply(4000)], model="m", max_prompt_len=100000,
+                                         compress_algorithm="truncate")
+        msgs = [{"role": "system", "content": "s" * 3000}, {"role": "user", "content": "u" * 3000}]
+        c.call_llm_api(list(msgs))
+        self.check("calibration: a tiny prompt teaches nothing", c._token_ratio is None, repr(c._token_ratio))
+        c.call_llm_api(list(msgs))
+        estimate = c._estimate_input_tokens(msgs) + c._schema_tokens(c._tools())
+        self.check("calibration: ratio of the server's count to the estimate",
+                   c._token_ratio is not None and abs(c._token_ratio - 4000 / estimate) < 1e-9, repr(c._token_ratio))
+        c._token_ratio = 2.0  # the server counts twice the estimate: compression starts at half of it
+        c.max_prompt_len, c.max_tokens = 10000, 1000
+        size = c._estimate_input_tokens([{"role": "user", "content": "x" * 15000}])
+        c.conversation_history = [{"role": "system", "content": "s"}, {"role": "user", "content": "x" * 15000}]
+        compressed = c._context_compress()
+        self.check("calibration: a history under the raw budget but over the scaled one is compressed",
+                   size < 9000 and compressed, f"size={size} compressed={compressed}")
+        c._token_ratio = None
+        c.conversation_history = [{"role": "system", "content": "s"}, {"role": "user", "content": "x" * 15000}]
+        self.check("calibration: uncalibrated, the same history fits", not c._context_compress())
+
     def test_output_limit_cut_off(self):
         # A reply that hits max_tokens loses its half-written tool call (servers drop
         # it and may still say "tool_calls"): the model is told to split the work
@@ -2603,7 +2673,7 @@ class TestRunner:
                   "find . -delete", "find . -exec rm {} +", "git push", "git branch -D x", "sort -o out x",
                   "./ls", "FOO=1 ls", "ls &", "uniq a b", "cat a#b; rm x", "ls | sh", "tee x", "python3 -c 1",
                   "git -c core.pager=x log", "git diff --output=x", "cat <(rm x)", "'unterminated", "",
-                  "sort -no out x", "git grep -iO x", "tree -ao out"]
+                  "sort -no out x", "git grep -iO x", "tree -ao out", "printenv"]
         self.check("read-only: plain reads qualify", all(ro(cmd) for cmd in safe), [cmd for cmd in safe if not ro(cmd)])
         self.check("read-only: writes, substitutions and unknowns do not", not any(ro(cmd) for cmd in unsafe),
                    [cmd for cmd in unsafe if ro(cmd)])
@@ -2782,7 +2852,7 @@ class TestRunner:
                     delta = {"content": "done\nTASKCOMPLETE"}
                 else:
                     delta = {"tool_calls": [{"index": 0, "id": "t1", "type": "function", "function": {
-                        "name": "execute_bash", "arguments": json.dumps({"command": "env | grep -c AIC_API_KEY"})}}]}
+                        "name": "execute_bash", "arguments": json.dumps({"command": "env | grep -cE '^(AIC|OPENAI)_API_KEY='"})}}]}
                 chunk = {"id": "x", "object": "chat.completion.chunk", "created": 0, "model": "m",
                          "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
                 self.send_response(200)
@@ -2793,7 +2863,8 @@ class TestRunner:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         env = {k: v for k, v in os.environ.items() if not k.startswith(("OPENAI_", "AIC_"))}
-        env.update(AIC_API_BASE=f"http://127.0.0.1:{server.server_port}/v1", AIC_MODEL="m", AIC_API_KEY="secret")
+        env.update(AIC_API_BASE=f"http://127.0.0.1:{server.server_port}/v1", AIC_MODEL="m", AIC_API_KEY="secret",
+                   OPENAI_API_KEY="secret too")
         script = os.path.join(os.path.dirname(os.path.abspath(aic.__file__)), "aic.py")
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -2813,7 +2884,7 @@ class TestRunner:
                 self.check("headless: prompt read from stdin and env config used",
                            tool_requests and tool_requests[0]["messages"][1]["content"] == "say hi")
                 result = [m for r in tool_requests for m in r["messages"] if m["role"] == "tool"]
-                self.check("headless: AIC_API_KEY hidden from commands",
+                self.check("headless: AIC_API_KEY and OPENAI_API_KEY hidden from commands",
                            result and "Output:\n0" in result[0]["content"], repr(result)[:200])
                 proc = run("--max-steps", "1")
                 self.check("headless: exit 2 at the step limit", proc.returncode == 2, f"rc={proc.returncode}")
@@ -2907,6 +2978,8 @@ def main():
     runner.test_ccllm_summary_is_folded_not_stacked()
     runner.test_summarizer_failures_fall_back()
     runner.test_internal_calls_use_low_effort()
+    runner.test_rejected_params_adapt()
+    runner.test_token_calibration()
     runner.test_output_limit_cut_off()
     runner.test_context_overflow_is_retried()
     runner.test_transient_error_is_retried()

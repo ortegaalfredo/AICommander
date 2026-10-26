@@ -253,7 +253,7 @@ def _has_marker(text: str, marker: str) -> bool:
 # the list with $AIC_READ_ONLY_COMMANDS. Options that write or run something are denied.
 _READ_ONLY_COMMANDS = frozenset(
     "ls cat head tail wc grep egrep fgrep rg find pwd cd echo printf stat du df which type tree diff cmp sort "
-    "uniq cut tr nl column jq basename dirname realpath readlink whoami id uname printenv ps od hexdump "
+    "uniq cut tr nl column jq basename dirname realpath readlink whoami id uname ps od hexdump "
     "strings md5sum sha1sum sha256sum test [ true false git".split()
     + os.environ.get("AIC_READ_ONLY_COMMANDS", "").split())
 _READ_ONLY_DENY = {"find": ("-exec", "-ok", "-delete", "-fprint", "-fls"), "sort": ("-o", "--output", "--compress"),
@@ -925,7 +925,7 @@ class AICommander:
         self.command_timeout = command_timeout
         self.max_prompt_len = max_prompt_len
         self.max_output_bytes = max_output_bytes
-        self.max_tokens = 16000  # completion reservation, sent as max_tokens to non-"gpt" models
+        self.max_tokens = 16000  # completion reservation, sent as the reply cap (see _max_tokens_param)
         self.debug = debug
         self.sink: EventSink = sink if sink is not None else ConsoleSink()
         self.persist_history = persist_history  # run() extends the history instead of resetting it
@@ -981,6 +981,9 @@ class AICommander:
         self._command_started = 0.0
         self._send_reasoning = True  # off once an endpoint rejects reasoning_content in requests
         self._effort_rejected = False  # set once an endpoint rejects reasoning_effort
+        self._temperature_rejected = False  # set once an endpoint accepts only its default temperature
+        self._token_param: str | None = ""  # the reply-cap parameter an endpoint asked for ("": by model name)
+        self._token_ratio: float | None = None  # server tokens per estimated token (see _calibrate)
         # Retries are done here (stop-aware, with backoff), not inside the SDK.
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url,
                              default_headers={"User-Agent": USER_AGENT}, max_retries=0)
@@ -1087,6 +1090,18 @@ class AICommander:
 
     def _estimate_input_tokens(self, messages: list[dict[str, Any]]) -> int:
         return sum(self._estimate_message_tokens(m) for m in messages)
+
+    @staticmethod
+    def _schema_tokens(tools) -> int:
+        return len(json.dumps(tools)) // 3 if tools else 0
+
+    def _calibrate(self, prompt_tokens: int, params: dict) -> None:
+        """Learn how the server's tokenizer compares with the estimate, from the
+        exact prompt size of an agent-loop call (its tool schemas included)."""
+        if prompt_tokens < 1000:  # too small to tell the tokenizer from the overhead
+            return
+        estimate = self._estimate_input_tokens(params["messages"]) + self._schema_tokens(params.get("tools"))
+        self._token_ratio = min(3.0, max(0.5, prompt_tokens / max(1, estimate)))
 
     def _emit_token_usage(self, input_tokens: int, output_tokens: int, cached: int = 0,
                           estimate: bool = False, tokens_per_sec: float | None = None) -> None:
@@ -1336,10 +1351,21 @@ class AICommander:
 
     def _prompt_budget(self) -> int:
         """Tokens the prompt may use: the window minus the completion reservation
-        (only models that are sent max_tokens reserve it)."""
-        if "gpt" not in self.model:
+        (only models that are sent a reply cap reserve it)."""
+        if self._max_tokens_param():
             return max(0, self.max_prompt_len - self.max_tokens)
         return self.max_prompt_len
+
+    def _openai_style(self) -> bool:
+        """OpenAI model names (gpt-oss aside, which vLLM/llama.cpp serve): no max_tokens, no extra_body."""
+        return "gpt" in self.model and "gpt-oss" not in self.model
+
+    def _max_tokens_param(self) -> str | None:
+        """The parameter that caps a reply: max_tokens, max_completion_tokens once an
+        endpoint asked for it, or None (not sent): OpenAI names, or after a rejection."""
+        if self._token_param != "":
+            return self._token_param
+        return None if self._openai_style() else "max_tokens"
 
     def _protected_messages(self) -> list[dict[str, Any]]:
         """Messages compression must keep verbatim: the system prompt, the first
@@ -1357,6 +1383,8 @@ class AICommander:
         ``_compress_<algorithm>``. *force* compresses even under budget (used
         after the server rejected a prompt as too long). True when it compressed."""
         budget = self._prompt_budget()
+        if self._token_ratio:  # in estimate units, leaving room for the tool schemas the ratio was measured with
+            budget = max(1, int(budget / self._token_ratio) - self._schema_tokens(self._tools()))
         total_tokens = self._estimate_input_tokens(self.conversation_history)
         if force:
             budget = max(1, min(budget, int(total_tokens * 0.75)))
@@ -2277,14 +2305,10 @@ Rules:
             return self._assistant_response(
                 f"I have completed my response. No further actions are needed.\n\n{self.COMPLETION_MARKER}",
                 terminal=True)
-        params: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            # AIC_TEMPERATURE_TOOL / AIC_TEMPERATURE_TEXT retune these per deployment.
-            "temperature": (_env_float("AIC_TEMPERATURE_TOOL", 0.7) if use_tools
-                            else _env_float("AIC_TEMPERATURE_TEXT", 1.0)),
-            "stream": True,
-        }
+        params: dict[str, Any] = {"model": self.model, "messages": messages, "stream": True}
+        if not self._temperature_rejected:  # AIC_TEMPERATURE_TOOL / AIC_TEMPERATURE_TEXT retune these
+            params["temperature"] = (_env_float("AIC_TEMPERATURE_TOOL", 0.7) if use_tools
+                                     else _env_float("AIC_TEMPERATURE_TEXT", 1.0))
         effort = None if self._effort_rejected else (reasoning_effort or self.reasoning_effort)
         if effort:
             params["reasoning_effort"] = effort
@@ -2292,18 +2316,19 @@ Rules:
         # (or disable them up front with AIC_STREAM_OPTIONS=0 / AIC_EXTRA_BODY=0).
         if _env_bool("AIC_STREAM_OPTIONS", True):
             params["stream_options"] = {"include_usage": True}
-        if "gpt" not in self.model:  # OpenAI rejects these
-            params["max_tokens"] = max_tokens or self.max_tokens
-            if _env_bool("AIC_EXTRA_BODY", True):  # some servers pass the effort to the template only this way
-                params["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking,
-                                                                 **({"reasoning_effort": effort} if effort else {})}}
+        if self._max_tokens_param():
+            params[self._max_tokens_param()] = max_tokens or self.max_tokens
+        if not self._openai_style() and _env_bool("AIC_EXTRA_BODY", True):  # OpenAI rejects it; some
+            # servers pass the effort to the chat template only this way
+            params["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking,
+                                                             **({"reasoning_effort": effort} if effort else {})}}
         if use_tools:
-            params["tools"] = self.loop_tool_schemas if self.loop_iteration else self.tool_schemas
+            params["tools"] = self._tools()
             params["tool_choice"] = "auto"
         self._emit_token_usage(self._estimate_input_tokens(messages), 0, estimate=True)
 
-        max_attempts, extras_dropped = 5, False
-        for attempt in range(1, max_attempts + 1):
+        max_attempts, attempt, extras_dropped = 5, 0, False
+        while True:  # adapting to a rejected parameter is not an attempt: each one removes something
             try:
                 return self._stream_completion(params, stream_display, stream_label, show_thinking)
             except Exception as exc:
@@ -2325,6 +2350,10 @@ Rules:
                     params.pop("reasoning_effort")
                     self._log("[API] The endpoint rejected reasoning_effort; continuing without it.", style="yellow")
                     continue
+                fixed = self._adapt_rejected_param(params, exc)
+                if fixed:
+                    self._log(f"[API] {fixed}", style="yellow")
+                    continue
                 if not extras_dropped and ("stream_options" in params or "extra_body" in params) \
                         and _is_param_rejection(exc):
                     extras_dropped = True
@@ -2333,6 +2362,7 @@ Rules:
                     self._log("[API] The endpoint rejected stream_options/extra_body; retrying without them.",
                               style="yellow")
                     continue
+                attempt += 1
                 if attempt == max_attempts or not _is_retryable(exc):
                     raise
                 wait = min(60, 2 ** attempt)
@@ -2341,7 +2371,32 @@ Rules:
                 self._status("api_retry", retry=f"retry {attempt}/{max_attempts} in {wait}s")
                 if self.stop_event.wait(wait):
                     return self._assistant_response(None, stopped=True)
-        raise RuntimeError("unreachable")
+
+    def _adapt_rejected_param(self, params: dict, exc: Exception) -> str:
+        """Fit *params* to an endpoint that rejected the reply cap or the temperature
+        (OpenAI reasoning models take only max_completion_tokens and their default
+        temperature), for this and later calls. Returns what changed, or ""."""
+        if getattr(exc, "status_code", None) not in (400, 422) or _is_context_overflow(exc):
+            return ""
+        text = str(exc).lower()
+        key = next((k for k in ("max_tokens", "max_completion_tokens") if k in params), None)
+        if key and key in text:
+            value = params.pop(key)
+            if key == "max_tokens" and "max_completion_tokens" in text:
+                self._token_param = "max_completion_tokens"
+                params[self._token_param] = value
+                return "The endpoint wants max_completion_tokens instead of max_tokens; retrying with it."
+            self._token_param = None
+            return f"The endpoint rejected {key}; continuing without a reply cap."
+        if "temperature" in params and "temperature" in text:
+            del params["temperature"]
+            self._temperature_rejected = True
+            return "The endpoint rejected the temperature; continuing with its default."
+        return ""
+
+    def _tools(self) -> list[dict]:
+        """The tool schemas the model is offered."""
+        return self.loop_tool_schemas if self.loop_iteration else self.tool_schemas
 
     def _stream_completion(self, params: dict, stream_display: bool, stream_label: str | None,
                            show_thinking: bool) -> dict[str, Any]:
@@ -2426,9 +2481,11 @@ Rules:
                 tps = completion / elapsed if elapsed > 0.2 else None
             self._emit_token_usage(tokens["prompt_tokens"], completion, cached=tokens["cached_tokens"],
                                    tokens_per_sec=tps)
+            if stream_display:
+                self._calibrate(tokens["prompt_tokens"], params)
         # Hitting the output cap cuts the reply off; servers then drop a half-written tool
         # call and may still report finish_reason "tool_calls", so the token count decides.
-        cap = params.get("max_tokens")
+        cap = params.get("max_tokens") or params.get("max_completion_tokens")
         truncated = finish_reason == "length" or bool(cap and tokens.get("completion_tokens", 0) >= cap)
         if stream_display:  # an agent-loop reply, for the Status pane
             self.last_reply = {"finish_reason": finish_reason, "tool_calls": len(tool_calls), "truncated": truncated,
@@ -6417,9 +6474,10 @@ def main():
                         help="Emit every event as a JSON line on stdout (implies --nogui)")
     parser.add_argument("request", nargs="*", help="Task request (--nogui reads it from stdin when piped)")
     args = parser.parse_args()
-    # AIC_API_KEY is ours: keep it out of the environment the agent's commands inherit.
+    # Keep the key out of the environment the agent's commands inherit (and the model could print).
     env_key = os.environ.pop("AIC_API_KEY", None)
-    args.api_key = args.api_key or env_key or os.environ.get("OPENAI_API_KEY")
+    openai_key = os.environ.pop("OPENAI_API_KEY", None)
+    args.api_key = args.api_key or env_key or openai_key
     for name, env in (("api_base", "AIC_API_BASE"), ("api_key", "AIC_API_KEY")):
         if not getattr(args, name):
             parser.error(f"--{name.replace('_', '-')} is required (or set ${env})")

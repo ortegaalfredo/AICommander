@@ -574,15 +574,18 @@ is reduced by the output reservation (`max_tokens`, 16,000) so the prompt leaves
 room for the completion inside the context window:
 
 ```
-prompt_budget = max_prompt_len - max_tokens   (for non-gpt models)
-prompt_budget = max_prompt_len                (for gpt models)
+prompt_budget = max_prompt_len - max_tokens   (models sent a reply cap)
+prompt_budget = max_prompt_len                (OpenAI gpt-* names, which get none)
 ```
 
 Token counts are estimated locally with a conservative heuristic (~3 characters
 per token plus per-message overhead). Exact numbers come from the API's usage
-stats once each call finishes and are shown in the status bar. If the server
-still rejects a prompt as too long (tokenizers differ, e.g. for CJK text), the
-history is compressed harder and the request retried.
+stats once each call finishes and are shown in the status bar. Each agent-loop
+reply's exact prompt size (1000 tokens or more) calibrates the estimate: the
+ratio of the server's count to the estimate (tool schemas included, clamped to
+0.5–3) scales the budget, so compression follows the server's tokenizer. If the
+server still rejects a prompt as too long (e.g. after a sudden switch to CJK
+text), the history is compressed harder and the request retried.
 
 ### The `truncate` algorithm
 
@@ -835,11 +838,15 @@ instructions for the model.
 | `AIC_EXTRA_BODY=0` | Do not send `chat_template_kwargs.enable_thinking` to the endpoint. |
 | `AIC_DEBUG_DUMP_DIR` | Directory for `--debug` dumps (default `~/.aic`). |
 | `NO_COLOR` | Disable colors in `--nogui` mode (they are also off when output is piped). |
-| `AIC_API_BASE`, `AIC_MODEL`, `AIC_API_KEY` | Defaults for `--api-base`, `--model` and `--api-key` (`OPENAI_BASE_URL` and `OPENAI_API_KEY` are also read). `AIC_API_KEY` is removed from the environment, so the agent's commands cannot see it. |
+| `AIC_API_BASE`, `AIC_MODEL`, `AIC_API_KEY` | Defaults for `--api-base`, `--model` and `--api-key` (`OPENAI_BASE_URL` and `OPENAI_API_KEY` are also read). `AIC_API_KEY` and `OPENAI_API_KEY` are removed from the environment, so the agent's commands cannot see them (export the key again inside a task that needs it). |
 
 Endpoints that reject `stream_options` or `extra_body` are detected and the
 request is retried without them automatically; the variables just skip the
-first attempt.
+first attempt. The same goes for the reply cap and the temperature: an endpoint
+that wants `max_completion_tokens` instead of `max_tokens` (OpenAI's reasoning
+models) gets it, one that rejects the cap altogether gets none, and one that
+accepts only its default temperature (GPT-5, o-series) is sent none. Each
+adjustment is remembered for the rest of the session.
 
 Agent commands run with `PAGER=cat` and `GIT_PAGER=cat` (a pager would wait for
 a keypress forever), and the output returned to the model has escape codes
