@@ -193,7 +193,7 @@ panel. In `--nogui` mode a request is required on the command line.
 | Option | Description |
 | ------ | ----------- |
 | `--api-base` | API base URL (required; default `$AIC_API_BASE` or `$OPENAI_BASE_URL`). |
-| `--model` | Model name (required; default `$AIC_MODEL`). |
+| `--model` | Model name (default `$AIC_MODEL`). Without one, AI-Commander asks the server for its models (`GET /models`): it uses the only one, or lets you pick — in a dialog that filters as you type (the model of the session it resumes is preselected), or by number with `--nogui`. |
 | `--api-key` | API key (required; default `$AIC_API_KEY` or `$OPENAI_API_KEY`). Prefer the variables: a key on the command line is visible to every process, the agent's own commands included. |
 | `--auto-approve` | Auto-approve command execution (for testing). |
 | `--confirm-reads` | Ask before read-only commands and `read_file` too (by default they run without asking). |

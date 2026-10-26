@@ -1,6 +1,18 @@
 AI-Commander changelog
 ======================
 
+2.6.1
+-----
+
+- Without --model, AI-Commander asks the server for its models (GET /models)
+  and uses the only one, or lets you pick: in the TUI a dialog that filters as
+  you type (the model of the resumed session is preselected; Esc quits), with
+  --nogui a numbered list. --json, or no terminal to ask on, stops with the
+  list of models.
+- Code cleanup: duplicated logic merged into shared helpers (building the
+  agent from the command line, tool-call arguments and labels, restoring a
+  session's tool calls), dead code removed; no change in behavior.
+
 2.6.0
 -----
 

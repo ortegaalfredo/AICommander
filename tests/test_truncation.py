@@ -133,7 +133,7 @@ class RecordingSink(TUISink):
     Subclassing TUISink makes AICommander.execute_bash_command() treat this as
     a TUI sink, so it skips stdin monitoring and can run headless. Every
     emitted event is appended to self.events as (kind, payload) tuples, and
-    input() always returns "y" so the approval gate never blocks.
+    auto_approve answers every approval with "y", so the gate never blocks.
     """
 
     def __init__(self):
@@ -143,10 +143,6 @@ class RecordingSink(TUISink):
 
     def emit(self, kind, payload):
         self.events.append((kind, dict(payload)))
-
-    def input(self, prompt):
-        self.events.append(("INPUT", {"prompt": prompt}))
-        return "y"
 
     def close(self):
         pass
@@ -1892,7 +1888,7 @@ class TestRunner:
                 app.agent.client = fake_openai.FakeOpenAIClient(script)
                 app.agent.task_summary_enabled = False
                 await pilot.press(*"hi", "enter")
-                await until(pilot, lambda: not app._agent_busy())
+                await until(pilot, lambda: not app.tab.busy())
                 await pilot.pause(0.2)
                 log = app.agent_log.plain_text
                 results["answer streamed"] = "Hello there." in log
@@ -1902,7 +1898,7 @@ class TestRunner:
                     pilot, lambda: type(app.screen).__name__ == "ApprovalScreen")
                 await pilot.pause(0.5)  # keys are ignored right after the dialog opens
                 await pilot.press("y")
-                await until(pilot, lambda: not app._agent_busy())
+                await until(pilot, lambda: not app.tab.busy())
                 await pilot.pause(0.2)
                 results["command output shown"] = "tui-output" in app.console_log.plain_text
                 results["exit summary"] = "✓ exit 0" in app.console_log.plain_text
@@ -1973,7 +1969,7 @@ class TestRunner:
                 app.agent.task_summary_enabled = False
                 await pilot.press(*"plan", "enter")
                 end = time.monotonic() + 10
-                while app._agent_busy() and time.monotonic() < end:
+                while app.tab.busy() and time.monotonic() < end:
                     await pilot.pause(0.05)
                 await pilot.pause(0.2)
                 subtitle = to_content(app.agent_log.border_subtitle or "").plain
@@ -2250,6 +2246,81 @@ class TestRunner:
                                "work/proj/sub/f.txt": None, "a.txt": "x\n"}, repr(got))
         finally:
             shutil.rmtree(repo, ignore_errors=True)
+
+    def test_model_choice(self):
+        """No --model: the server's models, picked in the terminal (--nogui) or in a
+        dialog before the TUI opens its tabs."""
+        import builtins
+        import contextlib
+        import io
+
+        class Listing:
+            def __init__(self, *args, **kwargs):
+                self.models = self
+
+            def list(self):
+                return [type("Model", (), {"id": name})() for name in ("beta", "Alpha", "gamma", "beta")]
+        real_client, aic.OpenAI = aic.OpenAI, Listing
+        try:
+            self.check("models: listed sorted, once each", aic.list_models("http://x/v1", "k") == ["Alpha", "beta", "gamma"])
+        finally:
+            aic.OpenAI = real_client
+        answers = iter(["9", "nope", "2", ""])
+        real_input, builtins.input = builtins.input, lambda prompt="": next(answers)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                picked, again = aic._ask_model(["a", "b", "c"]), aic._ask_model(["a", "b", "c"], "c")
+        finally:
+            builtins.input = real_input
+        self.check("models: --nogui asks until it gets a number or a name", picked == "b", repr(picked))
+        self.check("models: Enter takes the last one used", again == "c", repr(again))
+        if not aic._TEXTUAL_AVAILABLE:
+            self.check("models: dialog skipped (textual missing)", True)
+            return
+        import asyncio
+
+        def make_args():
+            return argparse.Namespace(
+                api_base="http://localhost:1/v1", model="", model_choices=["alpha", "beta-large", "gamma"],
+                model_preferred="gamma", api_key="test-key", auto_approve=True, no_thinking=False, timeout=30,
+                max_prompt_len=80000, max_output_bytes=10240, max_steps=10, debug=False, compress_alg="truncate",
+                compress_target=0.4, fast=False, reasoning_effort=None, request=[], session_file="",
+                instance_number=1, session_msg="[SESSION] off", sandbox_enabled=False, sandbox_msg="[SANDBOX] off",
+                sandbox_write_dir=os.getcwd(), loop="", max_iterations=10, verify="", confirm_reads=False)
+
+        async def scenario():
+            r = {}
+            app = aic.CommanderApp(make_args(), aic.PromptHistory(None))
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause(0.3)
+                screen = app.screen
+                r["the dialog comes first, before any tab"] = type(screen).__name__ == "ModelScreen" and not app.tabs
+                r["the session's model is highlighted"] = (
+                    screen.shown[screen.query_one(aic.OptionList).highlighted] == "gamma")
+                await pilot.press("f3", "f9")  # they need a tab: ignored meanwhile
+                await pilot.press(*"bet")
+                await pilot.pause(0.1)
+                r["typing filters the list"] = screen.shown == ["beta-large"]
+                await pilot.press("enter")
+                await pilot.pause(0.5)
+                r["Enter starts with that model"] = (len(app.tabs) == 1 and app.tab.agent.model == "beta-large"
+                                                     and "model beta-large" in app.agent_log.plain_text)
+            app = aic.CommanderApp(make_args(), aic.PromptHistory(None))
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause(0.3)
+                await pilot.press("escape")
+                await pilot.pause(0.3)
+                r["Esc quits"] = not app.is_running and not app.tabs
+            return r
+
+        native = aic.clipboard_write_native, aic.clipboard_read_native
+        aic.clipboard_write_native, aic.clipboard_read_native = (lambda text: False), (lambda: None)
+        try:
+            results = asyncio.run(scenario())
+        finally:
+            aic.clipboard_write_native, aic.clipboard_read_native = native
+        for name, ok in results.items():
+            self.check(f"models: {name}", ok, repr(results) if not ok else "")
 
     def test_tui_clipped_commands(self):
         """Tool calls in the agent panel are folds, closed from the start, of their
@@ -2849,6 +2920,7 @@ def main():
     runner.test_tui_pause()
     runner.test_tui_status()
     runner.test_git_changes_many_untracked()
+    runner.test_model_choice()
     runner.test_tui_clipped_commands()
     runner.test_completion_marker()
     runner.test_file_tools()

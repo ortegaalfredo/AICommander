@@ -8,7 +8,7 @@ plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.6.0"
+__version__ = "2.6.1"
 
 import argparse
 import asyncio
@@ -179,8 +179,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 class colors:
     """ANSI codes used by ConsoleSink."""
-    RED, GREEN, YELLOW, BLUE = "\033[91m", "\033[92m", "\033[93m", "\033[94m"
-    MAGENTA, CYAN, BOLD, DIM, END = "\033[95m", "\033[96m", "\033[1m", "\033[2m", "\033[0m"
+    RED, GREEN, YELLOW, BLUE, CYAN = "\033[91m", "\033[92m", "\033[93m", "\033[94m", "\033[96m"
+    BOLD, DIM, END = "\033[1m", "\033[2m", "\033[0m"
 
 
 # CSI (incl. private "?" modes), OSC (BEL or ST terminated), DCS/PM/APC strings
@@ -223,6 +223,17 @@ def _content_text(content) -> str:
         return "\n".join(p if isinstance(p, str) else p.get("text", "") for p in content
                          if isinstance(p, str) or (isinstance(p, dict) and isinstance(p.get("text"), str)))
     return ""
+
+
+def _call_args(tool_call) -> dict | None:
+    """A tool call's arguments as a dict (sent as JSON text, or already parsed); None when they are not one."""
+    args = ((tool_call.get("function") or {}) if isinstance(tool_call, dict) else {}).get("arguments")
+    if not isinstance(args, dict):
+        try:
+            args = json.loads(args or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return args if isinstance(args, dict) else None
 
 
 def _is_continuation(msg) -> bool:
@@ -295,14 +306,22 @@ def _is_read_only(command: str) -> bool:
 _EXIT_CODES = {"complete": 0, "loop_complete": 0, "error": 1, "max_steps": 2, "max_iterations": 2, "stopped": 130}
 
 
+def _diff_stat(diff: list[str]) -> tuple[int, int]:
+    """(added, removed) lines of a unified diff, past its two header lines."""
+    return sum(ln.startswith("+") for ln in diff[2:]), sum(ln.startswith("-") for ln in diff[2:])
+
+
 def _is_empty_assistant(msg) -> bool:
     return (msg.get("role") == "assistant" and not msg.get("tool_calls")
             and not _content_text(msg.get("content")).strip())
 
 
-def _exit_code(status: int) -> int:
-    code = os.waitstatus_to_exitcode(status)
+def _shell_code(code: int) -> int:
     return 128 - code if code < 0 else code  # killed by signal N -> 128+N, like a shell
+
+
+def _exit_code(status: int) -> int:
+    return _shell_code(os.waitstatus_to_exitcode(status))
 
 
 def _safe_cwd() -> str:
@@ -688,6 +707,8 @@ def read_session_file(path: str) -> tuple[dict | None, str | None]:
 
 # --- Event sinks -------------------------------------------------------------
 
+_RUN_IT = "Run it? [y]es / [n]o / or type a suggestion: "
+
 class EventSink:
     """Presentation-layer I/O for AICommander.
 
@@ -701,12 +722,9 @@ class EventSink:
     def emit(self, kind: str, payload: dict):
         raise NotImplementedError
 
-    def input(self, prompt: str) -> str:
-        raise NotImplementedError
-
     def confirm(self, command: str) -> str:
         """Ask whether to run *command*; returns y / n / a free-text suggestion."""
-        return self.input(f"Approve command? (y/n/suggestion): {command}")
+        raise NotImplementedError
 
     def close(self):
         pass
@@ -718,8 +736,7 @@ class ConsoleSink(EventSink):
     _STREAMS = {"LLM_STREAM": colors.CYAN, "THINKING_STREAM": colors.YELLOW,
                 "CONSOLE_STREAM": colors.YELLOW, "CMD_OUTPUT": colors.GREEN}
     _LOG_STYLES = {"yellow": colors.YELLOW, "green": colors.GREEN, "red": colors.RED,
-                   "cyan": colors.CYAN, "dim": colors.DIM, "bright_yellow": colors.BOLD + colors.YELLOW,
-                   "bold bright_yellow": colors.BOLD + colors.YELLOW}
+                   "cyan": colors.CYAN, "dim": colors.DIM, "bold bright_yellow": colors.BOLD + colors.YELLOW}
 
     def __init__(self):
         self._at_line_start = True
@@ -762,8 +779,8 @@ class ConsoleSink(EventSink):
                 self._line(f"[USER REQUEST] {text}", colors.BOLD + colors.YELLOW)
                 self._line("=" * 60)
             elif kind == "CMD_EXEC":
-                prefix = "" if payload.get("function_name") in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS else "$ "
-                self._line(f"{prefix}{payload.get('command', '')}", colors.BOLD + colors.YELLOW)
+                self._line(AICommander.command_label(payload.get("function_name"), payload.get("command", "")),
+                           colors.BOLD + colors.YELLOW)
             elif kind == "CMD_COMPLETE":
                 self._line(f"[exit {payload.get('exit_code')}]", colors.BOLD)
             elif kind == "TODO" and payload.get("items"):
@@ -792,8 +809,7 @@ class ConsoleSink(EventSink):
         return answer
 
     def confirm(self, command: str) -> str:
-        question = "Run it? [y]es / [n]o / or type a suggestion: "
-        return self.input(f"{colors.BOLD}{colors.YELLOW}{question}{colors.END}" if self._color else question)
+        return self.input(f"{colors.BOLD}{colors.YELLOW}{_RUN_IT}{colors.END}" if self._color else _RUN_IT)
 
 
 class JsonSink(EventSink):
@@ -818,7 +834,7 @@ class JsonSink(EventSink):
         return line.rstrip("\n")
 
     def confirm(self, command: str) -> str:
-        return self.input(f"{command}\nRun it? [y]es / [n]o / or type a suggestion: ")
+        return self.input(f"{command}\n{_RUN_IT}")
 
 
 class TUISink(EventSink):
@@ -836,9 +852,6 @@ class TUISink(EventSink):
         # The TUI styles text itself, so terminal escape codes are removed here.
         self.queue.put({"kind": kind, "payload": {
             k: _strip_ansi(v) if isinstance(v, str) else v for k, v in payload.items()}})
-
-    def input(self, prompt: str) -> str:
-        return self.confirm(prompt)
 
     def confirm(self, command: str) -> str:
         if self.auto_approve:
@@ -888,6 +901,11 @@ class AICommander:
     AGENT_TOOLS = ("todo", "task_complete")  # handled by the agent itself, never need approval
     _TODO_MARKS = {"pending": "[ ]", "in_progress": "[>]", "done": "[x]"}
     TODO_REMINDER_STEPS = 3  # steps of tool calls without a todo update before the model is reminded
+
+    @classmethod
+    def command_label(cls, name, command: str) -> str:
+        """How a tool call shows: file and agent tools by their summary, commands as `$ command`."""
+        return command if name in cls.FILE_TOOLS + cls.AGENT_TOOLS else f"$ {command}"
 
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
                  show_thinking: bool = True, command_timeout: int = 120,
@@ -1021,11 +1039,15 @@ class AICommander:
 
     def _wait_if_paused(self, step: int):
         if self.paused and not self.stop_event.is_set():
-            self.sink.emit("STATUS_UPDATE", {"step": step, "max_steps": self.max_steps, "phase": "paused"})
+            self._status("paused", step)
             self._log("[PAUSED] The agent is paused; resume it to go on.", style="yellow")
             self.resume_event.wait()
             if not self.stop_event.is_set():
                 self._log("[RESUMED]", style="yellow")
+
+    def _status(self, phase: str, step: int | None = None, **extra) -> None:
+        self.sink.emit("STATUS_UPDATE", {"step": self.step_count if step is None else step,
+                                         "max_steps": self.max_steps, "phase": phase, **extra})
 
     def _log(self, message: str, style: str = ""):
         self.sink.emit("LOG", {"text": message, "style": style})
@@ -1340,8 +1362,7 @@ class AICommander:
             budget = max(1, min(budget, int(total_tokens * 0.75)))
         elif total_tokens <= budget:
             return
-        self.sink.emit("STATUS_UPDATE", {"step": self.step_count, "max_steps": self.max_steps,
-                                         "phase": "compressing"})
+        self._status("compressing")
         algorithm = getattr(self, f"_compress_{self.compress_algorithm.replace('-', '_')}", None)
         if algorithm is None:
             self._log(f"[COMPRESS] Unknown context-compression algorithm '{self.compress_algorithm}'. "
@@ -1484,7 +1505,7 @@ Remember to not exceed 5000 characters, its very important that the summary to b
         # The original task anchors the summary even when the evicted segment
         # contains no user message. (The agent's full system prompt is not
         # needed for that and would only add prefill.)
-        first_user = getattr(self, "_compress_first_user", None)
+        first_user = next((m for m in self.conversation_history if m.get("role") == "user"), None)
         prompt += ("\n\nCONTEXT: the conversation is an autonomous agent (AI-Commander) carrying out the "
                    "user's task with shell and file tools.")
         if first_user is not None:
@@ -1529,11 +1550,9 @@ Remember to not exceed 5000 characters, its very important that the summary to b
             request = None
         log = [(i, m) for i, m in enumerate(hist)
                if m.get("role") != "system" and not any(m is p for p in protected)]
-        self._compress_first_user = first_user
 
-        # Size everything in the trigger's units: content + tool-call arguments +
-        # per-message overhead (the library alone would count content only and
-        # retain far too much, re-triggering compression on the next step).
+        # Size everything in the trigger's units (content, tool-call arguments and
+        # per-message overhead), so the retained part does not re-trigger compression.
         fixed = self._estimate_input_tokens([m for m in protected if m is not hist[0]])
         if base_prompt is not None:
             fixed += self._estimate_message_tokens({"role": "system", "content": base_prompt})
@@ -1635,8 +1654,7 @@ Remember to not exceed 5000 characters, its very important that the summary to b
 - Only describe your plan, your reasoning, and conclusions drawn from the REAL tool output. Never fabricate or guess command output — wait for the actual result.
 
 **Internet Access:**
-- Web search by printing JSON results to stdout: `python3 -c "import json; from ddgs import DDGS; print(json.dumps(list(DDGS().text('QUERY', max_results=10)), ensure_ascii=False, indent=2))"` (replace QUERY). Use wget/curl and the w3m browser to fetch page contents.
-{self._ddgs_note()}
+{self._web_note()}
 
 **Persistence Policy (CRITICAL):**
 - Keep working until the task is genuinely complete. Do NOT stop early or produce a summary-only final response — take concrete action with tools.
@@ -1663,8 +1681,7 @@ Rules:
 - Output is capped at {self.max_output_bytes} bytes; longer output keeps its start and end, names a file holding the full output, and ends with the sentinel `{self.OUTPUT_TRUNCATION_SENTINEL}`. If you see it, you are missing data — do not assume success or failure; grep the saved file.
 - Commands are killed after {self.command_timeout}s; run servers and long jobs with background=true.
 - Only report conclusions from real tool output; never fabricate results.
-- Web search by printing JSON results to stdout: `python3 -c "import json; from ddgs import DDGS; print(json.dumps(list(DDGS().text('QUERY', max_results=10)), ensure_ascii=False, indent=2))"` (replace QUERY). Use wget/curl and the w3m browser to fetch page contents.
-{self._ddgs_note()}
+{self._web_note()}
 - Keep working until the task is genuinely complete; partial completion is not completion.{self._loop_note()}{self._project_instructions()}"""
 
     def _verify_note(self) -> str:
@@ -1699,11 +1716,13 @@ Rules:
         return ""
 
     @staticmethod
-    def _ddgs_note() -> str:
-        if _DDGS_AVAILABLE:
-            return "(ddgs is installed and available.)"
-        return ("(NOTE: the ddgs package is NOT installed in this environment: that one-liner will fail with "
-                "ModuleNotFoundError. Install it with `pip install ddgs`, or rely on curl/wget/w3m only.)")
+    def _web_note() -> str:
+        return ("- Web search by printing JSON results to stdout: `python3 -c \"import json; from ddgs import DDGS; "
+                "print(json.dumps(list(DDGS().text('QUERY', max_results=10)), ensure_ascii=False, indent=2))\"` "
+                "(replace QUERY). Use wget/curl and the w3m browser to fetch page contents.\n"
+                + ("(ddgs is installed and available.)" if _DDGS_AVAILABLE else
+                   "(NOTE: the ddgs package is NOT installed in this environment: that one-liner will fail with "
+                   "ModuleNotFoundError. Install it with `pip install ddgs`, or rely on curl/wget/w3m only.)"))
 
     # --- Command execution ---------------------------------------------------
 
@@ -1756,8 +1775,9 @@ Rules:
     def _kill_proc(proc) -> None:
         if proc.poll() is None:
             with contextlib.suppress(Exception):
-                if _IS_WINDOWS:
-                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=5)
+                if _IS_WINDOWS:  # /T walks the tree: killing PowerShell alone would orphan the command
+                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=5,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 else:
                     os.killpg(proc.pid, signal.SIGTERM)
 
@@ -1981,10 +2001,7 @@ Rules:
                         return
 
         def terminate():
-            """taskkill /T walks the tree: killing PowerShell alone would orphan the command."""
-            with contextlib.suppress(Exception):
-                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
-                               timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self._kill_proc(proc)
             with contextlib.suppress(Exception):
                 proc.kill()
 
@@ -2116,8 +2133,7 @@ Rules:
             done = f"replaced {count if replace_all else 1} occurrence(s) in {path}"
         diff = [ln if ln.endswith("\n") else ln + "\n" for ln in
                 difflib.unified_diff(before.splitlines(True), after.splitlines(True), f"a/{path}", f"b/{path}", n=2)]
-        added = sum(ln.startswith("+") for ln in diff[2:])
-        removed = sum(ln.startswith("-") for ln in diff[2:])
+        added, removed = _diff_stat(diff)
         preview = "".join(diff[:400]) + (f"… ({len(diff) - 400} more diff lines)\n" if len(diff) > 400 else "")
 
         def apply() -> str:
@@ -2322,9 +2338,7 @@ Rules:
                 wait = min(60, 2 ** attempt)
                 self._log(f"[API ERROR] {_describe_error(exc)}. Retrying in {wait}s "
                           f"(attempt {attempt}/{max_attempts}).", style="yellow")
-                self.sink.emit("STATUS_UPDATE", {"step": self.step_count, "max_steps": self.max_steps,
-                                                 "phase": "api_retry",
-                                                 "retry": f"retry {attempt}/{max_attempts} in {wait}s"})
+                self._status("api_retry", retry=f"retry {attempt}/{max_attempts} in {wait}s")
                 if self.stop_event.wait(wait):
                     return self._assistant_response(None, stopped=True)
         raise RuntimeError("unreachable")
@@ -2401,25 +2415,24 @@ Rules:
                 continue
             call["id"] = call["id"] or f"call_{int(time.time() * 1000)}_{i}"  # some servers omit ids
             tool_calls.append(call)
+        tokens: dict[str, int] = {}
         if usage is not None:
-            completion = getattr(usage, "completion_tokens", 0) or 0
-            tps = getattr(usage, "completion_tokens_per_sec", None)
+            tokens = {"prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                      "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                      "cached_tokens": self._extract_cached_tokens(usage)}
+            completion, tps = tokens["completion_tokens"], getattr(usage, "completion_tokens_per_sec", None)
             if not tps and completion >= 8:  # too few tokens give a meaningless rate
                 elapsed = time.monotonic() - (first_token or started)  # generation time, not prefill
                 tps = completion / elapsed if elapsed > 0.2 else None
-            self._emit_token_usage(getattr(usage, "prompt_tokens", 0) or 0, completion,
-                                   cached=self._extract_cached_tokens(usage), tokens_per_sec=tps)
+            self._emit_token_usage(tokens["prompt_tokens"], completion, cached=tokens["cached_tokens"],
+                                   tokens_per_sec=tps)
         # Hitting the output cap cuts the reply off; servers then drop a half-written tool
         # call and may still report finish_reason "tool_calls", so the token count decides.
         cap = params.get("max_tokens")
-        truncated = finish_reason == "length" or bool(
-            cap and usage is not None and (getattr(usage, "completion_tokens", 0) or 0) >= cap)
+        truncated = finish_reason == "length" or bool(cap and tokens.get("completion_tokens", 0) >= cap)
         if stream_display:  # an agent-loop reply, for the Status pane
             self.last_reply = {"finish_reason": finish_reason, "tool_calls": len(tool_calls), "truncated": truncated,
-                               "seconds": time.monotonic() - started,
-                               **({"prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                                   "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                                   "cached_tokens": self._extract_cached_tokens(usage)} if usage is not None else {})}
+                               "seconds": time.monotonic() - started, **tokens}
         # reasoning_content lets the loop detect reasoning-only turns.
         return self._assistant_response("".join(content) or None, tool_calls or None, "".join(thinking) or None,
                                         truncated=truncated)
@@ -2563,14 +2576,8 @@ Rules:
     def finish_summary(msg: dict) -> str:
         """The summary of an assistant turn's task_complete call, or ""."""
         for tc in msg.get("tool_calls") or []:
-            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-            if fn.get("name") == "task_complete":
-                try:
-                    args = fn.get("arguments")
-                    args = args if isinstance(args, dict) else json.loads(args or "{}")
-                except (json.JSONDecodeError, TypeError):
-                    return ""
-                return str(args.get("summary") or "").strip() if isinstance(args, dict) else ""
+            if isinstance(tc, dict) and (tc.get("function") or {}).get("name") == "task_complete":
+                return str((_call_args(tc) or {}).get("summary") or "").strip()
         return ""
 
     # --- Changed files (the TUI's Status pane) ------------------------------------
@@ -2758,7 +2765,7 @@ Rules:
             if code is None:
                 continue
             del self.jobs[n]
-            code = 128 - code if code < 0 else code  # killed by signal N -> 128+N, like a shell
+            code = _shell_code(code)
             try:
                 with open(log, "rb") as f:
                     f.seek(max(0, os.path.getsize(log) - 2000))
@@ -2810,59 +2817,27 @@ Rules:
                 break
             tcid, command, name = call["tool_call_id"], call.get("command"), call.get("function_name")
             args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
-            if name in self.FILE_TOOLS or name in self.AGENT_TOOLS:
-                if name == "todo":
-                    result = self._todo(call.get("arguments"))
-                elif name != "task_complete":
-                    result = self._run_file_tool(name, args, suggestions)
-                elif len(calls) + len(malformed) > 1:
-                    result = ("Not accepted: call task_complete on its own, after you have seen the results of "
-                              "your other tool calls.")
-                else:
-                    result = (self._verify() if self.verify_command else None) or "Task completion accepted."
-                    if not result.startswith("[VERIFY FAILED]"):
-                        finish = args
-                        summary = str(args.get("summary") or "").strip()
-                        if summary:
-                            self._log(summary, style="cyan")
-                self.conversation_history.append(self._tool_result(tcid, result))
-                self.save_session("tool_result")
-                continue
-            if not command:
-                if name == "execute_bash":
-                    result = ("ERROR: execute_bash requires a 'command' string argument. Re-issue the tool "
-                              "call with a JSON object like {\"command\": \"...\"}.")
-                else:
-                    result = self.handle_function_call({"name": name, "arguments": call["function_arguments"]})
-                self.conversation_history.append(self._tool_result(tcid, result))
-                self.save_session("tool_result")
-                continue
-            background = args.get("background") in (True, "true")  # some models send booleans as strings
-            label = f"{command} &" if background else command
-            self.sink.emit("CMD_EXEC", {"command": label, "tool_call_id": tcid, "function_name": name})
-            approved, suggestion = ((True, None) if self.auto_approve_reads and not background
-                                    and _is_read_only(command) else self.get_user_confirmation(label))
-            if approved and background:
-                result = self._start_job(command)
-            elif approved:
-                cwd = self.cwd
-                git = self._git_state(cwd)
-                try:
-                    output, code = self.execute_bash_command(command)
-                    result = f"Command executed with exit code {code}.\nOutput:\n{output}"
-                except CommandTimeoutError as exc:
-                    result = f"{exc}" + (f"\nOutput before the timeout:\n{exc.output}" if exc.output else "")
-                except Exception as exc:
-                    result = f"Command execution failed: {exc}"
-                    self._log_error(result)
-                self._note_git_changes(git)
-                if self.cwd != cwd:
-                    result += f"\n[working directory is now {self.cwd}]"
+            if name == "todo":
+                result = self._todo(call.get("arguments"))
+            elif name in self.FILE_TOOLS:
+                result = self._run_file_tool(name, args, suggestions)
+            elif name == "task_complete" and len(calls) + len(malformed) > 1:
+                result = ("Not accepted: call task_complete on its own, after you have seen the results of "
+                          "your other tool calls.")
+            elif name == "task_complete":
+                result = (self._verify() if self.verify_command else None) or "Task completion accepted."
+                if not result.startswith("[VERIFY FAILED]"):
+                    finish = args
+                    summary = str(args.get("summary") or "").strip()
+                    if summary:
+                        self._log(summary, style="cyan")
+            elif command:
+                result = self._run_command(tcid, name, command, args, suggestions)
+            elif name == "execute_bash":
+                result = ("ERROR: execute_bash requires a 'command' string argument. Re-issue the tool "
+                          "call with a JSON object like {\"command\": \"...\"}.")
             else:
-                self._log("[INFO] Command not approved by user.")
-                result = "Command execution skipped by user."
-                if suggestion:
-                    suggestions.append(suggestion)
+                result = self.handle_function_call({"name": name, "arguments": call["function_arguments"]})
             self.conversation_history.append(self._tool_result(tcid, result))
             self.save_session("tool_result")  # a crash keeps every finished result
         for suggestion in suggestions:
@@ -2870,6 +2845,32 @@ Rules:
         if suggestions:
             self.save_session("tool_result")
         return finish
+
+    def _run_command(self, tcid, name: str, command: str, args: dict, suggestions: list) -> str:
+        """An execute_bash call through the approval gate; returns the tool result."""
+        background = args.get("background") in (True, "true")  # some models send booleans as strings
+        label = f"{command} &" if background else command
+        self.sink.emit("CMD_EXEC", {"command": label, "tool_call_id": tcid, "function_name": name})
+        approved, suggestion = ((True, None) if self.auto_approve_reads and not background
+                                and _is_read_only(command) else self.get_user_confirmation(label))
+        if not approved:
+            self._log("[INFO] Command not approved by user.")
+            if suggestion:
+                suggestions.append(suggestion)
+            return "Command execution skipped by user."
+        if background:
+            return self._start_job(command)
+        cwd, git = self.cwd, self._git_state(self.cwd)
+        try:
+            output, code = self.execute_bash_command(command)
+            result = f"Command executed with exit code {code}.\nOutput:\n{output}"
+        except CommandTimeoutError as exc:
+            result = f"{exc}" + (f"\nOutput before the timeout:\n{exc.output}" if exc.output else "")
+        except Exception as exc:
+            result = f"Command execution failed: {exc}"
+            self._log_error(result)
+        self._note_git_changes(git)
+        return result + (f"\n[working directory is now {self.cwd}]" if self.cwd != cwd else "")
 
     def _todo_reminder(self, calls: list[dict[str, Any]]) -> None:
         """Models tend to update their task list late and in batches: after
@@ -2949,7 +2950,7 @@ Rules:
                     break
                 step += 1
                 self.step_count = step
-                self.sink.emit("STATUS_UPDATE", {"step": step, "max_steps": self.max_steps, "phase": "llm_call"})
+                self._status("llm_call", step)
                 if self.debug:
                     self._dump_conversation_history()
                 self._report_jobs()
@@ -3114,7 +3115,7 @@ if _TEXTUAL_AVAILABLE:
     _C_CMD, _C_OK, _C_FAIL, _C_DIM = "bold #ffd75f", "#5fd787", "#ff8787", "#8fa8cc"
     _SELECTION = Style(color="#000000", bgcolor="#87d7ff")
     _LOG_STYLES = {"yellow": "#ffd75f", "green": "#5fd787", "red": "#ff8787", "cyan": "#87d7ff",
-                   "dim": _C_DIM, "bright_yellow": _C_USER, "bold bright_yellow": _C_USER}
+                   "dim": _C_DIM, "bold bright_yellow": _C_USER}
 
     def _fmt_tokens(n: float) -> str:
         return f"{n:.0f}" if n < 1000 else f"{n / 1000:.1f}k" if n < 1_000_000 else f"{n / 1e6:.1f}M"
@@ -3160,11 +3161,8 @@ if _TEXTUAL_AVAILABLE:
         return rows
 
     def _tool_command(tool_call) -> str | None:
-        try:
-            args = json.loads((tool_call.get("function") or {}).get("arguments") or "{}")
-        except (json.JSONDecodeError, TypeError, AttributeError):
-            return None
-        if not isinstance(args, dict):
+        args = _call_args(tool_call)
+        if args is None:
             return None
         name = (tool_call.get("function") or {}).get("name")
         if name in AICommander.AGENT_TOOLS:
@@ -3183,8 +3181,7 @@ if _TEXTUAL_AVAILABLE:
         __slots__ = ("plain", "runs", "rule", "owner", "folded", "clip")
 
         def __init__(self, rule: bool = False, owner: _Line | None = None):
-            self.plain, self.runs, self.rule, self.owner, self.folded = "", [], rule, owner, None
-            self.clip = 0
+            self.plain, self.runs, self.rule, self.owner, self.folded, self.clip = "", [], rule, owner, None, 0
 
         def append(self, text: str, style) -> None:
             self.plain += text
@@ -3985,8 +3982,7 @@ if _TEXTUAL_AVAILABLE:
         def _key_bytes(self, event: events.Key) -> bytes:
             key = event.key
             if key in ("up", "down", "right", "left", "home", "end") and (1 << 5) in self._screen.mode:
-                return b"\x1bO" + {"up": b"A", "down": b"B", "right": b"C", "left": b"D",
-                                   "home": b"H", "end": b"F"}[key]  # application cursor mode
+                return b"\x1bO" + self._KEYS[key][-1:]  # application cursor mode: ESC O A, not ESC [ A
             if key in self._KEYS:
                 return self._KEYS[key]
             if key.startswith("ctrl+") and len(key) == 6 and key[5].isalpha():
@@ -4038,7 +4034,7 @@ if _TEXTUAL_AVAILABLE:
         def _color(self, name: str) -> str | None:
             if name == "default":
                 return None
-            if len(name) == 6 and all(c in "0123456789abcdefABCDEF" for c in name):
+            if re.fullmatch(r"[0-9a-fA-F]{6}", name):
                 return "#" + name
             return self._COLOR_NAMES.get(name, name)
 
@@ -4347,8 +4343,8 @@ if _TEXTUAL_AVAILABLE:
             label = "new" if before is None else "deleted" if after is None else ""
             if before is False or after is False:
                 return None, None, label or "binary or large"
-            lines = list(difflib.unified_diff((before or "").splitlines(), (after or "").splitlines(), lineterm="", n=0))
-            return (sum(ln.startswith("+") for ln in lines[2:]), sum(ln.startswith("-") for ln in lines[2:]), label)
+            return (*_diff_stat(list(difflib.unified_diff((before or "").splitlines(), (after or "").splitlines(),
+                                                          lineterm="", n=0))), label)
 
         def _tree(self, files: list) -> list[tuple]:
             """The changed files as tree rows, folders first: (depth, key, name, file count)
@@ -4520,8 +4516,7 @@ if _TEXTUAL_AVAILABLE:
                         pass
                 elif finished < 3:
                     finished += 1
-                    ended = self._job_ends.setdefault(n, now)
-                    code = 128 - code if code < 0 else code
+                    ended, code = self._job_ends.setdefault(n, now), _shell_code(code)
                     lines.append([(" ✓ " if code == 0 else " ✗ ", _C_OK if code == 0 else _C_FAIL),
                                   (f"job {n} · exit {code} · ran {_fmt_secs(ended - started)} · ", _C_DIM),
                                   (command, "#c8d0e0")])
@@ -4612,7 +4607,7 @@ if _TEXTUAL_AVAILABLE:
         ContextScreen OutputLog { width: 96%; height: 90%; border: double #5fd7ff; background: #0b2f5e;
                                   border-title-color: #ffff5f; border-subtitle-color: #6f8fc0; }
         """
-        BINDINGS = [Binding("escape,q", "close", show=False)]
+        BINDINGS = [Binding("escape,q", "dismiss", show=False)]
         _ROLE_STYLES = {"system": "bold #af87ff", "user": "bold #ffff5f", "assistant": "bold #87d7ff",
                         "tool": "bold #5fd787"}
 
@@ -4645,9 +4640,6 @@ if _TEXTUAL_AVAILABLE:
                 log.end_fold()
             log.focus()
 
-        def action_close(self) -> None:
-            self.dismiss()
-
     class _ClickBar(Static):
         """A one-row bar of clickable items: subclasses build (text, items)."""
 
@@ -4660,6 +4652,10 @@ if _TEXTUAL_AVAILABLE:
 
         def render(self) -> Text:
             return self.build(self.size.width or 80)
+
+        def _begin(self) -> Text:
+            self._spans = []
+            return Text(no_wrap=True, overflow="crop")
 
         def _add(self, text: Text, label: str, style: str, action: str) -> None:
             start = text.cell_len
@@ -4679,8 +4675,7 @@ if _TEXTUAL_AVAILABLE:
                  ("7", "Zoom", "zoom"), ("8", "Clear", "clear"), ("9", "Stop", "stop"), ("10", "Quit", "quit"))
 
         def build(self, width: int) -> Text:
-            self._spans = []
-            text = Text(no_wrap=True, overflow="crop")
+            text = self._begin()
             slot = max(5, width // len(self.ITEMS))
             for number, label, action in self.ITEMS:
                 start = text.cell_len
@@ -4695,8 +4690,7 @@ if _TEXTUAL_AVAILABLE:
         agent tab); a hidden tab with news is marked."""
 
         def build(self, width: int) -> Text:
-            self._spans = []
-            text = Text(no_wrap=True, overflow="crop")
+            text = self._begin()
             tab = self.app.tab
             active = tab.pane if tab else "status"
             for pane in _PANES:
@@ -4715,8 +4709,7 @@ if _TEXTUAL_AVAILABLE:
         """The agent tab strip of the left panel: one tab per agent, + opens one."""
 
         def build(self, width: int) -> Text:
-            self._spans = []
-            text = Text(no_wrap=True, overflow="crop")
+            text = self._begin()
             tabs, active = self.app.tabs, self.app.tab
             slot = max(8, (width - 4) // max(1, len(tabs)) - 1)
             for pos, tab in enumerate(tabs, 1):
@@ -4792,6 +4785,63 @@ if _TEXTUAL_AVAILABLE:
         def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
             event.stop()
             self.dismiss(("select", event.option_index + 1))
+
+    class ModelScreen(ModalScreen):
+        """No --model: pick one of the models the server lists. Typing filters
+        them, ↑↓ move, Enter or a click starts with the highlighted one, Esc quits."""
+
+        CSS = """
+        ModelScreen { align: center middle; background: #000000 50%; }
+        #models { width: 72; max-width: 96%; height: auto; max-height: 90%; border: double #5fd7ff;
+                  background: #0b2f5e; padding: 0 1; }
+        #models OptionList { height: auto; max-height: 20; border: none; background: #0b2f5e; padding: 0; }
+        #models Input { margin: 1 0 0 0; }
+        """
+        BINDINGS = [Binding("up", "move(-1)", show=False), Binding("down", "move(1)", show=False),
+                    Binding("escape", "dismiss(None)", show=False)]
+
+        def __init__(self, models: list[str], where: str, preferred: str = ""):
+            super().__init__()
+            self.models, self.where, self.preferred = models, where, preferred
+            self.shown: list[str] = []
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="models"):
+                yield Input(placeholder="Type to filter…")
+                yield OptionList()
+                yield Static(Text(f"{len(self.models)} models at {self.where} · ↑↓ Enter start · Esc quits", _C_DIM))
+
+        def on_mount(self) -> None:
+            self.query_one("#models").border_title = "Choose a model"
+            self._fill("")
+            self.query_one(Input).focus()
+
+        def _fill(self, query: str) -> None:
+            options = self.query_one(OptionList)
+            self.shown = [m for m in self.models if query.lower() in m.lower()]
+            options.clear_options()
+            options.add_options(self.shown)
+            if self.shown:
+                options.highlighted = self.shown.index(self.preferred) if self.preferred in self.shown else 0
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            event.stop()
+            self._fill(event.value)
+
+        def on_input_submitted(self, event: Input.Submitted) -> None:
+            event.stop()
+            index = self.query_one(OptionList).highlighted
+            if self.shown and index is not None:
+                self.dismiss(self.shown[index])
+
+        def action_move(self, delta: int) -> None:
+            options = self.query_one(OptionList)
+            if self.shown:
+                options.highlighted = ((options.highlighted or 0) + delta) % len(self.shown)
+
+        def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+            event.stop()
+            self.dismiss(self.shown[event.option_index])
 
     class ApprovalScreen(ModalScreen):
         """Run this command? Yes / No / Always, or reject with a suggestion.
@@ -5007,7 +5057,7 @@ if _TEXTUAL_AVAILABLE:
         #help { width: 100; max-width: 96%; height: auto; max-height: 90%; border: double #5fd7ff;
                 background: #0b2f5e; padding: 1 2; }
         """
-        BINDINGS = [Binding("escape,q,enter", "close", show=False)]
+        BINDINGS = [Binding("escape,q,enter", "dismiss", show=False)]
 
         def compose(self) -> ComposeResult:
             table = Table.grid(padding=(0, 2))
@@ -5019,9 +5069,6 @@ if _TEXTUAL_AVAILABLE:
                 yield Static(Text("AI-Commander — keys, mouse and commands\n", style="bold #ffff5f"))
                 yield Static(table)
                 yield Static(Text("\nEsc closes this help.", style=_C_DIM))
-
-        def action_close(self) -> None:
-            self.dismiss()
 
     class AgentTab:
         """One agent of the TUI: its AICommander (own session file, lock, queue
@@ -5038,16 +5085,8 @@ if _TEXTUAL_AVAILABLE:
             self.event_queue: queue.Queue = queue.Queue()
             self.sink = TUISink(self.event_queue, threading.Event())
             self.sink.auto_approve = a.auto_approve
-            self.agent = AICommander(
-                api_base=a.api_base, model=a.model, api_key=a.api_key, auto_approve=a.auto_approve,
-                show_thinking=not a.no_thinking, command_timeout=a.timeout, max_prompt_len=a.max_prompt_len,
-                max_output_bytes=a.max_output_bytes, debug=a.debug, sink=self.sink, persist_history=True,
-                max_steps=a.max_steps, compress_algorithm="truncate" if a.fast else a.compress_alg,
-                compress_target=a.compress_target, fast=a.fast, reasoning_effort=a.reasoning_effort,
-                sandbox_enabled=a.sandbox_enabled, sandbox_write_dir=a.sandbox_write_dir,
-                session_file=session_file, instance_number=instance_number, verify_command=a.verify,
-                auto_approve_reads=not a.confirm_reads)
-            self.agent.max_tokens = getattr(a, "max_tokens", None) or self.agent.max_tokens
+            self.agent = agent_from_args(a, self.sink, persist_history=True, session_file=session_file,
+                                         instance_number=instance_number)
             self.sink.stop_event = self.agent.stop_event
             self.agent_log = OutputLog(id=f"agent-log-{self.uid}", classes="agent-log")
             self.console_log = OutputLog(id=f"console-log-{self.uid}", max_lines=5000)
@@ -5131,10 +5170,7 @@ if _TEXTUAL_AVAILABLE:
             if restored:
                 self.reopen_at = self.agent.selected_at  # the latest is the tab on screen at the last exit
                 self.pane = self.agent.pane if self.agent.pane in _PANES else self.pane
-                self.step = self.agent.step_count
-                self.total_tokens = self.agent.usage_totals.get("billable_tokens", 0)
                 self.render_history()
-            self.set_title(self.agent.task_summary)
             log.write_line("Commands run automatically (auto-approve is ON; F2 toggles)." if self.auto_approve
                            else "Every command asks for approval (F2 or /aa turns on auto-approve).",
                            "#ffd75f" if self.auto_approve else _C_DIM)
@@ -5145,11 +5181,11 @@ if _TEXTUAL_AVAILABLE:
             return self.app.args
 
         def render_history(self) -> None:
-            """Replay a restored conversation into both panes."""
-            log, console = self.agent_log, self.console_log
-            commands: dict = {}
+            """Replay a restored conversation into both panes, with its counters and title."""
+            log, console, agent = self.agent_log, self.console_log, self.agent
+            self.step, self.total_tokens = agent.step_count, agent.usage_totals.get("billable_tokens", 0)
             results = {m.get("tool_call_id"): _content_text(m.get("content")).strip()
-                       for m in self.agent.conversation_history if m.get("role") == "tool"}
+                       for m in agent.conversation_history if m.get("role") == "tool"}
             for msg in self.agent.conversation_history:
                 role, text = msg.get("role"), _content_text(msg.get("content")).strip()
                 if role == "user" and text and not _is_continuation(msg) and text != _CONTINUE_PROMPT:
@@ -5161,44 +5197,35 @@ if _TEXTUAL_AVAILABLE:
                         if line:
                             log.write_line(line, _C_ANSWER)
                     for tc in msg.get("tool_calls") or []:
-                        fn = tc.get("function") or {}
-                        if fn.get("name") == "todo":  # the folded list, as when it ran
-                            raw = fn.get("arguments")
-                            with contextlib.suppress(json.JSONDecodeError, TypeError):
-                                raw = raw if isinstance(raw, dict) else json.loads(raw or "{}")
-                            todos = AICommander.normalize_todos(raw.get("items") if isinstance(raw, dict) else None)
+                        name, result = (tc.get("function") or {}).get("name"), results.get(tc.get("id"))
+                        if name == "todo":  # the folded list, as when it ran
+                            todos = AICommander.normalize_todos((_call_args(tc) or {}).get("items"))
                             if todos:
                                 self.write_todos(todos)
-                            commands[tc.get("id")] = ""  # its result needs no console fold
                             continue
-                        command = _tool_command(tc)
+                        command, match = _tool_command(tc), _RESULT_RE.match(result or "")
+                        label = AICommander.command_label(name, command) if command else "tool result"
+                        output = match.group(2) if match else result or ""
+                        ok = match is not None and match.group(1) == "0"
                         if command:
-                            if command.partition(" ")[0] not in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS:
-                                command = f"$ {command}"
-                            commands[tc.get("id")] = command
-                            self._begin_command(command)
-                            result = results.get(tc.get("id"))
-                            match = _RESULT_RE.match(result or "")
-                            self._command_output(match.group(2) if match else result or "")
+                            self._begin_command(label)
+                            self._command_output(output)
                             self._end_command()
                             if match:
-                                ok, lines = match.group(1) == "0", len(match.group(2).splitlines())
+                                lines = len(output.splitlines())
                                 log.write_line(f"  {'✓' if ok else '✗'} exit {match.group(1)} · {lines} line"
                                                f"{'s' * (lines != 1)}", _C_OK if ok else _C_FAIL)
-                elif role == "tool":
-                    command = commands.pop(msg.get("tool_call_id"), None)
-                    if command == "":
-                        continue
-                    _fold_command(console, command or "tool result")
-                    match = _RESULT_RE.match(text)
-                    output = match.group(2) if match else text
-                    console.write_line(output[:4000] + ("\n… (truncated)" if len(output) > 4000 else ""), "#d0d0d0")
-                    console.end_fold()
-                    if match:
-                        ok = match.group(1) == "0"
-                        console.write_line(f"{'✓' if ok else '✗'} exit {match.group(1)}", f"bold {_C_OK if ok else _C_FAIL}")
+                        if result is not None:
+                            _fold_command(console, label)
+                            console.write_line(output[:4000] + ("\n… (truncated)" if len(output) > 4000 else ""),
+                                               "#d0d0d0")
+                            console.end_fold()
+                            if match:
+                                console.write_line(f"{'✓' if ok else '✗'} exit {match.group(1)}",
+                                                   f"bold {_C_OK if ok else _C_FAIL}")
             log.write_rule("restored session", _C_DIM)
-            self.show_todos(self.agent.todos)
+            self.show_todos(agent.todos)
+            self.set_title(agent.task_summary)
 
         def set_title(self, summary: str) -> None:
             self.agent_log.border_title = f"Agent · {summary}" if summary else "Agent"
@@ -5295,11 +5322,11 @@ if _TEXTUAL_AVAILABLE:
                 text = "\n".join(unread)
                 self.agent_log.write_line("↳ the agent finished before reading your message; "
                                           "it is back in the prompt.", "#ffd75f")
+                merged = lambda old: f"{text}\n{old}".strip("\n") if old.strip() else text  # noqa: E731
                 if self is self.app.tab:
-                    prompt = self.app.prompt
-                    prompt.set_text(f"{text}\n{prompt.text}".strip("\n") if prompt.text.strip() else text)
+                    self.app.prompt.set_text(merged(self.app.prompt.text))
                 else:
-                    self.draft = f"{text}\n{self.draft}".strip("\n") if self.draft.strip() else text
+                    self.draft = merged(self.draft)
             callbacks, self._idle_callbacks = self._idle_callbacks, []
             for callback in callbacks:
                 callback()
@@ -5390,8 +5417,7 @@ if _TEXTUAL_AVAILABLE:
                     self.write_todos(p["items"])
             elif kind == "CMD_EXEC":
                 self.current_command, self._cmd_started = p.get("command", ""), time.monotonic()
-                label = ("" if p.get("function_name") in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS
-                         else "$ ") + self.current_command
+                label = AICommander.command_label(p.get("function_name"), self.current_command)
                 self._begin_command(label)
                 _fold_command(console, label)
                 self.cmd_tail = ""
@@ -5577,10 +5603,6 @@ if _TEXTUAL_AVAILABLE:
             return self.tab.agent if self.tab else None
 
         @property
-        def sink(self) -> TUISink | None:
-            return self.tab.sink if self.tab else None
-
-        @property
         def agent_log(self) -> OutputLog:
             return self.tab.agent_log
 
@@ -5598,6 +5620,26 @@ if _TEXTUAL_AVAILABLE:
             self._tabs_bar = self.query_one("#agent-tabs", AgentTabs)
             self._status_bar = self.query_one("#status-bar", Static)
             atexit.register(self.save_sessions, "process_exit")
+            if self.args.model:
+                await self._start()
+            else:  # no --model: the user picks one of the server's models first
+                self.push_screen(ModelScreen(getattr(self.args, "model_choices", []), self.args.api_base,
+                                             getattr(self.args, "model_preferred", "")), self._model_chosen)
+
+        async def _model_chosen(self, model: str | None) -> None:
+            if not model:
+                self.exit(message="No model chosen.")
+                return
+            self.args.model = model
+            await self._start()
+
+        def check_action(self, action: str, parameters: tuple) -> bool:
+            """Until the first tab opens (while a model is being chosen) only help and quit work."""
+            return self.tab is not None or action in ("help", "quit")
+
+        async def _start(self) -> None:
+            """Open the tab of this directory's session (and its other saved ones), then
+            run the task or loop given on the command line."""
             first = await self._open_tab(self.args.session_file, self.args.instance_number, self.args.session_msg)
             await self._restore_tabs()
             self.select_tab(max(self.tabs, key=lambda t: t.reopen_at))  # the tab on screen at the last exit
@@ -5861,9 +5903,6 @@ if _TEXTUAL_AVAILABLE:
 
         # Prompt and slash commands -------------------------------------------------
 
-        def _agent_busy(self) -> bool:
-            return self.tab is not None and self.tab.busy()
-
         def on_prompt_area_submitted(self, message: PromptArea.Submitted) -> None:
             self._submit(message.text)
 
@@ -5884,13 +5923,13 @@ if _TEXTUAL_AVAILABLE:
         def _slash_command(self, text: str) -> None:
             command, _, arg = text.partition(" ")
             command, arg = command.lower(), arg.strip()
+            resume = lambda: self.action_pause(resume=True)  # noqa: E731
             actions = {
                 "/help": self.action_help, "/autoapprove": self.action_toggle_auto, "/aa": self.action_toggle_auto,
                 "/clear": self._clear_conversation, "/new": self._clear_conversation,
                 "/session": self._report_session, "/reload": self._reload_session,
-                "/copy": lambda: self._copy_answer(), "/todo": self._report_todos, "/stop": self.action_stop,
-                "/pause": self.action_pause, "/resume": lambda: self.action_pause(resume=True),
-                "/unpause": lambda: self.action_pause(resume=True),
+                "/copy": self._copy_answer, "/todo": self._report_todos, "/stop": self.action_stop,
+                "/pause": self.action_pause, "/resume": resume, "/unpause": resume,
                 "/loop": lambda: self.tab.start_loop(arg or "PROMPT.md"),
                 "/newtab": lambda: self.call_later(self.action_new_tab), "/closetab": self.action_close_tab,
                 "/tab": lambda: self.action_select_tab(int(arg)) if arg.isdigit() else self.agent_log.write_line(
@@ -5946,10 +5985,7 @@ if _TEXTUAL_AVAILABLE:
             if tab.agent.load_session(notify=False):
                 tab.agent_log.clear()
                 tab.console_log.clear()
-                tab.step = tab.agent.step_count
-                tab.total_tokens = tab.agent.usage_totals.get("billable_tokens", 0)
                 tab.render_history()
-                tab.set_title(tab.agent.task_summary)
                 tab.agent_log.write_line("Session reloaded from disk.", _C_OK)
             else:
                 tab.agent_log.write_line(f"Nothing reloaded from {tab.session_file}.", "#ffd75f")
@@ -6143,7 +6179,7 @@ if _TEXTUAL_AVAILABLE:
                 panel.show(list(self.agent.todos))
 
         def action_escape(self) -> None:
-            """Esc slides the task list shut, or leaves a diff on the Status tab."""
+            """Esc slides the task list shut, or rolls up the diff open on the Status tab."""
             panel = self.query_one(TodoPanel)
             if panel.shown:
                 panel.hide()
@@ -6187,10 +6223,7 @@ if _TEXTUAL_AVAILABLE:
                 self.notify("The agent is not running.", timeout=2)
 
         def action_interrupt(self) -> None:
-            if self.tab.busy():
-                self.action_stop()
-                return
-            self.action_quit()
+            self.action_stop() if self.tab.busy() else self.action_quit()
 
         def action_quit(self) -> None:
             """Ask first; the quit key again while asking quits."""
@@ -6253,6 +6286,74 @@ def _enable_windows_console_vt() -> None:
             kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
 
 
+def list_models(api_base: str, api_key: str) -> list[str]:
+    """The model ids an OpenAI-compatible endpoint lists (GET /models), sorted."""
+    client = OpenAI(api_key=api_key, base_url=api_base.rstrip("/"), default_headers={"User-Agent": USER_AGENT},
+                    max_retries=0, timeout=15)
+    return sorted({m.id for m in client.models.list() if getattr(m, "id", None)}, key=str.lower)
+
+
+def _model_from_server(args, parser) -> str:
+    """No --model: the endpoint's only model, or the user's pick of its models.
+    The TUI asks in a dialog (it gets args.model_choices; "" is returned)."""
+    print(f"[MODEL] No --model given: asking {args.api_base} for its models...", file=sys.stderr)
+    try:
+        models = list_models(args.api_base, args.api_key)
+    except Exception as exc:
+        parser.error(f"--model is required (or set $AIC_MODEL): could not list the models of "
+                     f"{args.api_base} ({_describe_error(exc)})")
+    if not models:
+        parser.error(f"--model is required (or set $AIC_MODEL): {args.api_base} lists no models")
+    if len(models) == 1:
+        return models[0]
+    saved = (read_session_file(args.session_file)[0] or {}).get("model") if args.session_file else None
+    args.model_preferred = saved if saved in models else ""  # the model of the session this resumes
+    if not args.nogui:
+        args.model_choices = models
+        return ""
+    if args.json or not sys.stdin.isatty():
+        parser.error(f"--model is required (or set $AIC_MODEL); {args.api_base} lists: {', '.join(models)}")
+    return _ask_model(models, args.model_preferred)
+
+
+def _ask_model(models: list[str], preferred: str = "") -> str:
+    """--nogui: pick a model in the terminal, by number or name (Enter: *preferred*)."""
+    for i, model in enumerate(models, 1):
+        print(f"{i:4}  {model}{'  (last used)' if model == preferred else ''}")
+    while True:
+        try:
+            answer = input(f"Model [1-{len(models)}{', Enter: ' + preferred if preferred else ''}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit("No model chosen.")
+        if answer.isdigit() and 1 <= int(answer) <= len(models):
+            return models[int(answer) - 1]
+        if answer in models or (not answer and preferred):
+            return answer or preferred
+
+
+def agent_from_args(args, sink: EventSink, **settings) -> AICommander:
+    """An agent configured by the command line (a TUI tab, or the --nogui run)."""
+    agent = AICommander(
+        api_base=args.api_base, model=args.model, api_key=args.api_key, auto_approve=args.auto_approve,
+        show_thinking=not args.no_thinking, command_timeout=args.timeout, max_prompt_len=args.max_prompt_len,
+        max_output_bytes=args.max_output_bytes, debug=args.debug, sink=sink, max_steps=args.max_steps,
+        compress_algorithm="truncate" if args.fast else args.compress_alg, compress_target=args.compress_target,
+        fast=args.fast, reasoning_effort=args.reasoning_effort, sandbox_enabled=args.sandbox_enabled,
+        sandbox_write_dir=args.sandbox_write_dir, verify_command=args.verify,
+        auto_approve_reads=not args.confirm_reads, **settings)
+    agent.max_tokens = getattr(args, "max_tokens", None) or agent.max_tokens
+    return agent
+
+
+def _on_signals(handler) -> None:
+    """Route SIGTERM and SIGHUP (where they exist) to *handler*."""
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            with contextlib.suppress(ValueError, OSError, RuntimeError):
+                signal.signal(sig, handler)
+
+
 def main():
     _enable_windows_console_vt()
     _check_openai_version()
@@ -6262,7 +6363,8 @@ def main():
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--api-base", default=os.environ.get("AIC_API_BASE") or os.environ.get("OPENAI_BASE_URL"),
                         help="API base URL (default: $AIC_API_BASE or $OPENAI_BASE_URL)")
-    parser.add_argument("--model", default=os.environ.get("AIC_MODEL"), help="Model name (default: $AIC_MODEL)")
+    parser.add_argument("--model", default=os.environ.get("AIC_MODEL"),
+                        help="Model name (default: $AIC_MODEL; without one, pick one of the models the server lists)")
     parser.add_argument("--api-key", default=None,
                         help="API key (default: $AIC_API_KEY or $OPENAI_API_KEY; prefer these: a key on the "
                              "command line is visible to every process, the agent's commands included)")
@@ -6318,7 +6420,7 @@ def main():
     # AIC_API_KEY is ours: keep it out of the environment the agent's commands inherit.
     env_key = os.environ.pop("AIC_API_KEY", None)
     args.api_key = args.api_key or env_key or os.environ.get("OPENAI_API_KEY")
-    for name, env in (("api_base", "AIC_API_BASE"), ("model", "AIC_MODEL"), ("api_key", "AIC_API_KEY")):
+    for name, env in (("api_base", "AIC_API_BASE"), ("api_key", "AIC_API_KEY")):
         if not getattr(args, name):
             parser.error(f"--{name.replace('_', '-')} is required (or set ${env})")
     args.nogui = args.nogui or args.json
@@ -6349,6 +6451,9 @@ def main():
                                 f"{os.path.basename(args.session_file)} (instance {args.instance_number})")
         else:
             args.session_msg = f"[SESSION] Persisting session to {args.session_file}"
+    args.model_choices, args.model_preferred = [], ""
+    if not args.model:
+        args.model = _model_from_server(args, parser)
 
     history = None
     if not args.nogui:  # opened before the sandbox, which would block writes to $HOME
@@ -6367,17 +6472,8 @@ def main():
         sink.emit("LOG", {"text": args.sandbox_msg, "style": "green" if args.sandbox_enabled else "red"})
         sink.emit("LOG", {"text": args.session_msg,
                           "style": "green" if args.session_file and args.instance_number == 1 else "yellow"})
-        commander = AICommander(
-            api_base=args.api_base, model=args.model, api_key=args.api_key, auto_approve=args.auto_approve,
-            show_thinking=not args.no_thinking, command_timeout=args.timeout,
-            max_prompt_len=args.max_prompt_len, max_output_bytes=args.max_output_bytes, debug=args.debug,
-            sink=sink, max_steps=args.max_steps,
-            compress_algorithm="truncate" if args.fast else args.compress_alg,
-            compress_target=args.compress_target, fast=args.fast, reasoning_effort=args.reasoning_effort,
-            sandbox_enabled=args.sandbox_enabled, sandbox_write_dir=args.sandbox_write_dir,
-            session_file=args.session_file, instance_number=args.instance_number, verify_command=args.verify,
-            auto_approve_reads=not args.confirm_reads)
-        commander.max_tokens = args.max_tokens
+        commander = agent_from_args(args, sink, session_file=args.session_file,
+                                    instance_number=args.instance_number)
         commander.persist_history = commander.load_session()  # resume where the last run stopped
         atexit.register(commander.save_session, "process_exit")
 
@@ -6387,10 +6483,7 @@ def main():
             signal.signal(signum, signal.SIG_DFL)
             os.kill(os.getpid(), signum)
 
-        for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
-            if sig is not None:
-                with contextlib.suppress(ValueError, OSError, RuntimeError):
-                    signal.signal(sig, save_then_reraise)
+        _on_signals(save_then_reraise)
         try:
             status = (commander.run_loop(os.path.abspath(args.loop), args.max_iterations) if args.loop
                       else commander.run(" ".join(args.request)))
@@ -6411,10 +6504,7 @@ def main():
             os._exit(128 + signum)  # the terminal is gone: nothing left to restore
         app.call_later(app.shutdown)
 
-    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
-        if sig is not None:
-            with contextlib.suppress(ValueError, OSError, RuntimeError):
-                signal.signal(sig, on_signal)
+    _on_signals(on_signal)
     try:
         app.run(mouse=not args.no_mouse)
     except KeyboardInterrupt:
