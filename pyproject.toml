@@ -30,13 +30,11 @@ classifiers = [
 ]
 
 # All runtime dependencies are mandatory so that a plain `pip install`
-# yields a fully working TUI *and* the LLM context compressor.
+# yields a fully working TUI. textual brings rich, which the TUI also imports.
 dependencies = [
     "openai>=2.0.0",
-    "context-compressor-llm>=0.1.0",
     "ddgs>=8.0.0",
     "textual>=8.0.0",
-    "rich>=14.2.0",
     "pyte>=0.8.2",
     # Landlock is a Linux-only kernel sandbox; the agent runs unsandboxed
     # (graceful fallback) where it is unavailable.

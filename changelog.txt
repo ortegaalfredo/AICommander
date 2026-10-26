@@ -1,6 +1,29 @@
 AI-Commander changelog
 ======================
 
+2.6.0
+-----
+
+- Status, Changes: the files show as a folder tree (folders first, a chain
+  of lone folders as one row). A click on a folder folds it; a click on a
+  file unrolls its diff right under it with a short slide (a second click or
+  Esc rolls it up), and an open diff follows the agent's further edits.
+- The agent pane's tool calls are folds, closed from the start: the exit
+  summary stays in sight and a click rolls out the output (the whole command
+  first when its header was cut, then at most 200 lines; the Tools pane has
+  all of it). Restored sessions fold them the same way.
+- Quitting asks first (F10, Ctrl+Q, /quit, /exit, Ctrl+C while idle): y,
+  Enter or the same key again quits, n or Esc stays. SIGTERM still quits at
+  once.
+- /unpause: an alias of /resume.
+- Changes made with commands are found in repositories with more than 5000
+  untracked files too: only the largest untracked directories (never the one
+  holding the working directory) are left out of git status, where before
+  every untracked directory was one entry and the files created or deleted
+  in it were missed.
+- context-compressor-llm is no longer a dependency: the anchored-summary
+  compression (still the default --compress-alg) is built in.
+
 2.5.1
 -----
 

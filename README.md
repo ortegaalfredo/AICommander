@@ -127,8 +127,7 @@ pip install aic-agent
 ```
 
 This installs the `aic` command plus every runtime dependency, including the
-Textual TUI and the `context-compressor-llm` context compressor, so both the
-TUI and LLM-based compression work out of the box. (`py-landlock` is installed
+Textual TUI, so the TUI and LLM-based context compression work out of the box. (`py-landlock` is installed
 only on Linux; elsewhere the agent simply runs unsandboxed.)
 
 Upgrade with:
@@ -323,9 +322,10 @@ The default Textual interface is a Norton-Commander-style split screen:
 - **Left pane — Agent**: the model's streamed answer (live, word-wrapped and
   re-wrapped when the terminal is resized), its thinking in dim italics
   (folded to `▸ ✻ thinking · N lines` once it ends; click to unfold), each
-  command it runs (`$ command`, at most 3 rows: a longer one ends in `…` and a
-  click shows the rest, while the Tools pane always has it in full) with an
-  exit/duration summary, and status
+  command it runs as a folded `▸ $ command` line (at most 3 rows: a longer one
+  ends in `…`) with an exit/duration summary under it; a click rolls out its
+  output (the whole command first when it was cut, then up to 200 lines; the
+  Tools pane always has all of it), and status
   messages. The pane title shows an LLM-generated summary of the task, and its
   bottom border the agent's task list (from its `todo` tool): progress and the
   current item, e.g. `☑ 2/5 · ▸ Run the tests`. Each update of the list is a
@@ -341,9 +341,10 @@ The default Textual interface is a Norton-Commander-style split screen:
   **Changes** lists the files the agent changed in this conversation with
   their `+added −removed` lines — made with its file tools, or with commands
   inside a git repository (found by comparing `git status` and `HEAD` around
-  each command; `AIC_TRACK_CHANGES=0` turns that off). A click shows the diff
-  against the file before the agent first touched it; `Esc` goes back. The
-  list is saved with the session and `/clear` empties it.
+  each command; `AIC_TRACK_CHANGES=0` turns that off), as a folder tree: a
+  click on a folder folds it, and a click on a file unrolls its diff against
+  the file before the agent first touched it right under it (a second click or
+  `Esc` rolls it up). The list is saved with the session and `/clear` empties it.
   **Jobs** shows the running command with its last lines of output, and the
   background jobs with their latest output and a `stop` button (finished ones
   with their exit code).
@@ -388,11 +389,11 @@ controls, so they are **not** added to prompt history:
 | `/todo` | — | Print the agent's task list (its progress is always in the agent pane's bottom border). |
 | `/loop [file]` | — | Start a [ralph loop](#ralph-loop-mode) over a prompt file (default `PROMPT.md`), up to `--max-iterations`. |
 | `/stop` | — | Stop the running agent (same as `F9`). |
-| `/pause` | `/resume` | Pause the agent after its current step without ending the run (the running command or reply finishes first); `/pause` again or `/resume` goes on with the same conversation, step count and reasoning. Messages typed while paused are delivered on resume. |
+| `/pause` | `/resume`, `/unpause` | Pause the agent after its current step without ending the run (the running command or reply finishes first); `/pause` again, `/resume` or `/unpause` goes on with the same conversation, step count and reasoning. Messages typed while paused are delivered on resume. |
 | `/newtab` | — | Open a new agent tab (same as `Ctrl+T`). |
 | `/closetab` | — | Close the current agent tab, discarding its conversation (twice if it has one). |
 | `/tab N` | — | Select agent tab N (same as `Alt+N`). |
-| `/quit` | `/exit` | Stop the agent and exit the application. |
+| `/quit` | `/exit` | Stop the agent and exit the application (after a confirmation). |
 | `/approve`, `/reject`, `/suggest <text>` | — | Answer a pending approval (normally done in the approval dialog). |
 
 ### Keyboard shortcuts
@@ -412,8 +413,8 @@ controls, so they are **not** added to prompt history:
 | `F7` | Zoom the focused pane to full screen; `Escape` restores it. |
 | `F8` (twice) | Clear the conversation. |
 | `F9` | Stop the agent (a pending LLM response is cut off immediately). |
-| `Ctrl+C` | Copy the selection; otherwise stop a running agent; press twice while idle to quit. |
-| `F10` / `Ctrl+Q` | Quit (every tab's session and the history are saved). |
+| `Ctrl+C` | Copy the selection; otherwise stop a running agent; while idle, ask to quit (press it again to quit). |
+| `F10` / `Ctrl+Q` | Quit, after a confirmation: `y`, `Enter` or the same key again quits, `n` or `Esc` stays (every tab's session and the history are saved). |
 | `Ctrl+F` | Find in the agent log, or in the Tools pane or a diff when it has the focus: incremental and case-insensitive; `Enter`/`↑` previous match, `↓` next, `Esc` closes. A match inside folded output unfolds it. |
 | `Ctrl+T` | Open a new agent tab. |
 | `Ctrl+G` | Go to an agent tab: a list opens; `1`…`9` or `↑`/`↓` `Enter` select, `Ctrl+G` again (or `Tab`) the next tab, `N` a new tab, `X` closes the highlighted one, `Esc` cancels. Plain control keys work in every terminal, unlike Alt/Ctrl+digit, which terminals such as Tilix and GNOME Terminal keep for themselves. |
@@ -602,10 +603,11 @@ on each step, slowly losing more history than necessary.
 
 ### The `context-compressor-llm` algorithm
 
-`--compress-alg context-compressor-llm` (the default) uses the
+`--compress-alg context-compressor-llm` (the default) is a Factory.ai-style
+**anchored-summary incremental compressor**, the algorithm of the
 [`context-compressor-llm`](https://pypi.org/project/context-compressor-llm/)
-package, which implements a Factory.ai-style **anchored-summary incremental
-compressor**. When the non-system log exceeds the budget it:
+package, built into AI-Commander (no extra dependency). When the non-system
+log exceeds the budget it:
 
 1. **Evicts the oldest prefix** of the conversation.
 2. **Folds it into a persistent `AnchoredSummary`** via an LLM call on the
@@ -622,10 +624,7 @@ itself is kept (not the model's `<analysis>` scratchpad). The first user
 instruction and the current request are preserved verbatim, and a fallback user
 message is appended if aggressive compression would leave no user query at all
 (some endpoints reject that). When nothing can be summarized, the `truncate`
-algorithm is applied instead.
-
-If the `context-compressor-llm` package is not installed, this algorithm falls
-back to `truncate`.
+algorithm is applied instead, as it is when the summarizer call fails.
 
 ### Choosing an algorithm
 
@@ -881,3 +880,31 @@ removed and progress-bar redraws collapsed to their final state.
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+---
+
+## ASCII Pac-Man
+
+`ascii_pacman.py` is a complete, self-contained Pac-Man game for the terminal.
+It uses only the Python standard library (`curses` + `random`), needs no
+assets, and draws everything with ASCII characters.
+
+```bash
+python3 ascii_pacman.py
+```
+
+| Key | Action |
+| --- | --- |
+| Arrow keys / `WASD` / `HJKL` | Move |
+| `P` | Pause / resume |
+| `Q` | Quit |
+| `R` | Restart after game over |
+
+Eat every pellet to clear the level. Big pellets make the ghosts frightened for
+a few seconds — eat them for 200, 400, 800 and 1600 points in a chain. Four
+ghosts with classic personalities (direct chase, ambush, flanking, shy) patrol
+the maze, alternating between scatter and chase phases, and they get faster
+every level. You have three lives and the side tunnels wrap around the screen.
+
+Options: `--no-color`, `--seed N`, `--level N`, `--lives N`, `--selftest`.
+A terminal of at least 32x23 is required.

@@ -479,9 +479,7 @@ class TestRunner:
         # performs anchored-summary incremental compression: the oldest prefix
         # is folded into an anchored summary (a system message) while the newest
         # suffix is retained and the system prompt stays byte-identical. The
-        # LLM summarizer is stubbed so the test runs fully offline; when the
-        # context-compressor-llm package is missing the algorithm falls back to
-        # truncate, which still must bring the history under budget.
+        # LLM summarizer is stubbed so the test runs fully offline.
         c = self.make_commander(max_prompt_len=60, model="gpt-test",
                                 compress_algorithm="context-compressor-llm")
         big = "A" * 500
@@ -502,15 +500,12 @@ class TestRunner:
                    and c.conversation_history[1].get("role") == "user"
                    and c.conversation_history[1].get("content") == "hello",
                    repr(c.conversation_history))
-        if aic._CONTEXT_COMPRESSOR_LLM_AVAILABLE:
-            self.check("context-compressor-llm: anchored summary folded in",
-                       "[Prior conversation summary]" in c.conversation_history[0]["content"],
-                       repr(c.conversation_history[0]))
-            self.check("context-compressor-llm: no mid-list system message",
-                       not any(m["role"] == "system" for m in c.conversation_history[1:]),
-                       repr(c.conversation_history))
-        else:
-            self.check("context-compressor-llm: falls back when lib missing", True)
+        self.check("context-compressor-llm: anchored summary folded in",
+                   "[Prior conversation summary]" in c.conversation_history[0]["content"],
+                   repr(c.conversation_history[0]))
+        self.check("context-compressor-llm: no mid-list system message",
+                   not any(m["role"] == "system" for m in c.conversation_history[1:]),
+                   repr(c.conversation_history))
 
     def test_prompt_budget_reserves_output(self):
         # For non-"gpt" models the prompt must stay under
@@ -1047,9 +1042,26 @@ class TestRunner:
                 await pilot.press("f3", "f3")  # Status -> Shell -> Tools
                 await pilot.pause(0.1)
                 r["the tab on screen is the last selected"] = tab3.agent.selected_at > tab1.agent.selected_at > 0
+                asking = lambda: type(app.screen).__name__ == "QuitScreen"
                 await pilot.press("f10")
+                await pilot.pause(0.1)
+                r["F10 asks first"] = app.is_running and asking()
+                await pilot.pause(0.4)
+                await pilot.press("n")
+                await pilot.pause(0.1)
+                r["n stays"] = app.is_running and not asking()
+                app.prompt.focus()
+                await pilot.press(*"/quit", "enter", "y")
+                await pilot.pause(0.1)
+                r["/quit asks too; a y typed right away does not answer"] = app.is_running and asking()
+                await pilot.press("escape")
+                await pilot.pause(0.1)
+                r["Esc stays"] = app.is_running and not asking()
+                await pilot.press("ctrl+q")
+                await pilot.pause(0.5)
+                await pilot.press("y")
                 await pilot.pause(0.3)
-            r["quit"] = not app.is_running
+            r["y quits"] = not app.is_running
             return r
 
         async def second_run():
@@ -1068,8 +1080,9 @@ class TestRunner:
                 if len(app.tabs) == 2:
                     r["reopened tab shows its conversation"] = "third-answer" in app.tabs[1].agent_log.plain_text
                     r["first tab restored too"] = "first-answer" in app.tabs[0].agent_log.plain_text
-                await pilot.press("f10")
+                await pilot.press("f10", "f10")
                 await pilot.pause(0.3)
+            r["F10 twice quits"] = not app.is_running
             return r
 
         native = aic.clipboard_write_native, aic.clipboard_read_native
@@ -1651,9 +1664,6 @@ class TestRunner:
                    any(m is request for m in c.conversation_history), repr(c.conversation_history))
 
     def test_ccllm_summary_is_folded_not_stacked(self):
-        if not aic._CONTEXT_COMPRESSOR_LLM_AVAILABLE:
-            self.check("summary folding: skipped (library missing)", True)
-            return
         c = self.make_commander(max_prompt_len=300, model="gpt-test")
         seen = []
 
@@ -1670,10 +1680,6 @@ class TestRunner:
         self.check("summary folding: previous summary handed over", seen[-1] == "summary-1", repr(seen))
 
     def test_summarizer_failures_fall_back(self):
-        if not aic._CONTEXT_COMPRESSOR_LLM_AVAILABLE:
-            self.check("summarizer fallback: skipped (library missing)", True)
-            return
-
         def compress(summarize):
             c = self.make_commander(max_prompt_len=300, model="gpt-test")
             c._llm_summarize = summarize
@@ -1918,7 +1924,7 @@ class TestRunner:
                 await pilot.press("f6")
                 await pilot.press("ctrl+c")
                 await pilot.pause(0.1)
-                results["first ctrl+c keeps running"] = app.is_running
+                results["first ctrl+c asks to quit"] = app.is_running and type(app.screen).__name__ == "QuitScreen"
                 await pilot.press("ctrl+c")
                 await pilot.pause(0.3)
             results["second ctrl+c quits"] = not app.is_running
@@ -2056,8 +2062,8 @@ class TestRunner:
                 await pilot.pause(0.3)
                 results["nothing is sent while paused"] = len(fake.calls) == 1 and tab.busy()
                 await pilot.press(*"also check the logs", "enter")
-                await pilot.press(*"/resume", "enter")
-                results["resume finishes the same run"] = await until(pilot, lambda: not tab.busy())
+                await pilot.press(*"/unpause", "enter")  # (/resume's alias)
+                results["/unpause finishes the same run"] = await until(pilot, lambda: not tab.busy())
                 await pilot.pause(0.2)  # the last events reach the panes
                 sent = fake.calls[1]["messages"] if len(fake.calls) > 1 else []
                 results["the conversation went on, with the queued message"] = (
@@ -2103,6 +2109,7 @@ class TestRunner:
             sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd(),
             loop="", max_iterations=10, verify="", confirm_reads=False)
         script = [self._call("write_file", {"path": "notes.md", "content": "one\ntwo\n"}),
+                  self._call("write_file", {"path": "docs/guide/intro.md", "content": "hi\n"}, id="c1b"),
                   self._call("execute_bash", {"command": "sed -i s/8001/8003/ config.yml"}, id="c2"),
                   self._call("execute_bash", {"command": "sleep 1; echo bg-line", "background": True}, id="c3"),
                   self._done()]
@@ -2127,18 +2134,29 @@ class TestRunner:
                 await pilot.press(*"go", "enter")
                 await until(pilot, lambda: not tab.busy())
                 await pilot.pause(0.6)
-                rows = status.query_one(".changes-rows").render().plain
+                top, rest, leaf = (status.query_one(c) for c in (".changes-rows", ".changes-rest", ".diff"))
+                rows = top.render().plain.splitlines()
                 r["file-tool and command changes are listed"] = (
-                    "notes.md" in rows and "+2 −0 · new" in rows and "config.yml" in rows and "+1 −1 · bash" in rows)
+                    "notes.md" in rows[3] and "+2 −0 · new" in rows[3] and "config.yml" in rows[2]
+                    and "+1 −1 · bash" in rows[2])
+                r["they show as a tree, folders first"] = (
+                    rows[0].startswith(" ▾ docs/guide/") and rows[1].startswith("   ● intro.md"))
                 r["Tools is marked when it has news"] = "Tools ●" in bar.render().plain
-                await pilot.click(status.query_one(".changes-rows"), offset=(3, 1))
-                await pilot.pause(0.2)
-                diff = status.query_one(".diff").plain_text
-                r["a click shows the diff"] = (status.diff_path == os.path.join(repo, "config.yml")
-                                               and "-port: 8001" in diff and "+port: 8003" in diff)
+                await pilot.click(top, offset=(3, 2))
+                await pilot.pause(0.5)
+                diff = leaf.plain_text
+                r["a click unrolls the diff under the file"] = (
+                    status.diff_path == os.path.join(repo, "config.yml") and "-port: 8001" in diff
+                    and "+port: 8003" in diff and leaf.display and leaf.styles.height.value >= 3
+                    and "config.yml" in top.render().plain.splitlines()[-1] and "notes.md" in rest.render().plain)
                 await pilot.press("escape")
+                await pilot.pause(0.4)
+                r["Esc rolls it up"] = (status.diff_path is None and not leaf.display and not rest.display
+                                        and "notes.md" in top.render().plain)
+                await pilot.click(top, offset=(3, 0))
                 await pilot.pause(0.2)
-                r["Esc goes back to the list"] = status.diff_path is None and status.query_one(".changes").display
+                r["a click on a folder folds it"] = (top.render().plain.startswith(" ▸ docs/guide/ · 1 file")
+                                                     and "intro.md" not in top.render().plain)
                 jobs = status.query_one(".jobs")
                 r["a background job shows with its output"] = "job 1" in jobs.render().plain
                 await until(pilot, lambda: "✓ job 1 · exit 0" in jobs.render().plain, 5)
@@ -2197,9 +2215,46 @@ class TestRunner:
         for name, ok in results.items():
             self.check(f"tui status: {name}", ok, repr(results) if not ok else "")
 
+    def test_git_changes_many_untracked(self):
+        """Command changes are still found when a repository has more untracked
+        files than git status is asked to list: the largest untracked directory
+        is left out, never the one holding the working directory."""
+        if not shutil.which("git"):
+            self.check("git changes: skipped (git missing)", True)
+            return
+        import tempfile
+        repo = os.path.realpath(tempfile.mkdtemp())
+        try:
+            for d in ("work/proj", "junk"):
+                os.makedirs(os.path.join(repo, d))
+            for p in ("a.txt", "work/proj/old.txt"):
+                with open(os.path.join(repo, p), "w") as f:
+                    f.write("x\n")
+            for n in range(60):
+                open(os.path.join(repo, "junk", str(n)), "w").close()
+            git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+            for cmd in (["init", "-q"], ["add", "a.txt"], ["commit", "-qm", "init"]):
+                subprocess.run(git + cmd, cwd=repo, check=True)
+            agent = self.make_commander()
+            agent.cwd = agent.start_cwd = os.path.join(repo, "work", "proj")
+            agent._STATUS_LIMIT = 40
+            for command in ("echo y > new.txt", "rm old.txt", "mkdir sub && echo z > sub/f.txt", "rm ../../a.txt"):
+                state = agent._git_state(agent.cwd)
+                agent.execute_bash_command(command)
+                agent._note_git_changes(state)
+            got = {os.path.relpath(p, repo): c["before"] for p, c in agent.changes.items()}
+            self.check("git changes: the largest untracked directory is left out",
+                       state is not None and state[3] == ("junk/",), repr(state and state[3]))
+            self.check("git changes: files created and deleted in untracked directories are found",
+                       got == {"work/proj/new.txt": None, "work/proj/old.txt": False,
+                               "work/proj/sub/f.txt": None, "a.txt": "x\n"}, repr(got))
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
     def test_tui_clipped_commands(self):
-        """A long tool call takes at most 3 rows of the agent panel, ending in "…"
-        (a click shows all of it); the Tools pane shows it in full."""
+        """Tool calls in the agent panel are folds, closed from the start, of their
+        output (a click rolls it out); a long one takes at most 3 rows, ending in
+        "…", and its fold starts with all of it; the Tools pane shows it in full."""
         if not aic._TEXTUAL_AVAILABLE:
             self.check("tui clip: skipped (textual missing)", True)
             return
@@ -2216,7 +2271,9 @@ class TestRunner:
             request=[], session_file="", instance_number=1, session_msg="[SESSION] off",
             sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=tmp,
             loop="", max_iterations=10, verify="", confirm_reads=False)
-        script = [self._call("execute_bash", {"command": command}), self._done()]
+        script = [self._call("execute_bash", {"command": command}),
+                  self._call("execute_bash", {"command": "echo fold-out-1; echo fold-out-2"}, id="c2"),
+                  self._call("execute_bash", {"command": "true"}, id="c3"), self._done()]
 
         async def scenario():
             app = aic.CommanderApp(args, aic.PromptHistory(None))
@@ -2231,7 +2288,15 @@ class TestRunner:
                 while tab.busy() and time.monotonic() < end:
                     await pilot.pause(0.05)
                 await pilot.pause(0.3)
-                index = next(i for i, line in enumerate(log._lines) if line.plain.startswith("$ cat > notes.txt"))
+                lines = log._lines
+                index = next(i for i, line in enumerate(lines) if line.plain.startswith("▸ $ cat > notes.txt"))
+                echo = next(i for i, line in enumerate(lines) if line.plain.startswith("▸ $ echo fold-out-1"))
+                shown = {lines[row[0]].plain for row in log._rows}
+                r["a tool call's output is in its fold, closed"] = (
+                    "fold-out-1" in log.plain_text and "fold-out-1" not in shown and lines[echo].folded is True
+                    and lines[echo + 3].plain.startswith("  ✓ exit 0") and lines[echo + 3].owner is None)
+                r["a call without output is not a fold"] = "$ true" in shown and not any(
+                    line.plain.startswith("▸ $ true") for line in lines)
                 rows = [k for k, row in enumerate(log._rows) if row[0] == index]
                 top = int(log.scroll_offset.y)
                 last = log.render_line(rows[-1] - top).text.rstrip()
@@ -2241,12 +2306,19 @@ class TestRunner:
                 r["the command itself is not changed"] = tab.agent.conversation_history[2]["tool_calls"][0][
                     "function"]["arguments"] == json.dumps({"command": command})
                 await pilot.click(log, offset=(4, rows[0] - top + 1))  # (+1: the border)
-                await pilot.pause(0.2)
-                r["a click shows all of it"] = len([row for row in log._rows if row[0] == index]) > 3
+                await pilot.pause(0.4)
+                shown = [lines[row[0]].plain for row in log._rows]
+                r["a click rolls out the whole command and its output"] = (
+                    lines[index].plain.startswith("▾ $ cat") and command.splitlines()[-1] in shown
+                    and body.splitlines()[-1] in shown and "40 notes.txt" in shown)
                 log.clear()
                 tab.render_history()
-                index = next(i for i, line in enumerate(log._lines) if line.plain.startswith("$ cat > notes.txt"))
-                r["a restored session clips it too"] = len([row for row in log._rows if row[0] == index]) == 3
+                index = next(i for i, line in enumerate(log._lines) if line.plain.startswith("▸ $ cat > notes.txt"))
+                echo = next(i for i, line in enumerate(log._lines) if line.plain.startswith("▸ $ echo fold-out-1"))
+                r["a restored session folds and clips them too"] = (
+                    len([row for row in log._rows if row[0] == index]) == 3
+                    and log._lines[echo + 1].plain == "fold-out-1" and log._lines[echo + 1].owner is log._lines[echo]
+                    and "fold-out-1" not in {log._lines[row[0]].plain for row in log._rows})
             return r
 
         native = aic.clipboard_write_native, aic.clipboard_read_native
@@ -2776,6 +2848,7 @@ def main():
     runner.test_tui_todo()
     runner.test_tui_pause()
     runner.test_tui_status()
+    runner.test_git_changes_many_untracked()
     runner.test_tui_clipped_commands()
     runner.test_completion_marker()
     runner.test_file_tools()

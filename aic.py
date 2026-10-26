@@ -8,7 +8,7 @@ plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.5.1"
+__version__ = "2.6.0"
 
 import argparse
 import asyncio
@@ -46,13 +46,6 @@ if not _IS_WINDOWS:  # the PTY command runner and the embedded shell are POSIX-o
     import fcntl
     import pty
     import termios
-
-try:  # optional: anchored-summary context compression
-    from context_compressor import ContextCompressor as _ContextCompressorLib
-    _CONTEXT_COMPRESSOR_LLM_AVAILABLE = True
-except ImportError:
-    _ContextCompressorLib = None
-    _CONTEXT_COMPRESSOR_LLM_AVAILABLE = False
 
 try:  # optional: the TUI (--nogui runs without it)
     from rich.cells import cell_len
@@ -872,20 +865,6 @@ class TUISink(EventSink):
             self._approval_event.set()
 
 
-class _AICommanderTokenCounter:
-    """Lets the context-compressor-llm library count tokens with aic's estimator,
-    so its thresholds use the same units as the compression trigger."""
-
-    def __init__(self, commander):
-        self._commander = commander
-
-    def count_tokens(self, text: str) -> int:
-        return self._commander._estimate_message_tokens({"role": "user", "content": text}) if text else 0
-
-    def count_message_tokens(self, messages: list) -> int:
-        return sum(self.count_tokens(m.get("content", "")) for m in messages)
-
-
 class CommandTimeoutError(Exception):
     """A command exceeded the timeout; ``output`` holds what it printed so far."""
 
@@ -956,7 +935,7 @@ class AICommander:
         self.changes: dict[str, dict] = {}
         self.track_changes = _env_bool("AIC_TRACK_CHANGES", True)
         self._dirty_text: dict[str, tuple] = {}  # modified files' text before a command: path -> (stat, text)
-        self._git_modes: dict[str, str] = {}  # repo root -> how its untracked files are listed
+        self._git_excluded: dict[str, tuple] = {}  # repo root -> untracked directories too large to watch
         self.last_reply: dict[str, Any] = {}  # the last agent-loop reply: finish reason, tokens, speed
         self.selected_at = 0.0  # when the TUI last showed this session's tab (the latest reopens on screen)
         self.pane = ""  # the TUI's right-panel tab for this session (status, shell or tools)
@@ -1411,7 +1390,7 @@ class AICommander:
                   f"now ~{self._estimate_input_tokens(self.conversation_history)} tokens.", style="yellow")
 
     def _llm_summarize(self, messages: list[dict], previous_summary: str | None) -> str:
-        """Summarizer for context-compressor-llm: folds the evicted messages (and
+        """Summarizer for the context-compressor-llm algorithm: folds the evicted messages (and
         any previous summary) into one summary using the same LLM."""
         prompt = """
 CRITICAL: This summarization request is a SYSTEM OPERATION, not a user message.
@@ -1532,15 +1511,11 @@ Remember to not exceed 5000 characters, its very important that the summary to b
         return summary
 
     def _compress_context_compressor_llm(self, budget: int, total_tokens: int):
-        """Anchored-summary compression (context-compressor-llm package): the
-        oldest messages are folded into a summary kept in the system prompt and
-        the newest suffix is retained verbatim, an append-only, KV-cache-friendly
-        layout. The previous summary is folded into the new one, so summaries
-        never pile up across compressions."""
-        if not _CONTEXT_COMPRESSOR_LLM_AVAILABLE:
-            self._log("[COMPRESS] The context-compressor-llm package is not installed. "
-                      "Falling back to 'truncate'.", style="yellow")
-            return self._compress_truncate(budget, total_tokens)
+        """Anchored-summary compression (https://factory.ai/news/compressing-context,
+        as in the context-compressor-llm package): the oldest messages are folded
+        into a summary kept in the system prompt and the newest suffix is retained
+        verbatim, an append-only, KV-cache-friendly layout. The previous summary is
+        folded into the new one, so summaries never pile up across compressions."""
         self._log(f"[COMPRESS] Using 'context-compressor-llm': ~{total_tokens} tokens exceed the budget "
                   f"({budget}). Summarizing the oldest messages.", style="yellow")
         hist = self.conversation_history
@@ -1566,10 +1541,7 @@ Remember to not exceed 5000 characters, its very important that the summary to b
         log_tokens = max(1, sum(self._estimate_message_tokens(m) for _, m in log))
         t_summary = max(1, min(max(20, min(budget // 20, log_budget // 3)), log_budget - 1))
         t_retained = max(t_summary + 1, min(int(budget * self.compress_target) - fixed, log_tokens - 1))
-        cc = _ContextCompressorLib(
-            summarizer=lambda msgs, prev: self._llm_summarize(msgs, prev or old_summary or None),
-            t_max=t_retained, t_retained=t_retained, t_summary=t_summary,
-            tokenizer=_AICommanderTokenCounter(self))
+        entries = []  # (index, message, what the summarizer sees of it)
         for index, msg in log:
             content = _content_text(msg.get("content"))
             calls = msg.get("tool_calls") or []
@@ -1581,23 +1553,28 @@ Remember to not exceed 5000 characters, its very important that the summary to b
             if len(content) > 2000:  # the gist of a long output is enough for a summary
                 content = (f"{content[:1500]}\n[... {len(content) - 2000} characters omitted ...]\n"
                            f"{content[-500:]}")
-            cc.add_message(content, role=msg.get("role", "user"), metadata={"original": msg, "index": index})
-        for lib_msg in cc.state.messages:
-            lib_msg.token_count = self._estimate_message_tokens(lib_msg.metadata["original"])
+            entries.append((index, msg, content))
+        # Keep the longest suffix that fits t_retained - t_summary; summarize the rest.
+        sizes = [self._estimate_message_tokens(msg) for _, msg, _ in entries]
+        start = 0
+        if sum(sizes) > t_retained:
+            start, kept = len(entries), 0
+            while start and kept + sizes[start - 1] <= t_retained - t_summary:
+                start -= 1
+                kept += sizes[start]
+        if not start:
+            self._log("[COMPRESS] Nothing could be summarized; falling back to 'truncate'.", style="yellow")
+            return self._compress_truncate(budget, self._estimate_input_tokens(hist))
         try:
-            context = cc.get_current_context(auto_compress=True)
+            summary = self._llm_summarize([{"role": msg.get("role", "user"), "content": content}
+                                           for _, msg, content in entries[:start]], old_summary or None)
         except Exception as exc:  # never drop history behind a missing summary
             if self.stop_event.is_set():
                 return None
             self._log_error(f"[COMPRESS] The LLM summarizer failed ({exc}); falling back to 'truncate'.")
             return self._compress_truncate(budget, self._estimate_input_tokens(hist))
-        stats = cc.get_stats()
-        if not stats["compression_count"]:
-            self._log("[COMPRESS] Nothing could be summarized; falling back to 'truncate'.", style="yellow")
-            return self._compress_truncate(budget, self._estimate_input_tokens(hist))
-
-        summary = next((m.content for m in context if m.metadata.get("type") == "summary"), None) or old_summary
-        retained = [(m.metadata["index"], m.metadata["original"]) for m in context if "original" in m.metadata]
+        summary = summary or old_summary
+        retained = [(index, msg) for index, msg, _ in entries[start:]]
         if request is not None:  # keep the current task at its chronological place
             retained.append((next(i for i, m in enumerate(hist) if m is request), request))
             retained.sort(key=lambda pair: pair[0])
@@ -2628,11 +2605,14 @@ Rules:
         except (OSError, subprocess.SubprocessError):
             return None
 
-    def _git_state(self, cwd: str, snapshot: bool = True, untracked: str = "") -> tuple[str, dict, str, str] | None:
+    _STATUS_LIMIT = 5000  # git status entries watched around a command
+
+    def _git_state(self, cwd: str, snapshot: bool = True, excluded: tuple | None = None) -> tuple | None:
         """Before a bash command: (repo root, {path: (mtime, size) or None} of every
-        file git reports as modified or untracked, HEAD, how untracked files were
-        listed); None outside a repository. Untracked files are listed one by one,
-        or by directory when there are too many."""
+        file git reports as modified or untracked, HEAD, the untracked directories
+        left out, the untracked paths); None outside a repository. Untracked files
+        are listed one by one; when there are too many, the largest untracked
+        directories that do not hold the working directory are left out."""
         if not self.track_changes:
             return None
         top = self._git(cwd, "rev-parse", "--show-toplevel", "HEAD")
@@ -2640,30 +2620,67 @@ Rules:
             return None
         root, _, head = top.stdout.decode("utf-8", "replace").strip().partition("\n")
         root, head = os.path.normpath(root), head.strip() if top.returncode == 0 else ""
-        for mode in [untracked] if untracked else dict.fromkeys([self._git_modes.get(root, "all"), "normal"]):
-            status = self._git(root, "status", "--porcelain", "-z", f"--untracked-files={mode}")
+        if excluded is None:  # (the agent may have moved into one since)
+            excluded = tuple(d for d in self._git_excluded.get(root, ()) if not self._holds_cwd(root, d))
+        for attempt in range(2):
+            status = self._git(root, "status", "--porcelain", "-z", "--untracked-files=all", "--",
+                               *(f":(exclude,literal){d}" for d in excluded))
             if not status or status.returncode:
                 return None
-            entries, state, skip = status.stdout.decode("utf-8", "replace").split("\0"), {}, False
-            if len(entries) <= 5000:
-                self._git_modes[root] = mode
+            entries = status.stdout.decode("utf-8", "replace").split("\0")
+            if len(entries) <= self._STATUS_LIMIT:
                 break
-        else:
-            return None  # too many to watch cheaply
+            more = () if attempt else self._bulky_dirs(root, entries, len(entries) - self._STATUS_LIMIT)
+            if not more:
+                return None  # too many to watch cheaply
+            excluded += more
+        self._git_excluded[root] = excluded
+        state, untracked, skip = {}, set(), False
         for entry in entries:
             if skip or len(entry) < 4:
                 skip = False
                 continue
             skip = entry[0] in "RC"  # a rename's original path follows
             if entry.endswith("/"):
-                continue  # an untracked directory (listed by directory)
+                continue  # a nested repository
             path = os.path.normpath(os.path.join(root, entry[3:]))
             state[path] = self._stat(path)
-            if snapshot and entry[:2] != "??" and path not in self.changes and state[path]:
+            if entry[:2] == "??":
+                untracked.add(path)
+            elif snapshot and path not in self.changes and state[path]:
                 cached = self._dirty_text.get(path)
                 if not cached or cached[0] != state[path]:  # its text now, in case the command changes it
                     self._dirty_text[path] = (state[path], self.file_snapshot(path))
-        return root, state, head, mode
+        return root, state, head, excluded, untracked
+
+    def _holds_cwd(self, root: str, d: str) -> bool:
+        """Whether the repository directory *d* ("a/b/") holds the agent's working directory."""
+        top = os.path.normcase(os.path.join(root, *d.split("/")))
+        return any(os.path.normcase(os.path.join(os.path.realpath(p), "")).startswith(top)
+                   for p in (self.cwd, self.start_cwd))
+
+    def _bulky_dirs(self, root: str, entries: list[str], excess: int) -> tuple:
+        """Untracked directories (with no tracked file inside) whose files make up
+        *excess* of git status' *entries*: the largest first."""
+        listed = self._git(root, "status", "--porcelain", "-z", "--untracked-files=normal")
+        tops = {e[3:] for e in listed.stdout.decode("utf-8", "replace").split("\0")
+                if e.startswith("?? ") and e.endswith("/")} if listed and not listed.returncode else set()
+        sizes: collections.Counter = collections.Counter()
+        for entry in entries:
+            d, inside = "", False
+            for part in entry[3:].split("/")[:-1] if entry.startswith("?? ") else ():
+                d += part + "/"
+                inside = inside or d in tops
+                if inside:
+                    sizes[d] += 1
+        chosen: list[str] = []
+        for d, n in sorted(sizes.items(), key=lambda dn: (-dn[1], dn[0].count("/"))):  # parents before children
+            if excess <= 0:
+                break
+            if not d.startswith(tuple(chosen)) and not self._holds_cwd(root, d):
+                chosen.append(d)
+                excess -= n
+        return tuple(chosen)
 
     @staticmethod
     def _stat(path: str) -> tuple | None:
@@ -2673,16 +2690,16 @@ Rules:
         except OSError:
             return None
 
-    def _note_git_changes(self, before: tuple[str, dict, str, str] | None) -> None:
+    def _note_git_changes(self, before: tuple | None) -> None:
         """After a bash command: record the files it changed, as git status shows them
         (and the files of any commits it made)."""
-        after = self._git_state(before[0], snapshot=False, untracked=before[3]) if before else None
+        after = self._git_state(before[0], snapshot=False, excluded=before[3]) if before else None
         if not after:
             return
-        (root, old, head, _), new = before, after[1]
+        (root, old, head, _, _), (_, new, new_head, _, untracked) = before, after
         paths = [p for p in new if p not in old] + [p for p in old if new.get(p, self._stat(p)) != old[p]]
-        if head and after[2] != head:
-            names = self._git(root, "diff", "--name-only", "-z", head, after[2] or "HEAD")
+        if head and new_head != head:
+            names = self._git(root, "diff", "--name-only", "-z", head, new_head or "HEAD")
             paths += [os.path.normpath(os.path.join(root, n)) for n in
                       (names.stdout.decode("utf-8", "replace").split("\0") if names and not names.returncode else ())
                       if n and os.path.normpath(os.path.join(root, n)) not in old]
@@ -2692,8 +2709,8 @@ Rules:
             if path in old:  # it already differed from HEAD: its text before the command, if kept
                 cached = self._dirty_text.get(path)
                 before_text = cached[1] if cached and cached[0] == old[path] else None if old[path] is None else False
-            else:  # it matched the commit before the command (or did not exist)
-                shown = self._git(root, "show", f"{head}:" + os.path.relpath(path, root).replace(os.sep, "/"))
+            else:  # it matched the commit before the command (or did not exist; untracked: no git show each)
+                shown = None if path in untracked else self._git(root, "show", f"{head}:" + os.path.relpath(path, root).replace(os.sep, "/"))
                 before_text = None if not head or not shown or shown.returncode else (
                     False if len(shown.stdout) > self._SNAPSHOT_LIMIT else self._decode_or_false(shown.stdout))
             self._note_change(path, before_text, "bash")
@@ -3090,7 +3107,7 @@ if _TEXTUAL_AVAILABLE:
     _URL_RE = re.compile(r"https?://[^\s<>\"'`)\]]+")
     _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _SLASH_COMMANDS = ("/help", "/autoapprove", "/aa", "/approve", "/reject", "/suggest ", "/clear", "/new",
-                       "/session", "/reload", "/copy", "/todo", "/loop ", "/stop", "/pause", "/resume", "/newtab", "/closetab", "/tab ",
+                       "/session", "/reload", "/copy", "/todo", "/loop ", "/stop", "/pause", "/resume", "/unpause", "/newtab", "/closetab", "/tab ",
                        "/quit", "/exit")
     # Palette (Norton Commander blues).
     _C_USER, _C_ANSWER, _C_THINK = "bold #ffff5f", "#87d7ff", "italic #b2b28a"
@@ -3252,12 +3269,17 @@ if _TEXTUAL_AVAILABLE:
             self._newline()
             self._settle(follow)
 
-        def begin_fold(self, title: str, style="", rule: bool = False) -> None:
+        def begin_fold(self, title: str, style="", rule: bool = False, folded: bool = False, clip: int = 0) -> None:
             """Start a fold headed by *title*: the lines written until end_fold()
-            are hidden behind it (if there are any)."""
+            are hidden behind it (if there are any). Shown as they stream in,
+            unless *folded*: then they are hidden from the start (a click shows them)."""
             self.end_fold()
-            self.write_rule(title, style) if rule else self.write_line(title, style)
+            if rule:
+                self.write_rule(title, style)
+            else:
+                self.write_line(("▸ " if folded else "") + title, style, clip=clip)
             self._fold = self._lines[-2]
+            self._fold.folded = True if folded else None
             self._lines[-1].owner = self._fold
 
         def end_fold(self) -> None:
@@ -3269,7 +3291,16 @@ if _TEXTUAL_AVAILABLE:
             count = 0
             while count + 2 <= len(self._lines) and self._lines[-2 - count].owner is head:
                 count += 1
-            if count:  # retitle the header, then roll the fold up
+            if head.folded is not None:  # folded from the start: it only loses its mark if nothing came
+                if not count:
+                    head.plain, head.folded = head.plain[2:], None
+                    head.runs = [(len(head.plain), head.runs[0][1] if head.runs else "")]
+                    hi = len(self._lines) - 2
+                    a, b = (bisect.bisect_left(self._rows, (k, -1, -1)) for k in (hi, hi + 1))
+                    self._rows[a:b] = self._line_rows(hi)
+                    self._cache.clear()
+                    self._settle(self._at_bottom())
+            elif count:  # retitle the header, then roll the fold up
                 head.plain = f"▾ {head.plain} · {count} line{'s' * (count != 1)}"
                 head.runs, head.folded = [(len(head.plain), head.runs[0][1] if head.runs else "")], False
                 hi = len(self._lines) - 2 - count
@@ -3284,7 +3315,7 @@ if _TEXTUAL_AVAILABLE:
             head.folded = not head.folded
             head.plain = ("▸" if head.folded else "▾") + head.plain[1:]
             hi = next((k for k in range(len(self._lines) - 1, -1, -1) if self._lines[k] is head), -1)
-            if not animate or hi < 0:
+            if not animate or hi < 0 or head is self._fold:  # (still streaming: its open line's rows move too)
                 return self._reflow(follow=False)
             pos = end = bisect.bisect_left(self._rows, (hi + 1, -1, -1))
             if head.folded:
@@ -3365,7 +3396,9 @@ if _TEXTUAL_AVAILABLE:
             first = len(self._rows) - self._tail + keep
             start = self._rows[first - 1][2] if keep else 0
             del self._rows[first:]
-            if line.rule:
+            if line.owner is not None and line.owner.folded:
+                rows = []
+            elif line.rule:
                 rows = [(i, 0, len(line.plain))]
             elif final or line.plain:
                 rows = [(i, start + a, start + b)
@@ -3553,11 +3586,11 @@ if _TEXTUAL_AVAILABLE:
                 if event.ctrl and not line.rule:
                     url = next((m for m in _URL_RE.finditer(line.plain) if m.start() <= char < m.end()), None)
                     self.app.open_link(url.group() if url else line.plain[slice(*self._word_at(i, char))])
+                elif line.folded is not None:
+                    self.toggle_fold(line)
                 elif line.clip:  # a clipped line: show all of it
                     line.clip = 0
                     self._reflow()
-                elif line.folded is not None:
-                    self.toggle_fold(line)
                 return
             event.prevent_default()  # instead of Textual's select-the-whole-widget
             if hit is None:
@@ -4202,6 +4235,8 @@ if _TEXTUAL_AVAILABLE:
 
     _PANES = ("status", "shell", "tools")  # the right panel's tabs, in F3 order
     _CMD_ROWS = 3  # rows a tool call takes at most in the agent log (a click shows the rest)
+    _CMD_FOLD_LINES = 200  # output lines a tool call's fold in the agent log keeps (the Tools pane has all)
+    _RESULT_RE = re.compile(r"Command executed with exit code (-?\d+)\.\nOutput:\n?(.*)\Z", re.S)
 
     def _fold_command(console: OutputLog, label: str) -> None:
         """A command's fold in the Tools pane, headed by it; one too long for the
@@ -4225,16 +4260,19 @@ if _TEXTUAL_AVAILABLE:
                   ("tool results", "#5fd787"))
 
     class StatusPane(Vertical, can_focus=True):
-        """The Status tab of the right panel: the files the agent changed (a click
-        shows the diff), the command and background jobs running, and what the
-        model's context holds (a click lists every message). A click on a
-        section title folds the section."""
+        """The Status tab of the right panel: the files the agent changed, as a
+        folder tree (a click on a file unrolls its diff under it), the command
+        and background jobs running, and what the model's context holds (a
+        click lists every message). A click on a section title folds the section."""
 
         def __init__(self, tab: AgentTab, **kwargs):
             super().__init__(**kwargs)
             self.tab = tab
-            self.diff_path: str | None = None
+            self.diff_path: str | None = None  # the file whose diff is open
+            self.collapsed: set[str] = set()  # folders folded in the changes tree
             self.folded: set[str] = set()
+            self._leaf: str | None = None  # the file the diff leaf sits under (also while it rolls up)
+            self._leaf_stat: Any = False  # the file's stat when the leaf was filled (False: not yet)
             self._measured: dict[str, tuple] = {}  # path -> (stat, (added, removed, label) or None)
             self._job_ends: dict[int, float] = {}
             self._ctx_cache: tuple = (None, None)
@@ -4243,8 +4281,9 @@ if _TEXTUAL_AVAILABLE:
         def compose(self) -> ComposeResult:
             yield _Rows(classes="head head-changes")
             with VerticalScroll(classes="changes"):
-                yield _Rows(classes="changes-rows")
-            yield OutputLog(classes="diff")
+                yield _Rows(classes="changes-rows")  # the tree down to the open file
+                yield OutputLog(classes="diff")  # its diff, a leaf under it
+                yield _Rows(classes="changes-rest")
             yield _Rows(classes="head head-jobs")
             yield _Rows(classes="jobs")
             yield _Rows(classes="head head-context")
@@ -4311,58 +4350,139 @@ if _TEXTUAL_AVAILABLE:
             lines = list(difflib.unified_diff((before or "").splitlines(), (after or "").splitlines(), lineterm="", n=0))
             return (sum(ln.startswith("+") for ln in lines[2:]), sum(ln.startswith("-") for ln in lines[2:]), label)
 
+        def _tree(self, files: list) -> list[tuple]:
+            """The changed files as tree rows, folders first: (depth, key, name, file count)
+            for a folder (a chain of lone folders is one row), (depth, None, name, file) for a file."""
+            root: dict = {}
+            for file in files:
+                shown = self._show_path(file[0])
+                parts = shown.strip(os.sep).split(os.sep)
+                parts[0] = os.sep + parts[0] if shown.startswith(os.sep) else parts[0]
+                node = root
+                for part in parts[:-1]:
+                    node = node.setdefault(part + os.sep, {})
+                node[parts[-1]] = file
+
+            def size(node: dict) -> int:
+                return sum(size(child) if isinstance(child, dict) else 1 for child in node.values())
+            rows: list[tuple] = []
+
+            def walk(node: dict, depth: int, key: str) -> None:
+                for name in sorted(node, key=lambda n: (not isinstance(node[n], dict), n.lower())):
+                    child = node[name]
+                    if not isinstance(child, dict):
+                        rows.append((depth, None, name, child))
+                        continue
+                    while len(child) == 1 and isinstance(next(iter(child.values())), dict):
+                        sub = next(iter(child))
+                        name, child = name + sub, child[sub]
+                    rows.append((depth, key + name, name, size(child)))
+                    if key + name not in self.collapsed:
+                        walk(child, depth + 1, key + name)
+            walk(root, 0, "")
+            return rows
+
         def _update_changes(self, width: int) -> None:
-            files, folded = self.changed_files(), "changes" in self.folded
-            if self.diff_path is not None:
-                self._head("changes", "Changes ›", self._show_path(self.diff_path), ("‹ back (Esc)", self.close_diff))
-            else:
-                self._head("changes", "Changes",
-                           f"{len(files)} file{'s' * (len(files) != 1)}" if files else "none yet")
-            self.query_one(".changes").display = not folded and self.diff_path is None
-            self.query_one(".diff").display = not folded and self.diff_path is not None
-            body = self.query_one(".changes-rows", _Rows)
-            text, body.spans = Text(no_wrap=True, overflow="ellipsis"), []
+            files, log = self.changed_files(), self.query_one(".diff", OutputLog)
+            self._head("changes", "Changes", f"{len(files)} file{'s' * (len(files) != 1)}" if files else "none yet")
+            self.query_one(".changes").display = "changes" not in self.folded
+            rows = self._tree(files)
+            leaf = next((r for r in rows if r[1] is None and r[3][0] == self._leaf), None)
+            if self._leaf and not leaf:  # its file was folded away, or is as it was again
+                if log.has_focus:
+                    self.focus()
+                self.diff_path = self._leaf = None
+                log.display = False
+            elif leaf:
+                log.styles.margin = (0, 0, 0, 2 * leaf[0] + 3)  # under the file's name
+            if leaf and self._leaf_stat != AICommander._stat(self._leaf):  # just opened, or changed again
+                opening, height = self._leaf_stat is False, self._fill_diff(self._leaf, width - 2 * leaf[0] - 7)
+                if self.diff_path:  # (once laid out, so that its first frame is not lost)
+                    self.call_after_refresh(log.styles.animate, "height", height, duration=0.2, easing="out_cubic",
+                                            on_complete=log.scroll_visible if opening else None)
+            bodies = self.query_one(".changes-rows", _Rows), self.query_one(".changes-rest", _Rows)
+            texts, part = [Text(no_wrap=True, overflow="ellipsis") for _ in bodies], 0
+            for body in bodies:
+                body.spans = []
             if not files:
-                text.append(" The files the agent changes appear here; a click shows the diff.", _C_DIM)
-            for row, (path, change, (added, removed, label)) in enumerate(files):
-                tail = Text()
-                if added is not None:
-                    tail.append(f" +{added}", "#5fd787").append(f" −{removed}", "#ff8787")
-                for note in (label, "bash" if change["via"] == "bash" else ""):
-                    if note:
-                        tail.append(f" · {note}", _C_DIM)
-                shown, room = self._show_path(path), max(8, width - tail.cell_len - 4)
-                if cell_len(shown) > room:
-                    shown = "…" + shown[-(room - 1):]
-                color = {"new": "#5fd787", "deleted": "#ff8787"}.get(label, "#ffd75f")
-                text.append("\n" if row else "").append(" ● ", color).append(shown.ljust(room), "#e5e5e5")
-                text.append_text(tail)
-                body.spans.append((row, 0, None, lambda p=path: self.open_diff(p)))
-            body.update(text)
+                texts[0].append(" The files the agent changes appear here; a click on one shows its diff.", _C_DIM)
+            for row in rows:
+                depth, key, name, item = row
+                line = Text(" " + "  " * depth)
+                if key is not None:
+                    shut = key in self.collapsed
+                    line.append("▸ " if shut else "▾ ", "#87d7ff").append(name, "bold #87d7ff")
+                    line.append(f" · {item} file{'s' * (item != 1)}" if shut else "", _C_DIM)
+                    callback = lambda k=key: self.toggle_folder(k)
+                else:
+                    path, change, (added, removed, label) = item
+                    tail = Text()
+                    if added is not None:
+                        tail.append(f" +{added}", "#5fd787").append(f" −{removed}", "#ff8787")
+                    for note in (label, "bash" if change["via"] == "bash" else ""):
+                        if note:
+                            tail.append(f" · {note}", _C_DIM)
+                    room = max(8, width - tail.cell_len - 4 - 2 * depth)
+                    shown = name if cell_len(name) <= room else "…" + name[-(room - 1):]
+                    color = {"new": "#5fd787", "deleted": "#ff8787"}.get(label, "#ffd75f")
+                    line.append("● ", color).append(shown.ljust(room), "#e5e5e5").append_text(tail)
+                    if path == self.diff_path:
+                        line.stylize("bold on #1f5fa8", 1 + 2 * depth)
+                    callback = lambda p=path: self.toggle_diff(p)
+                texts[part].append("\n" if bodies[part].spans else "").append_text(line)
+                bodies[part].spans.append((len(bodies[part].spans), 0, None, callback))
+                part = 1 if row is leaf else part
+            for body, text in zip(bodies, texts):
+                body.update(text)
+            bodies[1].display = bool(bodies[1].spans)
+
+        def _fill_diff(self, path: str, room: int) -> int:
+            """Write *path*'s diff into the leaf; returns the leaf's height: its rows
+            wrapped at *room* cells, at most 2/3 of the changes area (the next rows stay in sight)."""
+            log, before = self.query_one(".diff", OutputLog), self.tab.agent.changes[path]["before"]
+            after, self._leaf_stat = AICommander.file_snapshot(path), AICommander._stat(path)
+            if before is False or after is False:
+                lines = [("Binary, unreadable or larger than 1 MB: no diff to show.", _C_DIM)]
+            else:
+                lines = [(ln, "#5fd787" if ln.startswith("+") else "#ff8787" if ln.startswith("-")
+                          else "#87d7ff" if ln.startswith("@@") else "#c8d0e0") for ln in
+                         list(difflib.unified_diff((before or "").splitlines(), (after or "").splitlines(),
+                                                   lineterm=""))[2:]]
+            log.clear()
+            for line, style in lines:
+                log.write_line(line, style)
+            rows = sum(max(1, -(-cell_len(line) // max(10, room))) for line, _ in lines)
+            return max(1, min(rows, self.query_one(".changes").size.height * 2 // 3))
+
+        def toggle_folder(self, key: str) -> None:
+            self.collapsed ^= {key}
+            self.update(force=True)
+
+        def toggle_diff(self, path: str) -> None:
+            self.close_diff() if path == self.diff_path else self.open_diff(path)
 
         def open_diff(self, path: str) -> None:
-            change = self.tab.agent.changes.get(path)
-            if change is None:
+            """Unroll *path*'s diff under its row in the tree (one diff is open at a time)."""
+            if path not in self.tab.agent.changes:
                 return
-            self.diff_path = path
             log = self.query_one(".diff", OutputLog)
-            log.clear()
-            before, after = change["before"], AICommander.file_snapshot(path)
-            if before is False or after is False:
-                log.write_line("Binary, unreadable or larger than 1 MB: no diff to show.", _C_DIM)
-            else:
-                for line in list(difflib.unified_diff((before or "").splitlines(), (after or "").splitlines(),
-                                                      lineterm=""))[2:]:
-                    log.write_line(line, "#5fd787" if line.startswith("+") else "#ff8787" if line.startswith("-")
-                                   else "#87d7ff" if line.startswith("@@") else "#c8d0e0")
-            self.update(force=True)
+            self.diff_path = self._leaf = path
+            self._leaf_stat, log.styles.height, log.display = False, 0, True
+            self.update(force=True)  # fills the leaf and rolls it down
             log.scroll_home(animate=False)
             log.focus()
 
         def close_diff(self) -> bool:
+            """Roll the open diff back up (Esc); False when none is open."""
             if self.diff_path is None:
                 return False
-            self.diff_path = None
+            self.diff_path, log = None, self.query_one(".diff", OutputLog)
+
+            def gone() -> None:
+                if self.diff_path is None:  # (not reopened meanwhile)
+                    self._leaf, log.display = None, False
+                    self.update(force=True)
+            log.styles.animate("height", 0, duration=0.15, easing="in_cubic", on_complete=gone)
             self.update(force=True)
             self.focus()
             return True
@@ -4742,6 +4862,49 @@ if _TEXTUAL_AVAILABLE:
             if event.value.strip():
                 self.dismiss(None if self._retired else ("suggest", event.value.strip()))
 
+    class QuitScreen(ModalScreen):
+        """Quit AI-Commander? y, Enter or the quit key again quits; n or Esc stays.
+        y and Enter are ignored for a moment after it opens (typing meant for the prompt)."""
+
+        CSS = """
+        QuitScreen { align: center middle; background: #000000 50%; }
+        #quit { width: 64; max-width: 96%; height: auto; border: double #ffd75f; background: #0b2f5e; padding: 1 2 0 2; }
+        #quit-buttons { height: auto; align: center middle; margin: 1 0 0 0; }
+        #quit-buttons Button { margin: 0 1; min-width: 14; }
+        """
+        BINDINGS = [Binding("y", "answer(True)", show=False), Binding("n,escape", "answer(False)", show=False),
+                    Binding("ctrl+c", "app.quit", show=False)]
+
+        def __init__(self, running: int):
+            super().__init__()
+            self.running = running
+            self._opened = 0.0
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="quit"):
+                text = Text().append("Quit AI-Commander?\n", "bold #ffd75f")
+                if self.running:
+                    text.append(f"{self.running} agent{'s' * (self.running != 1)} still running will be stopped. ",
+                                "#ff8787")
+                text.append("The sessions are saved: the tabs reopen on the next start.", "#c8d0e0")
+                yield Static(text)
+                with Horizontal(id="quit-buttons"):
+                    yield Button("Quit (y)", id="quit-yes", variant="error")
+                    yield Button("Stay (n)", id="quit-no", variant="primary")
+
+        def on_mount(self) -> None:
+            self._opened = time.monotonic()
+            self.query_one("#quit").border_title = "Quit"
+            self.query_one("#quit-yes").focus()
+
+        def action_answer(self, yes: bool) -> None:
+            if not yes or time.monotonic() - self._opened >= 0.4:
+                self.dismiss(yes)
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            event.stop()
+            self.action_answer(event.button.id == "quit-yes")
+
     class ReverseSearchScreen(ModalScreen):
         """Incremental reverse search over the prompt history (Ctrl+R)."""
 
@@ -4806,7 +4969,8 @@ if _TEXTUAL_AVAILABLE:
                   "right-click copies the selection, or pastes · middle-click pastes · the wheel scrolls · "
                   "drag the bar between the panels to resize them, double-click it to even them · "
                   "Ctrl+click opens a URL or file path · a click on a ▸/▾ line folds or unfolds it "
-                  "(thinking, command output and session summaries fold when they end) · "
+                  "(thinking, command output and session summaries fold when they end; the agent panel's "
+                  "tool calls are folded from the start, their output inside) · "
                   "a click on the task list in the agent panel's bottom border shows the whole list"),
         ("Find", "Ctrl+F searches the agent log, or the Tools pane or a diff when it has the focus · Enter or ↑ goes to "
                  "the previous match, ↓ the next · Esc closes"),
@@ -4824,11 +4988,13 @@ if _TEXTUAL_AVAILABLE:
                   "moves to the next pane · F7 zooms the focused pane (Esc restores) · in the Shell every key "
                   "goes to the shell: leave it with F6 or the mouse"),
         ("Status", "Changes: the files the agent changed (with its file tools, or with commands, found with git "
-                   "in a repository); a click shows the diff, Esc goes back · Jobs: the running command and the "
+                   "in a repository), as a folder tree: a click on a folder folds it, a click on a file unrolls "
+                   "its diff under it (a second click or Esc rolls it up) · Jobs: the running command and the "
                    "background jobs, with their latest output (stop ends a job) · Context: what the prompt holds, "
                    "and the last reply; a click lists every message · a click on a section title folds it"),
-        ("Quit", "F10 · Ctrl+Q · Ctrl+C twice while idle"),
-        ("Commands", "/help  /aa (/autoapprove)  /clear (/new)  /session  /reload  /copy  /todo  /stop  /pause (/resume)  "
+        ("Quit", "F10 · Ctrl+Q · /quit · Ctrl+C while idle: asks first (y, Enter or the same key again quits; "
+                 "n or Esc stays)"),
+        ("Commands", "/help  /aa (/autoapprove)  /clear (/new)  /session  /reload  /copy  /todo  /stop  /pause (/resume, /unpause)  "
                      "/quit (/exit)  "
                      "·  /loop [file] runs a ralph loop over a prompt file (default PROMPT.md)  "
                      "·  /newtab  /closetab  /tab N  "
@@ -4907,6 +5073,7 @@ if _TEXTUAL_AVAILABLE:
             self.closing = False
             self._agent_stream: str | None = None  # "think" / "text" while the agent pane streams
             self._console_stream = False
+            self._cmd_fold, self._cmd_lines = False, 0  # a tool call's fold open in the agent log, its output lines
             self._marker_hold = ""
             self._stream_chunks, self._stream_t0 = 0, 0.0
 
@@ -4981,6 +5148,8 @@ if _TEXTUAL_AVAILABLE:
             """Replay a restored conversation into both panes."""
             log, console = self.agent_log, self.console_log
             commands: dict = {}
+            results = {m.get("tool_call_id"): _content_text(m.get("content")).strip()
+                       for m in self.agent.conversation_history if m.get("role") == "tool"}
             for msg in self.agent.conversation_history:
                 role, text = msg.get("role"), _content_text(msg.get("content")).strip()
                 if role == "user" and text and not _is_continuation(msg) and text != _CONTINUE_PROMPT:
@@ -5007,13 +5176,21 @@ if _TEXTUAL_AVAILABLE:
                             if command.partition(" ")[0] not in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS:
                                 command = f"$ {command}"
                             commands[tc.get("id")] = command
-                            log.write_line(command, _C_CMD, clip=_CMD_ROWS)
+                            self._begin_command(command)
+                            result = results.get(tc.get("id"))
+                            match = _RESULT_RE.match(result or "")
+                            self._command_output(match.group(2) if match else result or "")
+                            self._end_command()
+                            if match:
+                                ok, lines = match.group(1) == "0", len(match.group(2).splitlines())
+                                log.write_line(f"  {'✓' if ok else '✗'} exit {match.group(1)} · {lines} line"
+                                               f"{'s' * (lines != 1)}", _C_OK if ok else _C_FAIL)
                 elif role == "tool":
                     command = commands.pop(msg.get("tool_call_id"), None)
                     if command == "":
                         continue
                     _fold_command(console, command or "tool result")
-                    match = re.match(r"Command executed with exit code (-?\d+)\.\nOutput:\n?(.*)\Z", text, re.S)
+                    match = _RESULT_RE.match(text)
                     output = match.group(2) if match else text
                     console.write_line(output[:4000] + ("\n… (truncated)" if len(output) > 4000 else ""), "#d0d0d0")
                     console.end_fold()
@@ -5163,6 +5340,7 @@ if _TEXTUAL_AVAILABLE:
                 self._agent_write(text, "think" if kind == "THINKING_STREAM" else "text")
             elif kind == "CMD_OUTPUT":
                 self.console_log.write(text, "#d0d0d0")
+                self._command_output(text)
                 self.cmd_tail = (self.cmd_tail + text)[-4096:]
                 self.tools_unseen = self.pane != "tools"
             elif kind == "CHANGES":
@@ -5193,6 +5371,8 @@ if _TEXTUAL_AVAILABLE:
                 pass  # the startup lines already show this
             else:
                 self._end_streams()
+                if kind != "APPROVAL_REQUEST":  # (what follows a tool call is not hidden in its fold)
+                    self._end_command()
                 self._dispatch_line(kind, p, text)
 
         def _dispatch_line(self, kind: str, p: dict, text: str) -> None:
@@ -5212,7 +5392,7 @@ if _TEXTUAL_AVAILABLE:
                 self.current_command, self._cmd_started = p.get("command", ""), time.monotonic()
                 label = ("" if p.get("function_name") in AICommander.FILE_TOOLS + AICommander.AGENT_TOOLS
                          else "$ ") + self.current_command
-                log.write_line(label, _C_CMD, clip=_CMD_ROWS)
+                self._begin_command(label)
                 _fold_command(console, label)
                 self.cmd_tail = ""
                 self.tools_unseen = self.pane != "tools"
@@ -5237,10 +5417,35 @@ if _TEXTUAL_AVAILABLE:
                                f"{_fmt_secs(time.monotonic() - self._run_started)}", _C_OK)
                 self.unseen = self is not self.app.tab
 
+        def _begin_command(self, label: str) -> None:
+            """A tool call in the agent log: a fold, closed from the start, that its
+            output goes into (a click on it rolls the output out)."""
+            log = self.agent_log
+            log.begin_fold(label, _C_CMD, folded=True, clip=_CMD_ROWS)
+            if "\n" in label.strip() or cell_len(label) > _CMD_ROWS * (log.scrollable_content_region.width or 80) - 4:
+                log.write_line(label, _C_CMD)  # all of what the header cuts
+            self._cmd_fold, self._cmd_lines = True, 0
+
+        def _command_output(self, text: str) -> None:
+            if self._cmd_fold and text:
+                room = _CMD_FOLD_LINES - self._cmd_lines
+                if room > 0:
+                    self.agent_log.write(text if text.count("\n") < room else
+                                         "\n".join(text.split("\n")[:room]) + "\n", "#d0d0d0")
+                self._cmd_lines += text.count("\n")
+
+        def _end_command(self) -> None:
+            if self._cmd_fold:
+                self._cmd_fold, more = False, self._cmd_lines - _CMD_FOLD_LINES
+                if more > 0:
+                    self.agent_log.write_line(f"… {more} more line{'s' * (more != 1)} in the Tools pane", _C_DIM)
+                self.agent_log.end_fold()
+
         def _agent_write(self, text: str, kind: str) -> None:
             log = self.agent_log
             if kind != self._agent_stream:
                 self._flush_marker()
+                self._end_command()
                 log.end_fold()
                 log.close_line()
                 if kind == "think":
@@ -5306,7 +5511,7 @@ if _TEXTUAL_AVAILABLE:
         StatusPane:focus-within { border: double #87d7ff; }
         StatusPane .head { height: 1; background: #0b2f5e; }
         StatusPane .changes { height: 1fr; }
-        StatusPane OutputLog, StatusPane OutputLog:focus { border: none; height: 1fr; display: none; }
+        StatusPane OutputLog, StatusPane OutputLog:focus { border: none; height: 0; display: none; background: #0b2f5e; }
         StatusPane .jobs { height: auto; max-height: 40%; }
         StatusPane .context { height: auto; }
         FindBar { display: none; height: 3; background: #000000; color: #f2f2f2; border: round #ffd75f;
@@ -5342,7 +5547,7 @@ if _TEXTUAL_AVAILABLE:
             self.tabs: list[AgentTab] = []
             self.tab: AgentTab | None = None  # the one on screen
             self._approval_screen: ApprovalScreen | None = None
-            self._last_ctrl_c = self._last_clear = 0.0
+            self._last_clear = 0.0
             self._last_close: tuple = (None, 0.0)
             self._last_status = self._last_tabs = self._last_panes = None
             self._ctx_cache = (None, 0)
@@ -5685,6 +5890,7 @@ if _TEXTUAL_AVAILABLE:
                 "/session": self._report_session, "/reload": self._reload_session,
                 "/copy": lambda: self._copy_answer(), "/todo": self._report_todos, "/stop": self.action_stop,
                 "/pause": self.action_pause, "/resume": lambda: self.action_pause(resume=True),
+                "/unpause": lambda: self.action_pause(resume=True),
                 "/loop": lambda: self.tab.start_loop(arg or "PROMPT.md"),
                 "/newtab": lambda: self.call_later(self.action_new_tab), "/closetab": self.action_close_tab,
                 "/tab": lambda: self.action_select_tab(int(arg)) if arg.isdigit() else self.agent_log.write_line(
@@ -5984,14 +6190,19 @@ if _TEXTUAL_AVAILABLE:
             if self.tab.busy():
                 self.action_stop()
                 return
-            now = time.monotonic()
-            if now - self._last_ctrl_c < 2:
-                self.action_quit()
-            else:
-                self._last_ctrl_c = now
-                self.notify("Press Ctrl+C again to quit (or F10).", timeout=2)
+            self.action_quit()
 
         def action_quit(self) -> None:
+            """Ask first; the quit key again while asking quits."""
+            if self._shutting_down:
+                return
+            if isinstance(self.screen, QuitScreen):
+                self.shutdown()
+            else:
+                self.push_screen(QuitScreen(sum(tab.busy() for tab in self.tabs)),
+                                 lambda yes: self.shutdown() if yes else None)
+
+        def shutdown(self) -> None:
             """Stop every agent, save the sessions and the history, exit."""
             if self._shutting_down:
                 return
@@ -6079,7 +6290,7 @@ def main():
                         help="Disable the OS-level Landlock sandbox (Linux only)")
     parser.add_argument("--compress-alg", default="context-compressor-llm",
                         help="Context compression: 'context-compressor-llm' (default; LLM anchored summaries, "
-                             "falls back to truncate without the package) or 'truncate' (condense tool outputs, "
+                             "falls back to truncate when no summary can be made) or 'truncate' (condense tool outputs, "
                              "drop the oldest messages)")
     parser.add_argument("--compress-target", type=float, default=0.4,
                         help="Fraction of the prompt budget kept after compressing (default: 0.4)")
@@ -6198,7 +6409,7 @@ def main():
         app.save_sessions(f"signal_{signum}")
         if signum == getattr(signal, "SIGHUP", None):
             os._exit(128 + signum)  # the terminal is gone: nothing left to restore
-        app.call_later(app.action_quit)
+        app.call_later(app.shutdown)
 
     for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
         if sig is not None:
