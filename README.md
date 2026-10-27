@@ -36,6 +36,7 @@ It supports two presentation modes:
   - [Mouse, copy and paste](#mouse-copy-and-paste)
   - [Prompt history](#prompt-history)
 - [The approval gate](#the-approval-gate)
+- [Questions from the agent](#questions-from-the-agent)
 - [Ralph loop mode](#ralph-loop-mode)
   - [Project instructions (`AGENTS.md`)](#project-instructions-agentsmd)
   - [The verification gate](#the-verification-gate)
@@ -197,6 +198,7 @@ panel. In `--nogui` mode a request is required on the command line.
 | `--api-key` | API key (required; default `$AIC_API_KEY` or `$OPENAI_API_KEY`). Prefer the variables: a key on the command line is visible to every process, the agent's own commands included. |
 | `--auto-approve` | Auto-approve command execution (for testing). |
 | `--confirm-reads` | Ask before read-only commands and `read_file` too (by default they run without asking). |
+| `--ask` | Let the agent [ask you questions](#questions-from-the-agent) with its `ask_user` tool. A question stops the run until you answer, so it is off by default and best left off for unattended runs (the TUI toggles it with `/ask`). |
 | `--no-thinking` | Hide thinking tokens from output. |
 | `--timeout` | Command timeout in seconds (default: `120`). |
 | `--max-prompt-len` | Maximum prompt length in tokens (default: `80000`). |
@@ -275,7 +277,13 @@ replacement) and `write_file` view and change files without shell quoting, so
 weaker models stop breaking files with `sed` and heredocs; each goes through
 the approval gate, which shows edits as a diff. `todo` keeps the agent's task
 list (shown back to it after the context is compacted, and saved in the
-session), and `task_complete(summary)` ends the task.
+session), and `task_complete(summary)` ends the task. With `--ask` (or `/ask`
+in the TUI) a seventh, `ask_user(question)`, lets it
+[ask you questions](#questions-from-the-agent).
+
+Independent calls (reading several files, searching several places) may share
+one turn: they run in order and their results go back together, which saves
+round trips; a call that needs an earlier result waits for the next turn.
 
 `execute_bash(command)` runs everything else with `bash` (`/bin/sh` if bash
 is missing; PowerShell on Windows) in a pseudo-terminal (PTY). The PTY gives
@@ -395,6 +403,7 @@ controls, so they are **not** added to prompt history:
 | `/tab N` | — | Select agent tab N (same as `Alt+N`). |
 | `/quit` | `/exit` | Stop the agent and exit the application (after a confirmation). |
 | `/approve`, `/reject`, `/suggest <text>` | — | Answer a pending approval (normally done in the approval dialog). |
+| `/ask [on\|off]` | — | Toggle (or set) whether the current tab's agent may [ask you questions](#questions-from-the-agent). |
 
 ### Keyboard shortcuts
 
@@ -508,6 +517,24 @@ You can toggle auto-approve at any time with `F2` or `/autoapprove` (`/aa`), or
 start with `--auto-approve`. When auto-approve is ON, all commands run without
 asking (the status line shows **AUTO-APPROVE**) — useful for testing and
 scripting, but be ready to stop the agent (`F9`) if a command misbehaves.
+
+---
+
+## Questions from the agent
+
+By default the agent never waits for you: it decides by itself and keeps
+working, so a run can go unattended. With `--ask`, or `/ask` in the TUI (per
+tab; `/ask on`, `/ask off`), it is offered an `ask_user` tool for the cases
+where it cannot reasonably go on without you: an ambiguous requirement, a
+choice only you can make, missing access.
+
+A question stops the run until you answer. In the TUI it shows in the agent
+pane (the tab is marked ◆ and the status line says *waiting for your
+answer*), and the next prompt you send is the answer; an empty answer, or
+`/ask off`, tells the agent to decide by itself. With `--nogui` the question is
+asked on the terminal (`--json`: a `QUESTION` event, the answer read from
+stdin); end of input counts as no answer. Stopping the agent while it waits
+ends the run as usual.
 
 ---
 

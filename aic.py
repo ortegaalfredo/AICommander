@@ -8,7 +8,7 @@ plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.6.1"
+__version__ = "2.7.0"
 
 import argparse
 import asyncio
@@ -716,7 +716,7 @@ class EventSink:
     CONSOLE_STREAM (internal calls such as the summarizer), CMD_EXEC,
     CMD_OUTPUT, CMD_COMPLETE, APPROVAL_REQUEST, STATUS_UPDATE, TOKEN_USAGE,
     TASK_TITLE, TODO (the task list: items), CHANGES (a file the agent changed:
-    path, count), SYSTEM and SHUTDOWN.
+    path, count), QUESTION (the model asks the user: text), SYSTEM and SHUTDOWN.
     """
 
     def emit(self, kind: str, payload: dict):
@@ -725,6 +725,10 @@ class EventSink:
     def confirm(self, command: str) -> str:
         """Ask whether to run *command*; returns y / n / a free-text suggestion."""
         raise NotImplementedError
+
+    def ask(self, question: str) -> str:
+        """Put the model's *question* to the user and wait for the answer ("": none)."""
+        return ""
 
     def close(self):
         pass
@@ -811,6 +815,10 @@ class ConsoleSink(EventSink):
     def confirm(self, command: str) -> str:
         return self.input(f"{colors.BOLD}{colors.YELLOW}{_RUN_IT}{colors.END}" if self._color else _RUN_IT)
 
+    def ask(self, question: str) -> str:
+        self._line(f"[QUESTION] {question}", colors.BOLD + colors.YELLOW)
+        return self.input("Your answer: ")
+
 
 class JsonSink(EventSink):
     """--json: every event as one JSON object per line on stdout ({"type": KIND,
@@ -836,10 +844,15 @@ class JsonSink(EventSink):
     def confirm(self, command: str) -> str:
         return self.input(f"{command}\n{_RUN_IT}")
 
+    def ask(self, question: str) -> str:
+        self.emit("QUESTION", {"text": question})
+        return self.input("Your answer: ")
+
 
 class TUISink(EventSink):
     """Queue bridge to the Textual app: the agent thread only enqueues events and
-    the UI thread renders them. confirm() blocks until resolve_approval()."""
+    the UI thread renders them. confirm() blocks until resolve_approval(), ask()
+    until answer()."""
 
     def __init__(self, event_queue: queue.Queue, stop_event: threading.Event):
         self.queue = event_queue
@@ -856,20 +869,30 @@ class TUISink(EventSink):
     def confirm(self, command: str) -> str:
         if self.auto_approve:
             return "y"
+        return self._wait_for("APPROVAL_REQUEST", {"command": command}) or "n"
+
+    def ask(self, question: str) -> str:
+        return self._wait_for("QUESTION", {"text": question}) or ""
+
+    def _wait_for(self, kind: str, payload: dict) -> str | None:
+        """Publish *kind* and block until the UI responds or the run stops (None)."""
         # Create the event before publishing the request so the UI can never
         # answer before we wait on it.
         event = self._approval_event = threading.Event()
         self._approval_response = None
-        self.emit("APPROVAL_REQUEST", {"command": command})
+        self.emit(kind, payload)
         while not event.wait(0.1):
             if self.stop_event.is_set():
                 break
         response = self._approval_response if event.is_set() else None
         self._approval_event = None
-        return response or "n"
+        return response
 
     def resolve_approval(self, approved: bool, suggestion: str = ""):
-        self._approval_response = "y" if approved else (suggestion or "n")
+        self.answer("y" if approved else (suggestion or "n"))
+
+    def answer(self, text: str):
+        self._approval_response = text
         if self._approval_event:
             self._approval_event.set()
 
@@ -898,7 +921,7 @@ class AICommander:
     PROJECT_FILES = ("AGENTS.md", "CLAUDE.md")  # the first one found is added to the system prompt
     MAX_PROJECT_FILE_CHARS = 16000
     FILE_TOOLS = ("read_file", "edit_file", "write_file")
-    AGENT_TOOLS = ("todo", "task_complete")  # handled by the agent itself, never need approval
+    AGENT_TOOLS = ("todo", "task_complete", "ask_user")  # handled by the agent itself, never need approval
     _TODO_MARKS = {"pending": "[ ]", "in_progress": "[>]", "done": "[x]"}
     TODO_REMINDER_STEPS = 3  # steps of tool calls without a todo update before the model is reminded
 
@@ -915,7 +938,7 @@ class AICommander:
                  compress_target: float = 0.4, fast: bool = False, reasoning_effort: str | None = None,
                  sandbox_enabled: bool = False, sandbox_write_dir: str = "",
                  session_file: str = "", instance_number: int = 1, verify_command: str = "",
-                 auto_approve_reads: bool = True):
+                 auto_approve_reads: bool = True, ask_user: bool = False):
         self.base_url = api_base.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -939,6 +962,7 @@ class AICommander:
         self.session_file = session_file  # "" disables persistence
         self.instance_number = instance_number
         self.verify_command = verify_command  # must exit 0 before a completion signal is accepted
+        self.ask_user = ask_user  # offer the ask_user tool (it waits for the user: not for unattended runs)
         self.loop_iteration = 0  # > 0 while run_loop() drives the runs
         self.start_cwd = _safe_cwd() or os.path.expanduser("~")
         self.cwd = self.start_cwd  # where the next command starts: follows the last command's `cd`
@@ -1030,6 +1054,11 @@ class AICommander:
             objective_complete={"type": "boolean", "description": "True only if the ENTIRE objective of the "
                                 "prompt is complete and verified with nothing left to do; false when this "
                                 "iteration's item is done but work remains"})]
+        self.ask_schema = tool(
+            "ask_user", "Ask the user a question and wait for the answer. Use it only when you cannot reasonably "
+                        "go on without them: an ambiguous requirement, a choice only they can make, missing access "
+                        "or credentials. Otherwise decide yourself and keep working.", ["question"],
+            question={"type": "string", "description": "The question, with the options you see if there are any"})
 
     def pause(self, paused: bool = True):
         """Hold the run before its next LLM call (the current step finishes) or
@@ -1659,11 +1688,11 @@ Remember to not exceed 5000 characters, its very important that the summary to b
                    if self.sandbox_enabled else
                    f"You are running inside an OS-level sandbox (currently disabled). When the sandbox is active, "
                    f"writes are restricted to {self.sandbox_write_dir}, /tmp and /dev.")
-        return f"""You are an expert planning and execution assistant. Fulfill the user's request by breaking it into manageable steps and executing them with your tools, one call at a time, waiting for each result: execute_bash runs shell commands; read_file, edit_file and write_file view and change files (prefer them over cat/sed/heredocs for reading and editing files); todo keeps your task list; task_complete ends the task.
+        return f"""You are an expert planning and execution assistant. Fulfill the user's request by breaking it into manageable steps and executing them with your tools: execute_bash runs shell commands; read_file, edit_file and write_file view and change files (prefer them over cat/sed/heredocs for reading and editing files); todo keeps your task list; task_complete ends the task.
 
 **Workflow:**
 1. Analyze the request; if complex, break it into steps and track them with the todo tool: keep exactly one item in_progress and mark items done as you finish them. The list is shown back to you after the context is compacted.
-2. Execute one step with a tool, then evaluate the result.
+2. Execute a step with your tools, then evaluate the results. Independent calls (reading several files, searching several places) can go in one turn: they run in order and their results come back together. A call that needs an earlier result (running the tests after an edit) waits for the next turn.
 3. If a step fails, adjust your approach and explain. When all steps are done and the goal is met, call task_complete with a short summary for the user.
 4. Call task_complete only once you are certain every necessary action is complete and verified, and on its own, never alongside other tool calls.{self._verify_note()}
 
@@ -1696,10 +1725,11 @@ Think carefully; response quality is the highest priority.{self._project_instruc
 
     def get_fast_system_prompt(self) -> str:
         """A smaller, faster system prompt for --fast mode."""
-        return f"""You are an expert bash assistant. Complete the user's task with your tools, one call at a time, acting on each result: execute_bash for commands; read_file, edit_file and write_file for files; todo for your task list.
+        return f"""You are an expert bash assistant. Complete the user's task with your tools, acting on each result: execute_bash for commands; read_file, edit_file and write_file for files; todo for your task list.
 
 Workflow:
 - Break complex tasks into steps and track them with the todo tool.
+- Independent calls (reading several files) can go in one turn; a call that needs an earlier result waits for the next.
 - If a step fails, fix it and retry.
 - When the task is fully done and verified, call task_complete (on its own) with a short summary.{self._verify_note()}
 
@@ -2396,7 +2426,8 @@ Rules:
 
     def _tools(self) -> list[dict]:
         """The tool schemas the model is offered."""
-        return self.loop_tool_schemas if self.loop_iteration else self.tool_schemas
+        tools = self.loop_tool_schemas if self.loop_iteration else self.tool_schemas
+        return tools + [self.ask_schema] if self.ask_user else tools
 
     def _stream_completion(self, params: dict, stream_display: bool, stream_label: str | None,
                            show_thinking: bool) -> dict[str, Any]:
@@ -2876,6 +2907,8 @@ Rules:
             args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
             if name == "todo":
                 result = self._todo(call.get("arguments"))
+            elif name == "ask_user":
+                result = self._ask(args)
             elif name in self.FILE_TOOLS:
                 result = self._run_file_tool(name, args, suggestions)
             elif name == "task_complete" and len(calls) + len(malformed) > 1:
@@ -2928,6 +2961,21 @@ Rules:
             self._log_error(result)
         self._note_git_changes(git)
         return result + (f"\n[working directory is now {self.cwd}]" if self.cwd != cwd else "")
+
+    def _ask(self, args: dict) -> str:
+        """The ask_user tool: the question goes to the user and the run waits for the answer."""
+        if not self.ask_user:
+            return "Not available: asking the user is turned off. Decide yourself and keep working."
+        question = str(args.get("question") or "").strip()
+        if not question:
+            return "ERROR: ask_user requires a 'question' string argument."
+        try:
+            answer = (self.sink.ask(question) or "").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if self.stop_event.is_set():
+            return "No answer: the user stopped the agent."
+        return f"The user answered: {answer}" if answer else "The user gave no answer. Decide yourself and keep working."
 
     def _todo_reminder(self, calls: list[dict[str, Any]]) -> None:
         """Models tend to update their task list late and in batches: after
@@ -3166,7 +3214,7 @@ if _TEXTUAL_AVAILABLE:
     _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _SLASH_COMMANDS = ("/help", "/autoapprove", "/aa", "/approve", "/reject", "/suggest ", "/clear", "/new",
                        "/session", "/reload", "/copy", "/todo", "/loop ", "/stop", "/pause", "/resume", "/unpause", "/newtab", "/closetab", "/tab ",
-                       "/quit", "/exit")
+                       "/ask", "/quit", "/exit")
     # Palette (Norton Commander blues).
     _C_USER, _C_ANSWER, _C_THINK = "bold #ffff5f", "#87d7ff", "italic #b2b28a"
     _C_CMD, _C_OK, _C_FAIL, _C_DIM = "bold #ffd75f", "#5fd787", "#ff8787", "#8fa8cc"
@@ -3183,7 +3231,18 @@ if _TEXTUAL_AVAILABLE:
         return blend_rgb(Color.parse(a).triplet, Color.parse(b).triplet, t * t * (3 - 2 * t)).hex
 
     def _fmt_secs(s: float) -> str:
-        return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m{int(s % 60):02d}s"
+        if s < 60:
+            return f"{s:.1f}s"
+        m, sec = divmod(int(s), 60)
+        return f"{m}m{sec:02d}s" if m < 60 else f"{m // 60}h{m % 60:02d}m{sec:02d}s"
+
+    def _clock() -> str:
+        """The time of day, for the user only (it never reaches the model)."""
+        return datetime.now().strftime("%H:%M:%S")
+
+    _RUN_ENDS = {"complete": ("✓ task complete", _C_OK), "loop_complete": ("✓ loop complete", _C_OK),
+                 "max_steps": ("step limit reached", "#ffd75f"), "stopped": ("stopped", "#ffd75f"),
+                 "error": ("✗ ended on an error", _C_FAIL)}
 
     def _fit_chars(text: str, start: int, cells: int) -> int:
         """How many characters from *start* fit in *cells* columns (at least 1)."""
@@ -4776,7 +4835,7 @@ if _TEXTUAL_AVAILABLE:
                 if cell_len(title) > room:
                     title = title[:max(1, room - 1)] + "…"
                 style = ("bold #000000 on #06989a" if tab is active else
-                         f"bold #000000 on {_pulse('#ffd75f', '#8a6d1f')}" if tab.pending_approval is not None
+                         f"bold #000000 on {_pulse('#ffd75f', '#8a6d1f')}" if tab.waiting
                          else "#e5e5e5 on #0b2f5e")
                 self._add(text, f" {pos} {mark}{title}", style, f"select_tab({pos})")
                 if close:
@@ -4811,12 +4870,13 @@ if _TEXTUAL_AVAILABLE:
         def compose(self) -> ComposeResult:
             options = []
             for pos, tab in enumerate(self.tabs, 1):
-                state = ("waiting for approval" if tab.pending_approval is not None else "working" if tab.busy()
+                state = ("waiting for approval" if tab.pending_approval is not None else "waiting for your answer"
+                         if tab.pending_question is not None else "working" if tab.busy()
                          else "finished" if tab.unseen else "")
                 row = Text(f"{pos:>2} ", "bold #ffff5f")
                 row.append(" ".join(tab.agent.task_summary.split()) or "Agent", "bold #e5e5e5" if tab is self.current else "#e5e5e5")
                 if state:
-                    row.append(f"  {state}", "#ffd75f" if tab.pending_approval is not None else _C_DIM)
+                    row.append(f"  {state}", "#ffd75f" if tab.waiting else _C_DIM)
                 options.append(row)
             with Vertical(id="switcher-box"):
                 yield OptionList(*options)
@@ -5101,7 +5161,10 @@ if _TEXTUAL_AVAILABLE:
                    "and the last reply; a click lists every message · a click on a section title folds it"),
         ("Quit", "F10 · Ctrl+Q · /quit · Ctrl+C while idle: asks first (y, Enter or the same key again quits; "
                  "n or Esc stays)"),
-        ("Commands", "/help  /aa (/autoapprove)  /clear (/new)  /session  /reload  /copy  /todo  /stop  /pause (/resume, /unpause)  "
+        ("Questions", "/ask (or --ask) lets the agent ask you questions; a question waits for your answer: type "
+                      "it in the prompt and press Enter (an empty answer or /ask off lets it decide by itself) · "
+                      "off by default, so runs can go unattended"),
+        ("Commands", "/help  /aa (/autoapprove)  /ask [on|off]  /clear (/new)  /session  /reload  /copy  /todo  /stop  /pause (/resume, /unpause)  "
                      "/quit (/exit)  "
                      "·  /loop [file] runs a ralph loop over a prompt file (default PROMPT.md)  "
                      "·  /newtab  /closetab  /tab N  "
@@ -5164,6 +5227,7 @@ if _TEXTUAL_AVAILABLE:
             self.retry_text = self.current_command = ""
             self._run_started = self._cmd_started = time.monotonic()
             self.pending_approval: str | None = None  # a command waiting for the user's verdict
+            self.pending_question: str | None = None  # an ask_user question waiting for the user's answer
             self.draft = ""  # the prompt text while another tab is on screen
             self.unseen = False  # a run ended while another tab was on screen
             self.closing = False
@@ -5197,13 +5261,25 @@ if _TEXTUAL_AVAILABLE:
         def auto_approve(self) -> bool:
             return self.sink.auto_approve
 
+        @property
+        def waiting(self) -> bool:
+            """Waiting for the user: an approval or an answer."""
+            return self.pending_approval is not None or self.pending_question is not None
+
+        def answer_question(self, text: str) -> None:
+            self.pending_question = None
+            self.sink.answer(text)
+            self.agent_log.write_line(f"  ↳ answered: {text}" if text else "  ↳ no answer: the agent decides",
+                                      _C_USER if text else "#ffd75f")
+            self.set_phase("thinking")
+
         @auto_approve.setter
         def auto_approve(self, value: bool) -> None:
             self.sink.auto_approve = self.agent.auto_approve = value
 
         def mark(self) -> str:
             """The tab bar's status glyph."""
-            if self.pending_approval is not None:
+            if self.waiting:
                 return "◆ "
             if self.busy() and self.agent.paused:
                 return "⏸ "
@@ -5368,7 +5444,7 @@ if _TEXTUAL_AVAILABLE:
         def _on_finished(self) -> None:
             self.thread = None
             self._end_streams()
-            self.pending_approval = None
+            self.pending_approval = self.pending_question = None
             self.app._approval_closed(self)
             self.set_phase("idle")
             unread = []  # steering messages typed after the agent's last step
@@ -5466,7 +5542,7 @@ if _TEXTUAL_AVAILABLE:
             elif kind == "ERROR":
                 log.write_line(text, "bold #ff5f5f")
             elif kind == "USER_REQUEST":
-                log.write_rule(f"You · {datetime.now().strftime('%H:%M:%S')}", _C_DIM)
+                log.write_rule(f"You · {_clock()}", _C_DIM)
                 log.write_line(text, _C_USER)
             elif kind == "TODO":
                 self.show_todos(p.get("items") or [])
@@ -5480,6 +5556,13 @@ if _TEXTUAL_AVAILABLE:
                 self.cmd_tail = ""
                 self.tools_unseen = self.pane != "tools"
                 self.set_phase("running")
+            elif kind == "QUESTION":
+                self.set_phase("question")
+                self.pending_question = text
+                log.write_rule(f"Question · {_clock()}", "#ffd75f")
+                log.write_line(text, "bold #ffd75f")
+                log.write_line("  type your answer in the prompt and press Enter", _C_DIM)
+                self.app._question_asked(self)
             elif kind == "APPROVAL_REQUEST":
                 self.set_phase("approval")
                 self.pending_approval = p.get("command", "")
@@ -5489,15 +5572,15 @@ if _TEXTUAL_AVAILABLE:
                 ok = code == 0
                 lines = output.count("\n") + bool(output and not output.endswith("\n"))
                 summary = (f"{'✓' if ok else '✗'} exit {code} · {_fmt_secs(p.get('duration') or 0.0)}"
-                           f" · {lines} line{'s' * (lines != 1)}")
+                           f" · {lines} line{'s' * (lines != 1)} · {_clock()}")
                 console.end_fold()
                 console.write_line(summary, f"bold {_C_OK if ok else _C_FAIL}")
                 log.write_line(f"  {summary}", _C_OK if ok else _C_FAIL)
                 self.set_phase("thinking")
             elif kind == "SHUTDOWN":
-                log.write_rule(f"{'✓ task complete' if p.get('completed') else 'ready'} · "
-                               f"{p.get('steps', self.step)} step(s) · "
-                               f"{_fmt_secs(time.monotonic() - self._run_started)}", _C_OK)
+                outcome, style = _RUN_ENDS.get(p.get("status"), ("ended", _C_DIM))
+                log.write_rule(f"{outcome} · {p.get('steps', self.step)} step(s) · "
+                               f"{_fmt_secs(time.monotonic() - self._run_started)} · {_clock()}", style)
                 self.unseen = self is not self.app.tab
 
         def _begin_command(self, label: str) -> None:
@@ -5861,6 +5944,13 @@ if _TEXTUAL_AVAILABLE:
                 self.notify(f"Tab {pos} is waiting for your approval" + (f" (Alt+{pos})." if pos < 10 else "."),
                             timeout=4)
 
+        def _question_asked(self, tab: AgentTab) -> None:
+            if tab is self.tab:
+                self.prompt.focus()
+            else:
+                pos = self.tabs.index(tab) + 1
+                self.notify(f"Tab {pos} has a question for you" + (f" (Alt+{pos})." if pos < 10 else "."), timeout=4)
+
         def _show_approval(self, tab: AgentTab) -> None:
             if tab is not self.tab or tab.pending_approval is None or self._approval_screen is not None:
                 return
@@ -5904,7 +5994,7 @@ if _TEXTUAL_AVAILABLE:
                 return
             bar = self._tabs_bar
             tabs = bar.build(bar.size.width or 80).plain
-            if tabs != self._last_tabs or any(t.pending_approval is not None for t in self.tabs if t is not tab):
+            if tabs != self._last_tabs or any(t.waiting for t in self.tabs if t is not tab):
                 self._last_tabs = tabs  # (a tab waiting for approval pulses)
                 bar.refresh()
             panes = self.query_one("#tabs", PaneTabs)
@@ -5919,6 +6009,8 @@ if _TEXTUAL_AVAILABLE:
                 phase = ("●", "ready")
             elif tab.phase == "approval":
                 phase = ("◆", "waiting for your approval")
+            elif tab.phase == "question" and tab.pending_question is not None:
+                phase = ("?", "waiting for your answer")
             elif tab.agent.paused:
                 phase = ("⏸", f"paused {elapsed} · /pause resumes" if tab.phase == "paused"
                          else "pausing after this step")
@@ -5943,6 +6035,7 @@ if _TEXTUAL_AVAILABLE:
                 (f"{rate:.0f} tok/s", ""),
                 ("AUTO-APPROVE" if tab.auto_approve else "approve: ask",
                  "bold #ffffff on #af0000" if tab.auto_approve else ""),
+                *([("questions on", "")] if tab.agent.ask_user else []),
                 ("sandbox ✓" if self.args.sandbox_enabled else "sandbox ✗", ""),
                 (f"{self.args.model} · "
                  f"{(tab.agent.cwd if tab.agent else _safe_cwd()).replace(os.path.expanduser('~'), '~', 1)} · "
@@ -5971,6 +6064,9 @@ if _TEXTUAL_AVAILABLE:
                 self._slash_command(text)
                 return
             self.history.add(text)
+            if self.tab.pending_question is not None:
+                self.tab.answer_question(text)
+                return
             if self.tab.busy():
                 self.agent.inject_suggestion(text)
                 self.agent_log.write_line(f"↳ steering message queued for the agent: {text}", _C_USER)
@@ -5983,6 +6079,7 @@ if _TEXTUAL_AVAILABLE:
             resume = lambda: self.action_pause(resume=True)  # noqa: E731
             actions = {
                 "/help": self.action_help, "/autoapprove": self.action_toggle_auto, "/aa": self.action_toggle_auto,
+                "/ask": lambda: self._set_ask(arg),
                 "/clear": self._clear_conversation, "/new": self._clear_conversation,
                 "/session": self._report_session, "/reload": self._reload_session,
                 "/copy": self._copy_answer, "/todo": self._report_todos, "/stop": self.action_stop,
@@ -6000,6 +6097,20 @@ if _TEXTUAL_AVAILABLE:
             else:
                 self.agent_log.write_line(f"Unknown command {command}. Available: "
                                           + " ".join(c.strip() for c in _SLASH_COMMANDS), _C_FAIL)
+
+        def _set_ask(self, arg: str) -> None:
+            """/ask [on|off]: whether this tab's agent may ask the user questions."""
+            tab = self.tab
+            if arg not in ("", "on", "off"):
+                tab.agent_log.write_line("Usage: /ask [on|off]", _C_FAIL)
+                return
+            tab.agent.ask_user = (arg == "on") if arg else not tab.agent.ask_user
+            if not tab.agent.ask_user and tab.pending_question is not None:
+                tab.answer_question("")  # the question waiting now is answered by the agent itself
+            tab.agent_log.write_line(
+                "Questions are ON: the agent may stop and ask you; it waits for your answer. /ask turns them off."
+                if tab.agent.ask_user else "Questions are OFF: the agent decides by itself and can run unattended.",
+                "#ffd75f" if tab.agent.ask_user else _C_OK)
 
         def _report_todos(self) -> None:
             if self.tab.agent.todos:
@@ -6398,7 +6509,7 @@ def agent_from_args(args, sink: EventSink, **settings) -> AICommander:
         compress_algorithm="truncate" if args.fast else args.compress_alg, compress_target=args.compress_target,
         fast=args.fast, reasoning_effort=args.reasoning_effort, sandbox_enabled=args.sandbox_enabled,
         sandbox_write_dir=args.sandbox_write_dir, verify_command=args.verify,
-        auto_approve_reads=not args.confirm_reads, **settings)
+        auto_approve_reads=not args.confirm_reads, ask_user=getattr(args, "ask", False), **settings)
     agent.max_tokens = getattr(args, "max_tokens", None) or agent.max_tokens
     return agent
 
@@ -6428,6 +6539,9 @@ def main():
     parser.add_argument("--auto-approve", action="store_true", help="Auto-approve command execution")
     parser.add_argument("--confirm-reads", action="store_true",
                         help="Ask before read-only commands (ls, cat, grep, git status...) and read_file too")
+    parser.add_argument("--ask", action="store_true",
+                        help="Let the agent ask you questions (the ask_user tool): a question stops the run until "
+                             "you answer, so leave it off for unattended runs (the TUI toggles it with /ask)")
     parser.add_argument("--no-thinking", action="store_true", help="Hide thinking tokens from output")
     parser.add_argument("--timeout", type=int, default=120, help="Command timeout in seconds (default: 120)")
     parser.add_argument("--max-prompt-len", type=int, default=DEFAULT_MAX_PROMPT_LEN,

@@ -75,3 +75,7 @@ id_rsa
 id_ed25519
 credentials.json
 secrets.json
+
+# portable bundle build tree (see portable/README.md)
+portable/cache/
+portable/build.log

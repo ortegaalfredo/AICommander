@@ -2150,6 +2150,98 @@ class TestRunner:
         for name, ok in results.items():
             self.check(f"tui pause: {name}", ok, repr(results) if not ok else "")
 
+    def test_ask_user(self):
+        """ask_user is offered only when enabled (--ask, /ask); the answer is the tool result."""
+        ask = lambda **kw: self._call("ask_user", {"question": "Which color?", **kw})
+        c, fake = self.make_fake_commander([ask(), self._done()])
+        c.run("paint it")
+        tools = [t["function"]["name"] for t in fake.calls[0]["tools"]]
+        result = [m for m in fake.calls[1]["messages"] if m["role"] == "tool"]
+        self.check("ask: off by default, the tool is not offered", "ask_user" not in tools, repr(tools))
+        self.check("ask: a call while off is refused without waiting",
+                   result and result[0]["content"].startswith("Not available"), repr(result))
+        c, fake = self.make_fake_commander([ask(), self._done()], ask_user=True)
+        asked = []
+        c.sink.ask = lambda q: asked.append(q) or "blue"
+        c.run("paint it")
+        result = [m for m in fake.calls[1]["messages"] if m["role"] == "tool"]
+        self.check("ask: enabled, the tool is offered and the answer comes back",
+                   "ask_user" in [t["function"]["name"] for t in fake.calls[0]["tools"]] and asked == ["Which color?"]
+                   and result and result[0]["content"] == "The user answered: blue", repr(result))
+        c, fake = self.make_fake_commander([ask(), self._done()], ask_user=True)
+        c.sink.ask = lambda q: ""
+        c.run("paint it")
+        result = [m for m in fake.calls[1]["messages"] if m["role"] == "tool"]
+        self.check("ask: no answer lets the model decide", result and "no answer" in result[0]["content"])
+        sink = aic.TUISink(queue.Queue(), threading.Event())
+        got = []
+        worker = threading.Thread(target=lambda: got.append(sink.ask("why?")))
+        worker.start()
+        event = sink.queue.get(timeout=5)
+        sink.answer("because")
+        worker.join(5)
+        self.check("ask: TUISink.ask waits for answer()",
+                   event["kind"] == "QUESTION" and event["payload"]["text"] == "why?" and got == ["because"])
+        sink.stop_event.set()
+        self.check("ask: a stopped run gets no answer", sink.ask("again?") == "")
+        prompts = (c.get_system_prompt(), aic.AICommander.get_fast_system_prompt(c))
+        self.check("prompt: independent calls may share a turn",
+                   all("one call at a time" not in p and "Independent calls" in p for p in prompts))
+
+    def test_tui_ask(self):
+        """/ask toggles questions; a question waits and the next prompt answers it."""
+        if not aic._TEXTUAL_AVAILABLE:
+            self.check("tui ask: skipped (textual missing)", True)
+            return
+        import asyncio
+        import time
+        args = argparse.Namespace(
+            api_base="http://localhost:1/v1", model="test-model", api_key="test-key", auto_approve=True,
+            no_thinking=False, timeout=30, max_prompt_len=80000, max_output_bytes=10240, max_steps=10,
+            debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
+            request=[], session_file="", instance_number=1, session_msg="[SESSION] off",
+            sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd(),
+            loop="", max_iterations=10, verify="", confirm_reads=False)
+        script = [self._call("ask_user", {"question": "Tabs or spaces?"}), self._done()]
+
+        async def until(pilot, condition, timeout=10):
+            end = time.monotonic() + timeout
+            while not condition() and time.monotonic() < end:
+                await pilot.pause(0.05)
+            return condition()
+
+        async def scenario():
+            app = aic.CommanderApp(args, aic.PromptHistory(None))
+            results = {}
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause(0.2)
+                tab, fake = app.tab, fake_openai.FakeOpenAIClient(script)
+                tab.agent.client, tab.agent.task_summary_enabled = fake, False
+                results["off by default"] = not tab.agent.ask_user
+                await pilot.press(*"/ask", "enter")
+                results["/ask turns questions on"] = tab.agent.ask_user and "Questions are ON" in tab.agent_log.plain_text
+                await pilot.press(*"go", "enter")
+                results["the question waits for the user"] = (
+                    await until(pilot, lambda: tab.pending_question == "Tabs or spaces?") and tab.busy()
+                    and len(fake.calls) == 1 and "Tabs or spaces?" in tab.agent_log.plain_text)
+                await pilot.press(*"spaces", "enter")
+                results["the next prompt answers it and the run goes on"] = await until(pilot, lambda: not tab.busy())
+                sent = fake.calls[1]["messages"] if len(fake.calls) > 1 else []
+                results["the answer is the tool result"] = any(
+                    m["role"] == "tool" and m["content"] == "The user answered: spaces" for m in sent)
+                await pilot.press(*"/ask off", "enter")
+                results["/ask off turns them off"] = not tab.agent.ask_user
+            return results
+
+        native = aic.clipboard_write_native, aic.clipboard_read_native
+        aic.clipboard_write_native, aic.clipboard_read_native = (lambda text: False), (lambda: None)
+        try:
+            results = asyncio.run(scenario())
+        finally:
+            aic.clipboard_write_native, aic.clipboard_read_native = native
+        for name, ok in results.items():
+            self.check(f"tui ask: {name}", ok, repr(results) if not ok else "")
+
     def test_tui_status(self):
         """The Status tab: changed files (file tools and, via git, commands) with
         diffs, jobs, the context, folding, tab badges, the session and /clear."""
@@ -2438,6 +2530,13 @@ class TestRunner:
                     and lines[echo + 3].plain.startswith("  ✓ exit 0") and lines[echo + 3].owner is None)
                 r["a call without output is not a fold"] = "$ true" in shown and not any(
                     line.plain.startswith("▸ $ true") for line in lines)
+                r["its summary ends with the time it finished"] = bool(
+                    re.fullmatch(r"  ✓ exit 0 · [\d.]+s · 2 lines · \d\d:\d\d:\d\d", lines[echo + 3].plain))
+                r["the end of the task shows its steps, duration and time"] = any(
+                    re.fullmatch(r"✓ task complete · \d+ step\(s\) · [\d.]+s · \d\d:\d\d:\d\d", line.plain)
+                    for line in lines if line.rule)
+                r["long durations read in hours"] = (aic._fmt_secs(1.5), aic._fmt_secs(75), aic._fmt_secs(3725)) == (
+                    "1.5s", "1m15s", "1h02m05s")
                 rows = [k for k, row in enumerate(log._rows) if row[0] == index]
                 top = int(log.scroll_offset.y)
                 last = log.render_line(rows[-1] - top).text.rstrip()
@@ -2991,6 +3090,8 @@ def main():
     runner.test_tui_tabs()
     runner.test_tui_todo()
     runner.test_tui_pause()
+    runner.test_ask_user()
+    runner.test_tui_ask()
     runner.test_tui_status()
     runner.test_git_changes_many_untracked()
     runner.test_model_choice()

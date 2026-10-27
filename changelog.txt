@@ -1,6 +1,28 @@
 AI-Commander changelog
 ======================
 
+2.7.0
+-----
+
+- Questions from the agent, off by default: --ask, or /ask [on|off] in a
+  tab, gives the model an ask_user tool for when it cannot reasonably go on
+  without you. The TUI marks the tab and the next prompt you send is the
+  answer; --nogui asks in the terminal, --json emits a QUESTION event and
+  reads the answer from stdin. An empty answer or /ask off lets the agent
+  decide by itself.
+- Independent tool calls can share one turn (they run in order), so tasks
+  need fewer round trips to the model.
+- Servers that reject max_tokens or a non-default temperature (OpenAI's
+  GPT-5 and o-series) work: AI-Commander switches to max_completion_tokens
+  or stops sending the rejected parameter, without using up a retry.
+- The token estimate is calibrated with the server's prompt_tokens (tool
+  schemas included), so context compression starts at the real count.
+- OPENAI_API_KEY is removed from the commands' environment like AIC_API_KEY,
+  and printenv is no longer auto-approved.
+- TUI: tool-call summaries and the end-of-task line show the time of day,
+  the end line says how the task ended (complete, step limit, stopped,
+  error), and long durations read in hours.
+
 2.6.1
 -----
 
