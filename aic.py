@@ -8,7 +8,7 @@ plain CLI (--nogui, ConsoleSink).
 """
 from __future__ import annotations
 
-__version__ = "2.7.0"
+__version__ = "2.7.1"
 
 import argparse
 import asyncio
@@ -2593,7 +2593,12 @@ Rules:
             except queue.Empty:
                 return
             self.conversation_history.append({"role": "user", "content": f"[Suggestion from user] {suggestion}"})
-            self._log(f"[USER SUGGESTION] {suggestion}", style="bold bright_yellow")
+            self._log_suggestion(suggestion)
+
+    def _log_suggestion(self, suggestion: str) -> None:
+        """The user's *suggestion* reached the conversation (the TUI shows it as a block of its own)."""
+        self.sink.emit("LOG", {"text": f"[USER SUGGESTION] {suggestion}", "style": "bold bright_yellow",
+                               "suggestion": suggestion})
 
     def generate_task_summary(self, user_request: str, generation: int = 0):
         """Background: summarize the request in 10-15 words for the panel title
@@ -2932,6 +2937,7 @@ Rules:
             self.save_session("tool_result")  # a crash keeps every finished result
         for suggestion in suggestions:
             self.conversation_history.append({"role": "user", "content": f"I suggest you {suggestion}"})
+            self._log_suggestion(suggestion)
         if suggestions:
             self.save_session("tool_result")
         return finish
@@ -3217,6 +3223,8 @@ if _TEXTUAL_AVAILABLE:
                        "/ask", "/quit", "/exit")
     # Palette (Norton Commander blues).
     _C_USER, _C_ANSWER, _C_THINK = "bold #ffff5f", "#87d7ff", "italic #b2b28a"
+    _C_SUGGEST = "#d7af5f"  # the rule over a suggestion sent while the agent works
+    _SUGGESTION_PREFIXES = ("[Suggestion from user] ", "I suggest you ")  # how suggestions enter the history
     _C_CMD, _C_OK, _C_FAIL, _C_DIM = "bold #ffd75f", "#5fd787", "#ff8787", "#8fa8cc"
     _SELECTION = Style(color="#000000", bgcolor="#87d7ff")
     _LOG_STYLES = {"yellow": "#ffd75f", "green": "#5fd787", "red": "#ff8787", "cyan": "#87d7ff",
@@ -3336,6 +3344,9 @@ if _TEXTUAL_AVAILABLE:
             self._cache: dict[int, Strip] = {}
             self._cr = False  # a '\r' ended the last chunk: decided by what follows
             self._fold: _Line | None = None  # header of the fold new lines join
+            self._linger = False  # the open fold stays open when it ends (until it scrolls out of view)
+            self._lingering: list[tuple[_Line, int, int]] = []  # (header, absolute line index, lines) left open
+            self._dropped = 0  # lines trimmed so far (absolute index - _dropped = index in _lines)
             self._down_at = None  # where the left button went down (a click is not a drag)
             self._anim = None  # (timer, frame) of a fold rolling in or out
 
@@ -3382,11 +3393,15 @@ if _TEXTUAL_AVAILABLE:
             self._newline()
             self._settle(follow)
 
-        def begin_fold(self, title: str, style="", rule: bool = False, folded: bool = False, clip: int = 0) -> None:
+        def begin_fold(self, title: str, style="", rule: bool = False, folded: bool = False, clip: int = 0,
+                       linger: bool = False) -> None:
             """Start a fold headed by *title*: the lines written until end_fold()
             are hidden behind it (if there are any). Shown as they stream in,
-            unless *folded*: then they are hidden from the start (a click shows them)."""
+            unless *folded*: then they are hidden from the start (a click shows them).
+            With *linger* the ended fold stays open until all of it has scrolled
+            above the view, so nothing being read rolls up under the reader."""
             self.end_fold()
+            self._linger = linger
             if rule:
                 self.write_rule(title, style)
             else:
@@ -3397,6 +3412,7 @@ if _TEXTUAL_AVAILABLE:
 
         def end_fold(self) -> None:
             head, self._fold = self._fold, None
+            linger, self._linger = self._linger, False
             if head is None:
                 return
             self.close_line()
@@ -3419,12 +3435,54 @@ if _TEXTUAL_AVAILABLE:
                 hi = len(self._lines) - 2 - count
                 a, b = (bisect.bisect_left(self._rows, (k, -1, -1)) for k in (hi, hi + 1))
                 self._rows[a:b] = self._line_rows(hi)
-                self.toggle_fold(head, follow=self._at_bottom())
+                if linger:
+                    self._lingering.append((head, hi + self._dropped, count))
+                    self._cache.clear()
+                    self._settle(self._at_bottom())
+                else:
+                    self.toggle_fold(head, follow=self._at_bottom())
+
+        def _roll_up_unseen(self, follow: bool) -> None:
+            """Fold the lingering folds whose lines all scrolled above the view,
+            at once and keeping the view on the same text, so it is not seen."""
+            if not self._lingering or self._anim or self._width <= 0:
+                return
+            with contextlib.suppress(Exception):
+                if self.text_selection is not None or self.screen._selecting:
+                    return  # rows under a selection must not move
+            top, removed, keep = int(self.scroll_y), 0, []
+            for entry in self._lingering:
+                head, at, count = entry
+                hi = at - self._dropped
+                if not (0 <= hi < len(self._lines) and self._lines[hi] is head and head.folded is False):
+                    continue
+                pos, end = (bisect.bisect_left(self._rows, (k, -1, -1)) for k in (hi + 1, hi + 1 + count))
+                if end > top - removed:
+                    keep.append(entry)
+                    continue
+                del self._rows[pos:end]
+                head.folded, head.plain = True, "▸" + head.plain[1:]
+                removed += end - pos
+            self._lingering = keep
+            if removed:
+                self._cache.clear()
+                self.virtual_size = Size(self._width, len(self._rows))
+                if follow:
+                    self.scroll_end(animate=False, immediate=True, x_axis=False)
+                else:
+                    self.scroll_to(y=max(0, top - removed), animate=False, immediate=True)
+                self.refresh()
+
+        def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+            super().watch_scroll_y(old_value, new_value)
+            if self._lingering and round(old_value) != round(new_value):
+                self.call_later(lambda: self._roll_up_unseen(self._at_bottom()))
 
         def toggle_fold(self, head: _Line, animate: bool = True, follow: bool = False) -> None:
             """Fold or unfold *head*: its rows roll in or out over a few frames
             (ease-out), spliced into the row list without a full reflow."""
             self._stop_anim(finish=True)
+            self._lingering = [entry for entry in self._lingering if entry[0] is not head]
             head.folded = not head.folded
             head.plain = ("▸" if head.folded else "▾") + head.plain[1:]
             hi = next((k for k in range(len(self._lines) - 1, -1, -1) if self._lines[k] is head), -1)
@@ -3477,6 +3535,7 @@ if _TEXTUAL_AVAILABLE:
         def clear(self) -> None:
             self._stop_anim()
             self._lines, self._rows, self._tail, self._cr, self._fold = [_Line()], [], 0, False, None
+            self._linger, self._lingering = False, []
             self._cache.clear()
             self.virtual_size = Size(self._width, 0)
             self.scroll_to(y=0, animate=False, immediate=True)
@@ -3530,6 +3589,7 @@ if _TEXTUAL_AVAILABLE:
             excess = len(self._lines) - self.max_lines
             if excess > max(50, self.max_lines // 10):
                 self._trim(excess)
+            self._roll_up_unseen(follow)
             self.virtual_size = Size(self._width, len(self._rows))
             if follow:
                 self.scroll_end(animate=False, immediate=True, x_axis=False)
@@ -3540,6 +3600,7 @@ if _TEXTUAL_AVAILABLE:
             self._stop_anim(finish=True)
             removed = bisect.bisect_left(self._rows, (count, -1, -1))
             del self._lines[:count]
+            self._dropped += count
             self._rows = [(i - count, s, e) for i, s, e in self._rows[removed:]]
             self._cache.clear()
             with contextlib.suppress(Exception):
@@ -5136,8 +5197,8 @@ if _TEXTUAL_AVAILABLE:
                   "right-click copies the selection, or pastes · middle-click pastes · the wheel scrolls · "
                   "drag the bar between the panels to resize them, double-click it to even them · "
                   "Ctrl+click opens a URL or file path · a click on a ▸/▾ line folds or unfolds it "
-                  "(thinking, command output and session summaries fold when they end; the agent panel's "
-                  "tool calls are folded from the start, their output inside) · "
+                  "(command output and session summaries fold when they end, thinking once it has scrolled "
+                  "out of view; the agent panel's tool calls are folded from the start, their output inside) · "
                   "a click on the task list in the agent panel's bottom border shows the whole list"),
         ("Find", "Ctrl+F searches the agent log, or the Tools pane or a diff when it has the focus · Enter or ↑ goes to "
                  "the previous match, ↓ the next · Esc closes"),
@@ -5322,8 +5383,12 @@ if _TEXTUAL_AVAILABLE:
             for msg in self.agent.conversation_history:
                 role, text = msg.get("role"), _content_text(msg.get("content")).strip()
                 if role == "user" and text and not _is_continuation(msg) and text != _CONTINUE_PROMPT:
-                    log.write_rule("You", _C_DIM)
-                    log.write_line(text, _C_USER)
+                    prefix = next((x for x in _SUGGESTION_PREFIXES if text.startswith(x)), None)
+                    if prefix:
+                        self.write_suggestion(text[len(prefix):])
+                    else:
+                        log.write_rule("You", _C_DIM)
+                        log.write_line(text, _C_USER)
                 elif role == "assistant":
                     text = text.replace(AICommander.COMPLETION_MARKER, "").rstrip()
                     for line in (text, AICommander.finish_summary(msg)):
@@ -5538,7 +5603,10 @@ if _TEXTUAL_AVAILABLE:
         def _dispatch_line(self, kind: str, p: dict, text: str) -> None:
             log, console = self.agent_log, self.console_log
             if kind == "LOG":
-                log.write_line(text, _LOG_STYLES.get(p.get("style", ""), "#c8d0e0"))
+                if p.get("suggestion"):
+                    self.write_suggestion(p["suggestion"], _clock())
+                else:
+                    log.write_line(text, _LOG_STYLES.get(p.get("style", ""), "#c8d0e0"))
             elif kind == "ERROR":
                 log.write_line(text, "bold #ff5f5f")
             elif kind == "USER_REQUEST":
@@ -5583,6 +5651,14 @@ if _TEXTUAL_AVAILABLE:
                                f"{_fmt_secs(time.monotonic() - self._run_started)} · {_clock()}", style)
                 self.unseen = self is not self.app.tab
 
+        def write_suggestion(self, text: str, when: str = "") -> None:
+            """A suggestion the agent read mid-run: a rule over the text, indented,
+            so it stands out from the agent's output when scrolling back."""
+            log = self.agent_log
+            log.write_rule(" · ".join(filter(None, ("You · suggestion", when))), _C_SUGGEST)
+            for line in text.splitlines() or [""]:
+                log.write_line(f"    {line}", _C_USER)
+
         def _begin_command(self, label: str) -> None:
             """A tool call in the agent log: a fold, closed from the start, that its
             output goes into (a click on it rolls the output out)."""
@@ -5615,7 +5691,7 @@ if _TEXTUAL_AVAILABLE:
                 log.end_fold()
                 log.close_line()
                 if kind == "think":
-                    log.begin_fold("✻ thinking", _C_DIM)
+                    log.begin_fold("✻ thinking", _C_DIM, linger=True)
                 self._agent_stream = kind
                 self.set_phase("thinking" if kind == "think" else "writing")
             if kind == "text":
@@ -5967,7 +6043,7 @@ if _TEXTUAL_AVAILABLE:
                 approved = verdict in ("yes", "always")
                 tab.sink.resolve_approval(approved, suggestion)
                 tab.agent_log.write_line(
-                    "  ✓ approved" if approved else f"  ↳ rejected with suggestion: {suggestion}" if suggestion
+                    "  ✓ approved" if approved else "  ✗ rejected, with your suggestion" if suggestion
                     else "  ✗ rejected", _C_OK if approved else "#ffd75f")
                 tab.set_phase("running" if approved else "thinking")
             screen = self._approval_screen = ApprovalScreen(tab.pending_approval)
@@ -6069,7 +6145,7 @@ if _TEXTUAL_AVAILABLE:
                 return
             if self.tab.busy():
                 self.agent.inject_suggestion(text)
-                self.agent_log.write_line(f"↳ steering message queued for the agent: {text}", _C_USER)
+                self.agent_log.write_line("↳ suggestion queued: the agent reads it at its next step", "#ffd75f")
                 return
             self.tab.start(text)
 

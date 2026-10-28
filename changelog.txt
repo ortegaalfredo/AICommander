@@ -1,6 +1,18 @@
 AI-Commander changelog
 ======================
 
+2.7.1
+-----
+
+- Thinking no longer rolls up under your eyes: a finished thinking block
+  stays open and folds to "▸ ✻ thinking · N lines" only once all of it has
+  scrolled out of view, at once and keeping the view in place. A block
+  folded or unfolded by hand stays as you left it.
+- Suggestions stand out in the agent pane: once the agent reads a message
+  typed while it works (or a suggestion given when rejecting a command), it
+  shows under its own "You · suggestion · 14:02:31" rule, indented. Restored
+  sessions show past suggestions the same way.
+
 2.7.0
 -----
 

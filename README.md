@@ -329,7 +329,9 @@ The default Textual interface is a Norton-Commander-style split screen:
   The sandbox is shared: it is applied once, to the whole process, at startup.
 - **Left pane — Agent**: the model's streamed answer (live, word-wrapped and
   re-wrapped when the terminal is resized), its thinking in dim italics
-  (folded to `▸ ✻ thinking · N lines` once it ends; click to unfold), each
+  (it stays open after it ends, so it doesn't roll up while you read it, and
+  folds to `▸ ✻ thinking · N lines` once all of it has scrolled out of view;
+  click to unfold), each
   command it runs as a folded `▸ $ command` line (at most 3 rows: a longer one
   ends in `…`) with an exit/duration summary under it; a click rolls out its
   output (the whole command first when it was cut, then up to 200 lines; the
@@ -379,7 +381,10 @@ The default Textual interface is a Norton-Commander-style split screen:
 
 The agent runs in a background thread and communicates with the UI through a
 queue; the UI never blocks on the agent. Typing while the agent works queues a
-steering message that is delivered at its next step.
+steering message that is delivered at its next step. Once the agent reads it, it
+shows in the agent pane under its own `── You · suggestion · 14:02:31 ──` rule,
+indented, so it is easy to find when scrolling back; so does a suggestion typed
+when rejecting a command.
 
 ### Slash commands
 

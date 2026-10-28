@@ -1872,6 +1872,64 @@ class TestRunner:
         self.check("tui log: copy re-joins soft-wrapped rows",
                    text == "streamed text that is long enough to wrap across rows\nsecond line\nthird", repr(text))
 
+    def test_tui_lingering_fold(self):
+        """Thinking stays open when it ends and folds, unseen, once it has all
+        scrolled above the view; a fold read by hand stays as the user left it."""
+        if not aic._TEXTUAL_AVAILABLE:
+            self.check("lingering fold: skipped (textual missing)", True)
+            return
+        import asyncio
+
+        class LogApp(aic.App):
+            def compose(self):
+                yield aic.OutputLog(id="log")
+
+        async def scenario():
+            r = {}
+            app = LogApp()
+            async with app.run_test(size=(40, 10)) as pilot:
+                log = app.query_one(aic.OutputLog)
+                log.begin_fold("✻ thinking", linger=True)
+                log.write("one\ntwo\nthree")
+                log.end_fold()
+                head = next(line for line in log._lines if "thinking" in line.plain)
+                await pilot.pause(0.05)
+                r["it stays open when it ends"] = head.folded is False and head.plain.startswith("▾ ")
+                r["its lines are still shown"] = "three" in [log._lines[i].plain for i, _, _ in log._rows]
+                for k in range(3):
+                    log.write_line(f"after {k}")
+                await pilot.pause(0.05)
+                r["still open while on screen"] = head.folded is False
+                for k in range(20):
+                    log.write_line(f"more {k}")
+                await pilot.pause(0.05)
+                bottom = log.render_line(log.size.height - 1).text.rstrip()
+                r["it folds once it scrolled out of view"] = head.folded is True and head.plain.startswith("▸ ")
+                r["the view stays at the bottom"] = bottom == "more 19" and log.scroll_y >= log.max_scroll_y - 1
+                log.begin_fold("✻ thinking", linger=True)
+                log.write("again\nand again")
+                log.end_fold()
+                second = log._lines[-4]
+                log.scroll_to(y=0, animate=False, immediate=True)
+                await pilot.pause(0.05)
+                for k in range(20):
+                    log.write_line(f"read {k}")
+                await pilot.pause(0.05)
+                r["not folded while the reader is above it"] = second.folded is False
+                log.scroll_end(animate=False, immediate=True)
+                await pilot.pause(0.1)
+                bottom = log.render_line(log.size.height - 1).text.rstrip()
+                r["scrolling down past it folds it"] = second.folded is True and bottom == "read 19"
+                log.toggle_fold(second, animate=False)
+                for k in range(20):
+                    log.write_line(f"later {k}")
+                await pilot.pause(0.05)
+                r["unfolded by hand it stays open"] = second.folded is False
+            return r
+
+        for name, ok in asyncio.run(scenario()).items():
+            self.check(f"lingering fold: {name}", ok)
+
     def test_preserved_thinking(self):
         # The model's reasoning goes back with its turns for the rest of the
         # run (models shown empty thinking blocks stop thinking), is cleared
@@ -2187,6 +2245,53 @@ class TestRunner:
         prompts = (c.get_system_prompt(), aic.AICommander.get_fast_system_prompt(c))
         self.check("prompt: independent calls may share a turn",
                    all("one call at a time" not in p and "Independent calls" in p for p in prompts))
+
+    def test_tui_suggestion_block(self):
+        """A suggestion the agent read shows as a rule over the indented text,
+        live and in a restored session."""
+        if not aic._TEXTUAL_AVAILABLE:
+            self.check("tui suggestion: skipped (textual missing)", True)
+            return
+        import asyncio
+        import time
+        args = argparse.Namespace(
+            api_base="http://localhost:1/v1", model="test-model", api_key="test-key", auto_approve=True,
+            no_thinking=False, timeout=30, max_prompt_len=80000, max_output_bytes=10240, max_steps=10,
+            debug=False, compress_alg="truncate", compress_target=0.4, fast=False, reasoning_effort=None,
+            request=[], session_file="", instance_number=1, session_msg="[SESSION] off",
+            sandbox_enabled=False, sandbox_msg="[SANDBOX] off", sandbox_write_dir=os.getcwd(),
+            loop="", max_iterations=10, verify="", confirm_reads=False)
+
+        async def scenario():
+            app = aic.CommanderApp(args, aic.PromptHistory(None))
+            r = {}
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause(0.2)
+                tab = app.tab
+                tab.agent.client = fake_openai.FakeOpenAIClient([self._done()])
+                tab.agent.task_summary_enabled = False
+                tab.agent.inject_suggestion("use tabs\nnot spaces")
+                tab.start("go")
+                end = time.monotonic() + 10
+                while tab.busy() and time.monotonic() < end:
+                    await pilot.pause(0.05)
+                lines = tab.agent_log._lines
+                at = next((k for k, line in enumerate(lines)
+                           if line.rule and line.plain.startswith("You · suggestion · ")), -1)
+                r["a rule with the time heads it"] = at >= 0 and re.fullmatch(
+                    r"You · suggestion · \d\d:\d\d:\d\d", lines[at].plain) is not None
+                r["its lines are indented under it"] = at >= 0 and [l.plain for l in lines[at + 1:at + 3]] == [
+                    "    use tabs", "    not spaces"]
+                r["the raw log line is not shown"] = "[USER SUGGESTION]" not in tab.agent_log.plain_text
+                tab.agent_log.clear()
+                tab.render_history()
+                lines = tab.agent_log._lines
+                at = next((k for k, line in enumerate(lines) if line.rule and line.plain == "You · suggestion"), -1)
+                r["a restored session shows it the same way"] = at >= 0 and lines[at + 1].plain == "    use tabs"
+            return r
+
+        for name, ok in asyncio.run(scenario()).items():
+            self.check(f"tui suggestion: {name}", ok)
 
     def test_tui_ask(self):
         """/ask toggles questions; a question waits and the next prompt answers it."""
@@ -3084,6 +3189,7 @@ def main():
     runner.test_transient_error_is_retried()
     runner.test_prompt_history_file()
     runner.test_tui_log_wraps_and_copies()
+    runner.test_tui_lingering_fold()
     runner.test_preserved_thinking()
     runner.test_x11_clipboard()
     runner.test_tui_end_to_end()
@@ -3091,6 +3197,7 @@ def main():
     runner.test_tui_todo()
     runner.test_tui_pause()
     runner.test_ask_user()
+    runner.test_tui_suggestion_block()
     runner.test_tui_ask()
     runner.test_tui_status()
     runner.test_git_changes_many_untracked()
